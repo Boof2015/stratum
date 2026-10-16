@@ -62,6 +62,29 @@ presentation interval and the trimming required after decoding. Qualities are
 The CLI is an experimental adapter to the engine. There is no HTTP listener,
 discovery endpoint or finalized wire protocol. See [the interval contract](docs/audio-proof.md).
 
+## Disposable Navidrome proof
+
+The next experiment runs a real Navidrome against a temporary synthetic library.
+It measures late seeking over authenticated original-audio HTTP requests, compares
+every fetched PCM sample with the local reference, then feeds the acquired audio
+through the Rust segment engine. See [setup, results and limits](docs/navidrome-proof.md).
+
+```sh
+cargo build --release --bins --examples
+mkdir -p artifacts
+cargo run --release --example fixture -- artifacts/navidrome-source.flac
+python3 -B experiments/navidrome.py \
+  --navidrome /path/to/navidrome \
+  --stratum target/release/stratum-poc \
+  --fixture artifacts/navidrome-source.flac \
+  --out artifacts/navidrome-run
+```
+
+Use a fresh output directory for each run; the fixture can be reused. Python 3.9+
+and a Navidrome executable are required. The script does not download executables,
+connect to an existing server, or read Astra's sign-in. Both temporary HTTP
+listeners bind to loopback, and Navidrome is stopped after the test.
+
 ## What this establishes
 
 - Integer frame addressing and independently decodable representations.
@@ -85,6 +108,7 @@ sample rates, and lossy originals remain separate work.
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test -- --test-threads=1
+python3 -B -m unittest discover -s experiments -p 'test_*.py'
 ```
 
 Integration tests run actual FFmpeg encodes and decodes, including a synthetic
@@ -98,9 +122,10 @@ client. Discovery and Navidrome credentials do not belong in the audio engine.
 ## Next experiments
 
 1. Listen to music at the joins and investigate any audible switching artifacts.
-2. Run the same interval requests through an authenticated Navidrome source adapter,
-   measuring upstream bytes read and cold late-seek cost. Source reads are currently
-   local, and opening a source hashes the entire file.
+2. Build on the disposable Navidrome acquisition result: a production source adapter
+   still needs user-scoped authorization, source revision handling and integration
+   with the engine. The Python experiment currently feeds acquired intervals into
+   the local Rust engine; it is not a shipped Sidecar service.
 3. Extend the timing proof to 44.1/96 kHz and lossy originals before defining a
    production timeline/representation contract.
 4. Add a bounded real-time client/server experiment. Discovery, pairing, per-user

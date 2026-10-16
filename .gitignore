@@ -2,4 +2,5 @@
 /artifacts/
 /.local-plans/
 .DS_Store
-
+__pycache__/
+*.pyc
