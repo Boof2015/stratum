@@ -32,6 +32,11 @@ synthetic library and account, with the acquisition harness's 180-second server
 watchdog. Requests, subprocesses, playback and worker shutdown are bounded. No
 browser, Electron process, audio device or existing server is opened.
 
+The current default is `--source-cache session`, reusing source byte blocks within
+the case. Use `--source-cache per-segment` for the original implementation measured
+below. The bandwidth schedule, playback policy and audio checks are unchanged.
+See [source-session results](source-session-proof.md) for the comparison.
+
 ## What actually runs live
 
 ```text
@@ -148,15 +153,19 @@ source rates/formats, album boundaries, concurrent users or arbitrary network
 outages. Below the minimum representation's sustainable rate, buffering remains
 necessary; there is no claim that adaptation prevents every stall.
 
-Each source acquisition currently has its own small byte cache and subprocesses.
-That repeats probing and overlapping reads. It is intentionally not a claim of
-optimized server CPU, disk or upstream bandwidth use. A source can also change
-between independent acquisitions; track-wide revision consistency is unfinished.
+The original per-segment mode gives each acquisition its own small byte cache;
+the session mode now reuses those blocks. Both still start fresh decoder/encoder
+processes for intervals. Source validators have limited precision, especially
+Last-Modified; this is not a complete guarantee against all in-place file changes.
+Navidrome 0.64.2 also derives that header from scanned database metadata, so a
+file change can remain invisible until its next scan; the source-session document
+records the real-server probe that exposed this limitation.
 
 Every request rechecks the disposable account through Navidrome, but the loopback
 endpoint's random route is only test isolation. It does not implement production
-client authentication, scoped users, revocation, discovery, trusted pairing or a
-shared cache. Lossless FLAC preserves decoded source PCM, not original file bytes.
+client authentication, shared multi-user caches, discovery or trusted pairing.
+Cached-access rejection and observed revision changes have separate tests in the
+source-session experiment. Lossless FLAC preserves decoded source PCM, not original file bytes.
 
 Before production, exercise actual audio output, diverse source formats/rates,
 slow source acquisition, jitter/disconnects, seeking/skipping, source revisions,

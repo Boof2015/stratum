@@ -125,6 +125,12 @@ the same drop. Nothing plays through your speakers automatically. Each scenario
 produces `listening.wav`; real starvation is retained as silence in that file.
 See [method, results and limits](docs/live-delivery-proof.md).
 
+The live test now reuses an 8 MiB source cache across intervals within one account
+and track session. Every interval still checks Navidrome access and stream revision
+before using cached bytes. Add `--source-cache per-segment` to reproduce the earlier
+independent-cache baseline. See [the source-session experiment](docs/source-session-proof.md)
+for traffic comparisons and cached-access rejection checks.
+
 ## Checks
 
 ```sh

@@ -177,9 +177,54 @@ class RangeSource:
         self.hits = 0
         self.validator = None
         self.lock = threading.Lock()
+        self.invalid = False
+        self.peak_cached_bytes = 0
+
+    def invalidate(self):
+        with self.lock:
+            self.invalid = True
+            self.blocks.clear()
+
+    def _read(self, start, end, purpose="block"):
+        require(not self.invalid, "source session is invalid")
+        headers = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
+        if self.validator:
+            headers["If-Range"] = self.validator
+        try:
+            with HTTP.open(urllib.request.Request(self.url, headers=headers), timeout=5) as response:
+                expected_range = f"bytes {start}-{end}/{self.size}"
+                require(response.status == 206 and response.headers.get("Content-Range") == expected_range,
+                        "upstream did not honor the exact byte range")
+                require(response.headers.get("Content-Encoding", "identity") == "identity",
+                        "encoded upstream body cannot be byte-addressed")
+                etag = response.headers.get("ETag")
+                validator = etag if etag and not etag.startswith("W/") else response.headers.get("Last-Modified")
+                require(validator and (self.validator is None or validator == self.validator),
+                        "upstream source validator absent or changed")
+                self.validator = validator
+                data = response.read(end - start + 2)
+                self.records.append({"range": headers["Range"], "status": response.status,
+                                     "content_range": response.headers.get("Content-Range"),
+                                     "body_bytes_received": len(data), "complete": True,
+                                     "purpose": purpose})
+                require(len(data) == end - start + 1, "upstream returned an incomplete byte range")
+                require(sum(r["body_bytes_received"] for r in self.records) <= MAX_BYTES,
+                        "upstream transfer limit exceeded")
+                return data
+        except Exception:
+            # A warm entry must never remain usable after a source/auth failure.
+            self.invalid = True
+            self.blocks.clear()
+            raise
+
+    def revalidate(self):
+        """A real authenticated stream read, even if all decoder bytes are cached."""
+        with self.lock:
+            self._read(0, 0, purpose="validation")
 
     def block(self, index):
         with self.lock:
+            require(not self.invalid, "source session is invalid")
             require(index >= 0, "negative source block")
             if index in self.blocks:
                 self.blocks.move_to_end(index)
@@ -189,43 +234,44 @@ class RangeSource:
             end = min(start + BLOCK_BYTES, self.size) - 1
             if start > end:
                 raise RuntimeError("block outside source")
-            headers = {"Range": f"bytes={start}-{end}", "Accept-Encoding": "identity"}
-            if self.validator:
-                headers["If-Range"] = self.validator
-            with HTTP.open(urllib.request.Request(self.url, headers=headers), timeout=5) as response:
-                expected_range = f"bytes {start}-{end}/{self.size}"
-                if response.status != 206 or response.headers.get("Content-Range") != expected_range:
-                    raise RuntimeError("upstream did not honor the exact byte range")
-                if response.headers.get("Content-Encoding", "identity") != "identity":
-                    raise RuntimeError("encoded upstream body cannot be byte-addressed")
-                etag = response.headers.get("ETag")
-                validator = etag if etag and not etag.startswith("W/") else response.headers.get("Last-Modified")
-                if not validator or (self.validator is not None and validator != self.validator):
-                    raise RuntimeError("upstream source validator absent or changed")
-                self.validator = validator
-                data = response.read(end - start + 2)
-                self.records.append({"range": headers["Range"], "status": response.status,
-                                     "content_range": response.headers.get("Content-Range"),
-                                     "body_bytes_received": len(data), "complete": True})
-                if len(data) != end - start + 1:
-                    raise RuntimeError("upstream returned an incomplete byte range")
-                if sum(r["body_bytes_received"] for r in self.records) > MAX_BYTES:
-                    raise RuntimeError("upstream transfer limit exceeded")
+            data = self._read(start, end)
             self.blocks[index] = data
             while len(self.blocks) > MAX_CACHED_BLOCKS:
                 self.blocks.popitem(last=False)
+            self.peak_cached_bytes = max(self.peak_cached_bytes, sum(map(len, self.blocks.values())))
             return data
 
 
 @contextlib.contextmanager
-def metered_source(nav, song_id, bounded=True):
+def metered_source(nav, song_id, bounded=True, session=None):
+    if session is None:
+        with _metered_source(nav, song_id, bounded) as result:
+            yield result
+        return
+    require(bounded, "source sessions require bounded ranges")
+    # The lease covers decoder shutdown as well as authorization, so an old
+    # gateway cannot continue using a cache after another acquisition revalidates.
+    with session.lease(nav, song_id) as source:
+        with _metered_source(nav, song_id, bounded, source) as (url, metrics):
+            yield url, metrics
+        metrics["upstream_requests"] = source.records[session.record_start:]
+        metrics["block_cache_hits"] = source.hits - session.hit_start
+        require(not any("error" in r for r in metrics["decoder_requests"]),
+                "upstream acquisition had a transport error")
+
+
+@contextlib.contextmanager
+def _metered_source(nav, song_id, bounded=True, block_source=None):
     # Real identity/access check; the stream also uses this user's credentials.
-    song = nav.request("getSong", id=song_id)["song"]
-    upstream_url = nav.url("stream", id=song_id, format="raw", maxBitRate=0)
+    if block_source is None:
+        song = nav.request("getSong", id=song_id)["song"]
+        upstream_url = nav.url("stream", id=song_id, format="raw", maxBitRate=0)
+        block_source = RangeSource(upstream_url, int(song["size"])) if bounded else None
+    else:
+        upstream_url = block_source.url
     route = "/" + secrets.token_urlsafe(24) + "/source.flac"
     records = []
     lock = threading.Lock()
-    block_source = RangeSource(upstream_url, int(song["size"])) if bounded else None
     metrics = {"upstream_requests": block_source.records if bounded else records,
                "decoder_requests": records, "block_cache_hits": 0}
 
@@ -348,16 +394,17 @@ def metered_source(nav, song_id, bounded=True):
             metrics["block_cache_hits"] = block_source.hits
 
 
-def acquire(nav, song_id, start, frames, output, bounded=True):
+def acquire(nav, song_id, start, frames, output, bounded=True, session=None):
     """Fetch an original-source interval over authenticated Navidrome HTTP.
 
     The temporary gateway keeps upstream credentials out of FFmpeg arguments and
-    meters body bytes. Bounded mode caches original byte blocks for this acquisition;
-    it does not rewrite audio or implement production auth.
+    meters body bytes. Bounded mode caches original byte blocks for this acquisition,
+    or across acquisitions when given an authorized private source session.
+    It does not rewrite audio or implement production auth.
     """
     seek_seconds, skip = divmod(start, RATE)
     began = time.monotonic()
-    with metered_source(nav, song_id, bounded=bounded) as (url, metrics):
+    with metered_source(nav, song_id, bounded=bounded, session=session) as (url, metrics):
         run(FFMPEG + ["-protocol_whitelist", "file,http,tcp", "-ss", str(seek_seconds),
             "-i", url, "-map", "0:a:0", "-vn", "-map_metadata", "-1", "-af",
             f"atrim=start_sample={skip}:end_sample={skip + frames},asetpts=PTS-STARTPTS",
@@ -366,7 +413,7 @@ def acquire(nav, song_id, start, frames, output, bounded=True):
     if any("error" in r for r in metrics["decoder_requests"]):
         raise RuntimeError("upstream acquisition had a transport error")
     return {"start_frame": start, "frames": frames, "acquisition_ms": acquisition_ms,
-            "mode": "bounded" if bounded else "passthrough",
+            "mode": "session" if session is not None else "bounded" if bounded else "passthrough",
             "body_bytes_received": sum(r["body_bytes_received"] for r in metrics["upstream_requests"]),
             **metrics}
 

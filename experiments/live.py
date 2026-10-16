@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 
 import navidrome as nav
+from source_session import SourceSession
 
 RATE = nav.RATE
 FRAME_BYTES = nav.CHANNELS * 4
@@ -215,7 +216,7 @@ class Link:
 
 
 @contextlib.contextmanager
-def endpoint(navidrome, song, binary, output, playback, impaired):
+def endpoint(navidrome, song, binary, output, playback, impaired, source_session=None):
     route = "/" + secrets.token_urlsafe(24) + "/segment"
     records, lock = [], threading.Lock()
     link = Link(playback, impaired)
@@ -249,7 +250,8 @@ def endpoint(navidrome, song, binary, output, playback, impaired):
                 source_start = ORIGIN + start - nav.CONTEXT
                 source = work / "source.flac"
                 record["acquisition"] = nav.acquire(navidrome, song["id"], source_start,
-                                                     SEGMENT + 2 * nav.CONTEXT, source)
+                                                     SEGMENT + 2 * nav.CONTEXT, source,
+                                                     session=source_session)
                 segment = json.loads(nav.run([str(binary), "segment", "--source", str(source),
                     "--start-frame", str(nav.CONTEXT), "--frames", str(SEGMENT),
                     "--quality", quality, "--cache", str(work / "cache")]))
@@ -340,17 +342,18 @@ def receive(url, start, quality, policy, playback, adaptive, output):
             "buffer_after_seconds": playback.buffered()}
 
 
-def scenario(name, navidrome, song, binary, output):
+def scenario(name, navidrome, song, binary, output, source_cache="session"):
     output.mkdir()
     playback = Playback(output)
     player = threading.Thread(target=playback.play, daemon=True)
     policy = Policy(song["size"] / 160 * (SEGMENT / RATE))
+    session = SourceSession(navidrome, song["id"]) if source_cache == "session" else None
     adaptive = name != "forced-lossless"
     started = time.monotonic()
     segments, retries = [], []
     player.start()
     try:
-        with endpoint(navidrome, song, binary, output, playback, name != "steady") as (url, server_records):
+        with endpoint(navidrome, song, binary, output, playback, name != "steady", session) as (url, server_records):
             for start in range(0, TOTAL, SEGMENT):
                 while playback.buffered() >= TARGET_BUFFER / RATE:
                     nav.require(not playback.done.wait(0.02), "consumer stopped early")
@@ -378,7 +381,17 @@ def scenario(name, navidrome, song, binary, output):
                 segment[key] -= playback_start
         for retry in retries:
             retry["at"] -= playback_start
+        upstream_bytes = sum(r["acquisition"]["body_bytes_received"] for r in server_records)
+        if session is not None:
+            session.close()
+            source_metrics = session.summary()
+            nav.require(source_metrics["upstream_body_bytes"] == upstream_bytes, "source traffic counted twice")
+            nav.require(source_metrics["validation_requests"] == len(server_records), "cached request skipped validation")
+            nav.require(source_metrics["peak_cached_bytes"] <= source_metrics["cache_limit_bytes"], "source cache limit exceeded")
+        else:
+            source_metrics = {"upstream_body_bytes": upstream_bytes}
         result = {"scenario": name, "origin": ORIGIN, "frames": TOTAL,
+                  "source_cache": {"mode": source_cache, **source_metrics},
                   "startup_seconds": playback_start - started, "elapsed_seconds": playback.elapsed,
                   "underruns": playback.underruns, "silence_frames": playback.silence_frames,
                   "max_wake_late_ms": playback.max_wake_late_ms,
@@ -387,13 +400,16 @@ def scenario(name, navidrome, song, binary, output):
                   "received_after_playback_started": sum(s["ready"] > 0 for s in segments)}
         (output / "delivery.json").write_text(json.dumps(result, indent=2) + "\n")
         print(f"{name}: {len(playback.underruns)} underruns, "
-              f"{playback.silence_frames / RATE:.3f}s silence, {len(retries)} cancelled downloads", flush=True)
+              f"{playback.silence_frames / RATE:.3f}s silence, {len(retries)} cancelled downloads; "
+              f"{upstream_bytes:,} upstream bytes ({source_cache})", flush=True)
         return result
     finally:
         playback.cancel.set()
         playback.ready.set()
         player.join(timeout=3)
         nav.require(not player.is_alive(), "consumer did not stop")
+        if session is not None:
+            session.close()
 
 
 def main():
@@ -401,6 +417,8 @@ def main():
     for name in ("navidrome", "stratum", "checker", "fixture", "out"):
         parser.add_argument("--" + name, required=True, type=Path)
     parser.add_argument("--scenario", choices=("all", "steady", "adaptive", "forced-lossless"), default="all")
+    parser.add_argument("--source-cache", choices=("session", "per-segment"), default="session",
+                        help="Reuse source reads across segments, or reproduce the original baseline")
     args = parser.parse_args()
     for name in ("navidrome", "stratum", "checker", "fixture"):
         setattr(args, name, getattr(args, name).resolve(strict=True))
@@ -415,7 +433,7 @@ def main():
         # A separate disposable server for each bounded run; no persistent account.
         with tempfile.TemporaryDirectory(prefix="stratum-live-nav-") as state:
             with nav.disposable(args.navidrome, args.fixture, Path(state)) as (server, song, _):
-                reports.append(scenario(name, server, song, args.stratum, args.out / name))
+                reports.append(scenario(name, server, song, args.stratum, args.out / name, args.source_cache))
         report = reports[-1]
         report["server_stopped"] = True
         # Full local source decode is an after-the-run oracle, never client input.
