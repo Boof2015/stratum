@@ -163,8 +163,9 @@ def identify_test_songs(nav, fixtures, songs):
 
 
 @contextlib.contextmanager
-def disposable_library(navidrome_binary, fixtures, state):
-    require(1 <= len(fixtures) <= 2, "test library must contain one or two tracks")
+def disposable_library(navidrome_binary, fixtures, state, lifetime=180):
+    require(1 <= len(fixtures) <= 3, "test library must contain one to three tracks")
+    require(30 <= lifetime <= 900, "invalid disposable server lifetime")
     music = state / "music"
     music.mkdir()
     names = [("Stratum fixture" if len(fixtures) == 1 else f"Stratum fixture {index}") + fixture.suffix.lower()
@@ -186,7 +187,7 @@ def disposable_library(navidrome_binary, fixtures, state):
                                    stdin=subprocess.DEVNULL, stdout=log, stderr=log,
                                    start_new_session=True)
         # Hard lifetime bound independent of the test's happy path.
-        watchdog = threading.Timer(180, stop_group, args=(process,))
+        watchdog = threading.Timer(lifetime, stop_group, args=(process,))
         watchdog.daemon = True
         watchdog.start()
         try:

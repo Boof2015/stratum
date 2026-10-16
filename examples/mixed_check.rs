@@ -53,7 +53,11 @@ fn main() -> Result<()> {
     let delivery: Delivery = serde_json::from_slice(&fs::read(&path)?)?;
     ensure!(
         SOURCE_RATES.contains(&delivery.output_rate)
-            && delivery.tracks.len() == if delivery.seek { 1 } else { 2 },
+            && if delivery.seek {
+                (1..=16).contains(&delivery.tracks.len())
+            } else {
+                delivery.tracks.len() == 2
+            },
         "invalid output policy"
     );
     ensure!(
@@ -65,6 +69,7 @@ fn main() -> Result<()> {
     );
     let (mut elapsed_ticks, mut output_end, mut segments_seen) = (0u128, 0u64, 0usize);
     let mut output = Vec::new();
+    let mut incomplete_output = false;
     let mut checks = Vec::new();
     for (index, track) in delivery.tracks.iter().enumerate() {
         let source = Source::open(&track.source)?;
@@ -197,6 +202,11 @@ fn main() -> Result<()> {
                 },
             "output track incomplete"
         );
+        ensure!(
+            !incomplete_output || converted.is_empty(),
+            "output skipped an unfinished track"
+        );
+        incomplete_output |= (converted.len() as u64) < track.output_frames * 8;
         output.extend_from_slice(&converted);
         checks.push(json!({"sample_rate":rate,"native_frames":position-track.input_origin,"lossless_exact":exact,
             "zero_lag":zero && windows>0,"evaluable_windows":windows,"inconclusive":inconclusive,

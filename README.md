@@ -189,6 +189,10 @@ resampling. It does not implement bit-perfect format changes. See the
 The [mixed-rate seek/skip proof](docs/mixed-seek-proof.md) exercises cancellation
 and late converter output while seeking and skipping between native rates.
 
+The [sustained silent session](docs/session-proof.md) combines multi-track
+playback, repeated quality changes, seeks/skips and an outage while checking
+recovery and resource retirement over several minutes.
+
 ## Checks
 
 ```sh

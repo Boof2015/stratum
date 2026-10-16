@@ -177,3 +177,6 @@ This completes the fixed-output mixed-rate seek/skip experiment. Source cache
 reuse across seeks, sustained playback and queue editing, device-rate changes,
 bit-perfect negotiation, other formats and Astra integration remain separate.
 The prototype's source-session, discovery and authorization limits are unchanged.
+
+The [sustained silent session](session-proof.md) combines these races with
+multi-track playback, an outage and measured resource retirement over time.

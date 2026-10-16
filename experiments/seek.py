@@ -58,12 +58,20 @@ class Ticket:
 
 
 class SeekServer:
-    def __init__(self, account, songs, infos, binary, output, clock):
+    def __init__(self, account, songs, infos, binary, output, clock, max_generations=5, max_requests=80):
+        nav.require(1 <= max_generations <= 64 and 1 <= max_requests <= 2000, "invalid proof limits")
+        self.max_generations, self.max_requests = max_generations, max_requests
         self.account, self.songs, self.infos = account, songs, infos
         self.binary, self.output, self.clock = binary, output, clock
         self.lock, self.rate_lock = threading.Lock(), threading.Lock()
         self.records, self.sessions, self.cancelled = [], {}, {}
         self.route = "/" + secrets.token_urlsafe(24)
+
+    def session_key(self, generation, track):
+        return generation
+
+    def before_request(self, handler):
+        return True
 
     def flag(self, generation):
         with self.lock:
@@ -96,7 +104,7 @@ class SeekServer:
                     url = urllib.parse.urlsplit(self.path)
                     params = urllib.parse.parse_qs(url.query, strict_parsing=True)
                     gen = int(params["generation"][0])
-                    nav.require(url.path == owner.route and set(params) == {"generation"} and 0 <= gen < 5,
+                    nav.require(url.path == owner.route and set(params) == {"generation"} and 0 <= gen < owner.max_generations,
                                 "invalid cancellation")
                     owner.flag(gen).set()
                     self.send_response(204)
@@ -118,21 +126,27 @@ class SeekServer:
                                 "invalid request")
                     gen, track, start = (int(params[k][0]) for k in ("generation", "track", "start"))
                     quality = params["quality"][0]
-                    nav.require(0 <= gen < 5 and track in (0, 1) and quality in live.QUALITIES, "invalid identity")
+                    nav.require(0 <= gen < owner.max_generations and 0 <= track < len(owner.infos) and quality in live.QUALITIES, "invalid identity")
                     rate = owner.infos[track]["sample_rate"]
                     frames = int(params.get("frames", [str(SEGMENT)])[0])
                     nav.require(0 < frames <= 2 * rate + 1 and 0 <= start
                                 and start + frames <= owner.infos[track]["frames"], "invalid source interval")
                     begin, count, trim = acquisition_interval(start, frames, owner.infos[track]["frames"], rate)
                     cancel = owner.flag(gen)
+                    if not owner.before_request(self):
+                        return
                     with owner.lock:
-                        nav.require(len(owner.records) < 80, "request budget exceeded")
-                        if gen not in owner.sessions:
-                            owner.sessions[gen] = SourceSession(owner.account, owner.songs[track]["id"])
-                        session = owner.sessions[gen]
+                        if cancel.is_set():
+                            raise nav.Cancelled("generation already retired")
+                        nav.require(len(owner.records) < owner.max_requests, "request budget exceeded")
+                        key = owner.session_key(gen, track)
+                        if key not in owner.sessions:
+                            owner.sessions[key] = SourceSession(owner.account, owner.songs[track]["id"])
+                        session = owner.sessions[key]
                         record = {"generation": gen, "track": track, "source_start": start, "quality": quality,
                                   "frames": frames, "sample_rate": rate, "began": time.monotonic(), "sent_bytes": 0}
                         owner.records.append(record)
+                        self.proof_record = record
                         work = owner.output / f"request-{len(owner.records):03d}"
                         work.mkdir()
                     if cancel.is_set():

@@ -16,11 +16,12 @@ class FileTimeline:
         self.output, self.players, self.threads = output, {}, {}
         nav.require(rate in (44100, 48000, 96000), "unsupported output clock")
         self.rate = rate
+        self.archived = {}
         self.generation, self.started = -1, None
         self.switch(0, total)
 
     def switch(self, generation, total):
-        if self.generation >= 0:
+        if self.generation in self.players:
             old = self.players[self.generation]
             old.cancel.set()
             old.ready.set()
@@ -44,6 +45,8 @@ class FileTimeline:
         return True
 
     def snapshot(self, generation):
+        if generation in self.archived:
+            return dict(self.archived[generation])
         p = self.players[generation]
         if self.started is None and p.started is not None:
             self.started = p.started
@@ -52,6 +55,21 @@ class FileTimeline:
         return {"accepted": accepted, "consumed": consumed, "started": p.started,
                 "underruns": p.underruns, "silence_frames": p.silence_frames,
                 "buffered": buffered, "done": p.done.is_set()}
+
+    def retire(self, generation):
+        # Call after its producer has joined. Retain counters, not abandoned PCM.
+        if generation in self.archived:
+            return
+        player = self.players[generation]
+        nav.require(player.done.is_set(), "cannot retire an active consumer")
+        self.threads[generation].join(timeout=3)
+        nav.require(not self.threads[generation].is_alive(), "consumer thread remained")
+        self.archived[generation] = self.snapshot(generation)
+        with player.lock:
+            player.queue.clear()
+            player.frames = 0
+        del self.players[generation]
+        del self.threads[generation]
 
     def finish(self):
         p = self.players[self.generation]

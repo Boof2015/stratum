@@ -24,6 +24,10 @@ from seek import Client, SeekServer, Ticket, validate_envelope
 from seek_output import FileTimeline, NativeTimeline
 
 
+class TransientStreamError(RuntimeError):
+    """The response did not deliver a complete body; no PCM was admitted."""
+
+
 class MixedClient(Client):
     def __init__(self, server, sink, output, infos, output_rate):
         super().__init__(server, sink, output, infos)
@@ -127,7 +131,7 @@ class MixedClient(Client):
                 self.conversions[generation]['closed'] = converter.closed
                 self.conversions[generation]['process_stopped'] = converter.process is None or converter.process.poll() is not None
 
-    def fetch_native(self, generation, segment, quality):
+    def fetch_native(self, generation, segment, quality, folder=None):
         plan, ticket = self.plans[generation], self.tickets[generation]
         start, frames, rate = segment['source_start'], segment['frames'], plan['sample_rate']
         ticket.check()
@@ -141,6 +145,8 @@ class MixedClient(Client):
             connection.request('GET', self.server.route + '?' + urllib.parse.urlencode({
                 'generation': generation, 'track': plan['track'], 'start': start, 'frames': frames, 'quality': quality}))
             with connection.getresponse() as response:
+                if response.status in (502, 503, 504):
+                    raise TransientStreamError(f'temporary stream error: HTTP {response.status}')
                 nav.require(response.status == 200, 'segment request failed')
                 size = int(response.headers['Content-Length'])
                 nav.require(0 < size <= live.MAX_PAYLOAD, 'invalid response size')
@@ -152,13 +158,14 @@ class MixedClient(Client):
                 while len(body) < size:
                     ticket.check()
                     chunk = response.read(min(4096, size - len(body)))
-                    nav.require(bool(chunk), 'truncated segment')
+                    if not chunk:
+                        raise TransientStreamError('truncated segment')
                     body.extend(chunk)
                     job['received_bytes'] = len(body)
                 received = time.monotonic()
             ticket.check()
             nav.require(hashlib.sha256(body).hexdigest() == meta['payload_sha256'], 'corrupt payload')
-            folder = self.output / f'generation-{generation}'
+            folder = folder or self.output / f'generation-{generation}'
             encoded = folder / (f'segment-{start}.' + ('flac' if quality == 'lossless' else 'opus'))
             encoded.write_bytes(body)
             job['stage'] = 'decode'
