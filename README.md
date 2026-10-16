@@ -140,6 +140,14 @@ default output, volume and sample rate settings alone. The test uses its own
 reduced gain and stops after one excerpt. See [build and listening commands](docs/device-output-proof.md).
 Normal runs and automated unit tests still produce no sound.
 
+### Seeking and skipping
+
+`experiments/seek.py` extends the live proof with backward/rapid seeks and a skip
+between two tracks. It cancels obsolete HTTP/decoder work, flushes the output,
+rejects intentionally late completions, and checks exact resume positions. Its
+default sink is a file; optional macOS playback uses one native process across
+all resets. See [the sequence, commands and limits](docs/seek-proof.md).
+
 ## Checks
 
 ```sh
@@ -166,8 +174,8 @@ client. Discovery and Navidrome credentials do not belong in the audio engine.
    the local Rust engine; it is not a shipped Sidecar service.
 3. Extend the timing proof to 44.1/96 kHz and lossy originals before defining a
    production timeline/representation contract.
-4. Extend the device experiment to Astra's pipeline, harder network conditions
-   and seek/skip cancellation. Discovery, pairing, per-user authorization
+4. Extend the device and seek/skip experiments to Astra's pipeline, harder network
+   conditions, natural track handoffs and source-cache reuse across seeks. Discovery, pairing, per-user authorization
    and production cache eviction must be designed before deployment.
 
 The current cache is an unbounded experiment directory, not a server cache. No

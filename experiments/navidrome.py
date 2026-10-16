@@ -50,8 +50,32 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
-def run(command, timeout=TIMEOUT):
-    result = subprocess.run(command, capture_output=True, timeout=timeout)
+class Cancelled(RuntimeError):
+    pass
+
+
+def run(command, timeout=TIMEOUT, cancel=None):
+    if cancel is None:
+        result = subprocess.run(command, capture_output=True, timeout=timeout)
+    else:
+        with subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True) as process:
+            deadline = time.monotonic() + timeout
+            try:
+                while True:
+                    if cancel.is_set():
+                        raise Cancelled("request cancelled")
+                    if time.monotonic() >= deadline:
+                        raise subprocess.TimeoutExpired(command, timeout)
+                    try:
+                        stdout, stderr = process.communicate(timeout=min(0.05, deadline - time.monotonic()))
+                        break
+                    except subprocess.TimeoutExpired:
+                        continue
+                if cancel.is_set():
+                    raise Cancelled("request cancelled")
+                result = subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            finally:
+                stop_group(process)
     if result.returncode:
         # Commands never contain Navidrome credentials. Still avoid printing URLs.
         raise RuntimeError(f"{Path(command[0]).name} failed: "
@@ -106,9 +130,47 @@ def stop_group(process):
 
 @contextlib.contextmanager
 def disposable(navidrome_binary, fixture, state):
+    with disposable_library(navidrome_binary, [fixture], state) as (nav, songs, bad_auth):
+        yield nav, songs[0], bad_auth
+
+
+def identify_test_songs(nav, fixtures, songs):
+    """Fixture setup only: Subsonic paths may be virtual tag-based paths.
+
+    Match size plus a bounded original-byte prefix; reject ambiguous matches.
+    These setup reads are separate from measured playback acquisition traffic.
+    """
+    signatures = []
+    for source in fixtures:
+        with source.open("rb") as file:
+            signatures.append((source.stat().st_size, file.read(65536)))
+    ordered = [None] * len(fixtures)
+    for song in songs:
+        size = int(song["size"])
+        length = min(size, 65536)
+        request = urllib.request.Request(nav.url("stream", id=song["id"], format="raw", maxBitRate=0),
+                                         headers={"Range": f"bytes=0-{length - 1}", "Accept-Encoding": "identity"})
+        with HTTP.open(request, timeout=5) as response:
+            require(response.status == 206 and response.headers.get("Content-Range") == f"bytes 0-{length - 1}/{size}",
+                    "test track identity range rejected")
+            prefix = response.read(length + 1)
+        require(len(prefix) == length, "test track identity prefix truncated")
+        matches = [index for index, signature in enumerate(signatures) if signature == (size, prefix)]
+        require(len(matches) == 1 and ordered[matches[0]] is None, "test track mapping ambiguous")
+        ordered[matches[0]] = song
+    require(all(ordered), "test track mapping incomplete")
+    return ordered
+
+
+@contextlib.contextmanager
+def disposable_library(navidrome_binary, fixtures, state):
+    require(1 <= len(fixtures) <= 2, "test library must contain one or two tracks")
     music = state / "music"
     music.mkdir()
-    shutil.copy2(fixture, music / ("Stratum fixture" + fixture.suffix.lower()))
+    names = [("Stratum fixture" if len(fixtures) == 1 else f"Stratum fixture {index}") + fixture.suffix.lower()
+             for index, fixture in enumerate(fixtures)]
+    for index, fixture in enumerate(fixtures):
+        shutil.copy2(fixture, music / names[index])
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
@@ -150,14 +212,14 @@ def disposable(navidrome_binary, fixture, state):
             deadline = time.monotonic() + 30
             while True:
                 songs = nav.request("getRandomSongs", size=10).get("randomSongs", {}).get("song", [])
-                if songs:
+                if len(songs) == len(fixtures):
                     break
                 if time.monotonic() > deadline:
                     raise RuntimeError("Navidrome did not scan the test track in 30 seconds")
                 time.sleep(0.2)
-            if len(songs) != 1:
-                raise RuntimeError("expected exactly one test track")
-            yield nav, songs[0], Navidrome(base, username, "deliberately-wrong-password")
+            if len(fixtures) > 1:
+                songs = identify_test_songs(nav, fixtures, songs)
+            yield nav, songs, Navidrome(base, username, "deliberately-wrong-password")
         finally:
             watchdog.cancel()
             stop_group(process)
@@ -394,7 +456,7 @@ def _metered_source(nav, song_id, bounded=True, block_source=None):
             metrics["block_cache_hits"] = block_source.hits
 
 
-def acquire(nav, song_id, start, frames, output, bounded=True, session=None):
+def acquire(nav, song_id, start, frames, output, bounded=True, session=None, cancel=None):
     """Fetch an original-source interval over authenticated Navidrome HTTP.
 
     The temporary gateway keeps upstream credentials out of FFmpeg arguments and
@@ -408,7 +470,7 @@ def acquire(nav, song_id, start, frames, output, bounded=True, session=None):
         run(FFMPEG + ["-protocol_whitelist", "file,http,tcp", "-ss", str(seek_seconds),
             "-i", url, "-map", "0:a:0", "-vn", "-map_metadata", "-1", "-af",
             f"atrim=start_sample={skip}:end_sample={skip + frames},asetpts=PTS-STARTPTS",
-            "-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24", str(output)])
+            "-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24", str(output)], cancel=cancel)
         acquisition_ms = (time.monotonic() - began) * 1000
     if any("error" in r for r in metrics["decoder_requests"]):
         raise RuntimeError("upstream acquisition had a transport error")

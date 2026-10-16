@@ -11,6 +11,7 @@ struct Delivery {
     frames: u64,
     segments: Vec<Segment>,
     underruns: Vec<Underrun>,
+    rendered_media_frames: Option<u64>,
 }
 #[derive(Deserialize)]
 struct Underrun {
@@ -67,6 +68,10 @@ fn main() -> Result<()> {
             }
         }
         end += segment.frames;
+    }
+    if let Some(rendered_frames) = delivery.rendered_media_frames {
+        ensure!(rendered_frames <= end, "rendered beyond accepted media");
+        media_bytes.truncate(rendered_frames as usize * ch * 4);
     }
     let mut expected_render = Vec::new();
     let mut position = 0;

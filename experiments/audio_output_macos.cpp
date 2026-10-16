@@ -12,6 +12,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <fstream>
+#include <filesystem>
 #include <iomanip>
 #include <iostream>
 #include <memory>
@@ -172,7 +173,12 @@ void selfTest() {
     std::cout << "{\"self_test\":\"passed: starvation, ordering, wraparound, tail, capture, EOF\"}" << std::endl;
 }
 
-int play(const Device& device, const std::string& output, uint64_t total, float gain) {
+struct Control {
+    uint64_t generation = 0, nextGeneration = 0, nextTotal = 0;
+    bool interrupted = false;
+};
+
+int play(const Device& device, const std::string& output, uint64_t total, float gain, Control* control = nullptr) {
     auto owner = std::make_unique<PCM>(total);
     PCM* pcm = owner.get();
     dispatch_queue_t callbacks = dispatch_queue_create("stratum.poc.output", DISPATCH_QUEUE_SERIAL);
@@ -185,7 +191,10 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
     format.mFramesPerPacket = 1; format.mChannelsPerFrame = Channels; format.mBitsPerChannel = 32;
     std::atomic<bool> drain{false};
     auto* drainFlag = &drain;
+    std::atomic<bool> resetting{false};
+    auto* resetFlag = &resetting;
     auto fill = ^(AudioQueueRef aq, AudioQueueBufferRef buffer) {
+        if (resetFlag->load()) return;
         auto frames = pcm->take(static_cast<int32_t*>(buffer->mAudioData));
         if (!frames) return;
         buffer->mAudioDataByteSize = UInt32(frames * Channels * 4);
@@ -205,46 +214,66 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
         for (auto& buffer : buffers) checked(AudioQueueAllocateBuffer(queue, Quantum * Channels * 4, &buffer), "allocate output buffer");
         auto before = Clock::now(), started = before;
         bool running = false, stopping = false, eof = false;
-        uint64_t discontinuities = 0;
+        uint64_t discontinuities = 0, stalePackets = 0;
         double queueTime = 0, hardwareRate = 0;
-        std::array<uint64_t, 2> header{};
+        std::array<uint64_t, 3> wireHeader{};
+        const size_t headerSize = (control ? 3 : 2) * sizeof(uint64_t);
+        auto* header = wireHeader.data() + (control ? 1 : 0);
         std::vector<int32_t> packet(Segment * Channels);
         size_t headerBytes = 0, bodyBytes = 0;
         checked(fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK) < 0 ? -1 : 0, "stdin nonblocking");
-        std::cout << "{\"event\":\"opened\",\"device\":" << deviceJSON(device) << "}" << std::endl;
+        auto genJSON = control ? ",\"generation\":" + std::to_string(control->generation) : "";
+        std::cout << "{\"event\":\"opened\",\"device\":" << deviceJSON(device) << genJSON << "}" << std::endl;
         while (true) {
             require(seconds(before) < 90, "output lifetime exceeded");
             require(!pcm->error.load(), "audio callback/queue failed");
             // Incremental nonblocking stdin packets; the callback never reads a pipe.
-            while (!eof && pcm->written < total) {
-                bool readingHeader = headerBytes < sizeof(header);
-                auto* destination = readingHeader ? reinterpret_cast<char*>(header.data()) + headerBytes
+            while (!eof && (pcm->written < total || control)) {
+                bool readingHeader = headerBytes < headerSize;
+                auto* destination = readingHeader ? reinterpret_cast<char*>(wireHeader.data()) + headerBytes
                                                   : reinterpret_cast<char*>(packet.data()) + bodyBytes;
-                size_t wanted = readingHeader ? sizeof(header) - headerBytes : header[1] * Channels * 4 - bodyBytes;
+                size_t wanted = readingHeader ? headerSize - headerBytes : header[1] * Channels * 4 - bodyBytes;
                 ssize_t got = read(STDIN_FILENO, destination, wanted);
                 if (got < 0 && (errno == EAGAIN || errno == EINTR)) break;
                 require(got >= 0, "PCM pipe read failed");
                 if (!got) { eof = true; break; }
                 if (readingHeader) {
                     headerBytes += got;
-                    if (headerBytes == sizeof(header))
-                        require(header[0] == pcm->written && header[1] > 0 && header[1] <= Segment &&
-                                header[1] <= total - header[0], "invalid PCM header");
+                    if (headerBytes == headerSize) {
+                        if (control && header[0] == UINT64_MAX) {
+                            require(wireHeader[0] > control->generation && header[1] > 0 && header[1] <= 32 * Rate + 100,
+                                    "invalid seek command");
+                            control->nextGeneration = wireHeader[0]; control->nextTotal = header[1];
+                            control->interrupted = true;
+                            break;
+                        }
+                        require(header[1] > 0 && header[1] <= Segment, "invalid PCM packet size");
+                        if (!control || wireHeader[0] == control->generation)
+                            require(header[0] == pcm->written && header[1] <= total - header[0], "invalid PCM header");
+                        else require(wireHeader[0] < control->generation, "PCM from future generation");
+                    }
                 } else {
                     bodyBytes += got;
                     if (bodyBytes == header[1] * Channels * 4) {
-                        pcm->append(header[0], packet.data(), header[1]);
+                        if (!control || wireHeader[0] == control->generation) pcm->append(header[0], packet.data(), header[1]);
+                        else {
+                            ++stalePackets;
+                            std::cout << "{\"event\":\"rejected\",\"generation\":" << wireHeader[0]
+                                      << ",\"active_generation\":" << control->generation << "}" << std::endl;
+                        }
                         headerBytes = bodyBytes = 0;
                     }
                 }
             }
+            if (control && control->interrupted) break;
             require(!eof || pcm->written == total, "PCM producer ended early");
-            if (!running && pcm->written >= std::min(3 * Segment, total)) {
+            auto startupFrames = control && control->generation > 0 ? Segment : 3 * Segment;
+            if (!running && pcm->written >= std::min(startupFrames, total)) {
                 auto aq = queue;
                 for (auto buffer : buffers) dispatch_sync(callbacks, ^{ fill(aq, buffer); });
                 checked(AudioQueueStart(queue, nullptr), "start output");
                 started = Clock::now(); running = true;
-                std::cout << "{\"event\":\"started\"}" << std::endl;
+                std::cout << "{\"event\":\"started\"" << genJSON << "}" << std::endl;
             }
             if (running) {
                 AudioTimeStamp stamp{}; Boolean discontinuity = false;
@@ -265,9 +294,17 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
             size = sizeof(hardwareRate);
             checked(AudioQueueGetProperty(queue, kAudioQueueDeviceProperty_SampleRate, &hardwareRate, &size), "read output rate");
             std::cout << "{\"event\":\"status\",\"accepted\":" << pcm->written << ",\"consumed\":" << pcm->consumed
-                      << ",\"rendered\":" << pcm->rendered << ",\"queue_sample_time\":" << queueTime << "}" << std::endl;
+                      << ",\"rendered\":" << pcm->rendered << ",\"queue_sample_time\":" << queueTime << genJSON << "}" << std::endl;
             pollfd input{STDIN_FILENO, POLLIN, 0};
-            poll(pcm->written < total ? &input : nullptr, pcm->written < total ? 1 : 0, 20);
+            bool readControl = pcm->written < total || control;
+            poll(readControl ? &input : nullptr, readControl ? 1 : 0, 20);
+        }
+        bool interrupted = control && control->interrupted;
+        if (interrupted) {
+            // Stop(true) can return queued buffers through the callback. Quiesce
+            // our serial callback first so it cannot enqueue during the reset.
+            dispatch_sync(callbacks, ^{ resetFlag->store(true); });
+            checked(AudioQueueStop(queue, true), "flush old output");
         }
         double elapsed = seconds(started);
         UInt32 converterError = 0, size = sizeof(converterError);
@@ -275,7 +312,9 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
         checked(AudioQueueDisposeTimeline(queue, timeline), "dispose timeline"); timeline = nullptr;
         checked(AudioQueueDispose(queue, true), "dispose queue"); queue = nullptr;
         dispatch_sync(callbacks, ^{});
-        require(pcm->consumed == total && !pcm->error && !converterError, "incomplete device output");
+        require(interrupted || pcm->consumed == total, "incomplete device output");
+        checked(pcm->error.load(), "output callback");
+        checked(converterError, "output converter");
         std::ofstream raw(output + "/rendered.s32le", std::ios::binary);
         raw.write(reinterpret_cast<char*>(pcm->capture.data()), pcm->rendered * Channels * 4);
         raw.close(); require(bool(raw), "capture write failed");
@@ -285,6 +324,8 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
                << ",\"consumed_frames\":" << pcm->consumed << ",\"rendered_frames\":" << pcm->rendered
                << ",\"silence_frames\":" << pcm->silence << ",\"callbacks\":" << pcm->callbacks
                << ",\"elapsed_seconds\":" << elapsed << ",\"queue_sample_time\":" << queueTime
+               << ",\"accepted_frames\":" << pcm->written << ",\"stale_packets_rejected\":" << stalePackets
+               << ",\"interrupted\":" << (interrupted ? "true" : "false") << genJSON
                << ",\"timeline_discontinuities\":" << discontinuities << ",\"underruns\":[";
         for (uint64_t i = 0; i < pcm->underrunCount; ++i) {
             if (i) report << ',';
@@ -294,7 +335,7 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
         report << "]}";
         std::ofstream metadata(output + "/device.json"); metadata << report.str() << '\n';
         metadata.close(); require(bool(metadata), "device report write failed");
-        std::cout << "{\"event\":\"finished\"}" << std::endl;
+        std::cout << "{\"event\":" << quote(interrupted ? "flushed" : "finished") << genJSON << "}" << std::endl;
         dispatch_release(callbacks);
         return 0;
     } catch (...) {
@@ -315,11 +356,25 @@ int main(int argc, char** argv) {
             for (size_t i = 0; i < list.size(); ++i) { if (i) std::cout << ','; std::cout << deviceJSON(list[i]); }
             std::cout << ']' << std::endl; return 0;
         }
-        require(argc == 9 && std::string(argv[1]) == "--device" && std::string(argv[3]) == "--out" &&
+        bool interactive = argc == 10 && std::string(argv[9]) == "--interactive";
+        require((argc == 9 || interactive) && std::string(argv[1]) == "--device" && std::string(argv[3]) == "--out" &&
                 std::string(argv[5]) == "--total" && std::string(argv[7]) == "--gain", "usage: --list | --self-test | --device UID --out DIR --total FRAMES --gain 0..1");
         float gain = std::stof(argv[8]); require(std::isfinite(gain) && gain >= 0 && gain <= 1, "invalid gain");
         for (const auto& device : devices())
-            if (device.uid == argv[2]) return play(device, argv[4], std::stoull(argv[6]), gain);
+            if (device.uid == argv[2]) {
+                if (!interactive) return play(device, argv[4], std::stoull(argv[6]), gain);
+                Control control;
+                uint64_t total = std::stoull(argv[6]);
+                for (unsigned count = 0; count < 8; ++count) {
+                    auto path = std::filesystem::path(argv[4]) / ("generation-" + std::to_string(control.generation));
+                    require(std::filesystem::create_directory(path), "generation output already exists");
+                    play(device, path.string(), total, gain, &control);
+                    if (!control.interrupted) return 0;
+                    total = control.nextTotal;
+                    control = Control{control.nextGeneration, 0, 0, false};
+                }
+                throw std::runtime_error("seek command budget exceeded");
+            }
         throw std::runtime_error("selected stereo output is unavailable");
     } catch (const std::exception& error) {
         std::cerr << "Stratum output: " << error.what() << std::endl;

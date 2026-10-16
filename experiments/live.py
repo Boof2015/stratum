@@ -94,8 +94,10 @@ class Playback:
     rendered.s32le includes every starvation quantum. Per-segment PCM files are
     also checked afterward against the source, separately from delivery timing.
     """
-    def __init__(self, output):
+    def __init__(self, output, total=TOTAL, start_buffer=START_BUFFER):
         self.output = output
+        self.total = total
+        self.start_buffer = min(total, start_buffer)
         self.lock = threading.Lock()
         self.queue = deque()
         self.frames = 0
@@ -119,12 +121,12 @@ class Playback:
             nav.require(len(pcm) % FRAME_BYTES == 0, "partial PCM frame")
             self.queue.append((memoryview(pcm), time.monotonic()))
             self.frames += len(pcm) // FRAME_BYTES
-            if self.frames >= START_BUFFER:
+            if self.frames >= self.start_buffer:
                 self.ready.set()
 
     def consume(self, count, deadline=float("inf")):
         with self.lock:
-            count = min(count, TOTAL - self.consumed)
+            count = min(count, self.total - self.consumed)
             if self.frames < count:
                 return None, count
             # A late wakeup must not make data that missed the scheduled audio
@@ -153,12 +155,15 @@ class Playback:
     def play(self):
         try:
             nav.require(self.ready.wait(25), "startup buffer deadline exceeded")
+            nav.require(not self.cancel.is_set(), "playback cancelled")
             self.started = time.monotonic()
             tick, starving = 0, False
             with (self.output / "rendered.s32le").open("wb") as sink:
-                while self.consumed < TOTAL and not self.cancel.is_set():
+                while self.consumed < self.total and not self.cancel.is_set():
                     deadline = self.started + tick * QUANTUM / RATE
                     self.cancel.wait(max(0, deadline - time.monotonic()))
+                    if self.cancel.is_set():
+                        break
                     now = time.monotonic()
                     nav.require(now - self.started < 65, "playback lifetime exceeded")
                     self.max_wake_late_ms = max(self.max_wake_late_ms, (now - deadline) * 1000)
@@ -177,7 +182,7 @@ class Playback:
                     sink.write(pcm)
                     tick += 1
                 # Wait out the final quantum instead of ending a tick early.
-                end = self.started + (TOTAL + self.silence_frames) / RATE
+                end = self.started + (self.total + self.silence_frames) / RATE
                 self.cancel.wait(max(0, end - time.monotonic()))
                 nav.require(not self.cancel.is_set(), "playback cancelled")
             self.elapsed = time.monotonic() - self.started

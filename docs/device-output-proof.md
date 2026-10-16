@@ -167,3 +167,6 @@ track, sustained device interruptions and Astra integration remain separate work
 
 The output uses Apple's [Audio Queue Services](https://developer.apple.com/documentation/audiotoolbox/audio-queue-services)
 and [queue timeline](https://developer.apple.com/documentation/audiotoolbox/audioqueuegetcurrenttime(_:_:_:_:)).
+
+The later [seek/skip proof](seek-proof.md) adds explicit generation resets and
+tests cancellation while this native output is running.
