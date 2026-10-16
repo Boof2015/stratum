@@ -179,3 +179,7 @@ had zero measured lag. No device timeline discontinuities were reported.
 build pass. The native self-test passes. The final fully-queued-control adjustment
 was checked with the short output probe after the full music run. Test processes
 were stopped. No Astra source or real-server library/settings were changed.
+
+For native 44.1/48/96 kHz sources feeding an explicit fixed client output clock,
+see the [mixed-rate seek/skip extension](mixed-seek-proof.md). The original
+48 kHz command above retains its defaults.

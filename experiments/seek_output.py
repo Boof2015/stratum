@@ -12,8 +12,10 @@ import navidrome as nav
 
 
 class FileTimeline:
-    def __init__(self, output, total):
+    def __init__(self, output, total, rate=live.RATE):
         self.output, self.players, self.threads = output, {}, {}
+        nav.require(rate in (44100, 48000, 96000), "unsupported output clock")
+        self.rate = rate
         self.generation, self.started = -1, None
         self.switch(0, total)
 
@@ -29,7 +31,7 @@ class FileTimeline:
         folder.mkdir()
         (folder / "rendered.s32le").touch()
         player = live.Playback(folder, total=total,
-                               start_buffer=live.START_BUFFER if generation == 0 else live.SEGMENT)
+                               start_buffer=3 * (2 * self.rate + 1) if generation == 0 else 2 * self.rate + 1, rate=self.rate)
         self.players[generation] = player
         thread = threading.Thread(target=player.play, daemon=True)
         self.threads[generation] = thread
@@ -46,7 +48,7 @@ class FileTimeline:
         if self.started is None and p.started is not None:
             self.started = p.started
         with p.lock:
-            accepted, consumed, buffered = p.consumed + p.frames, p.consumed, p.frames / live.RATE
+            accepted, consumed, buffered = p.consumed + p.frames, p.consumed, p.frames / self.rate
         return {"accepted": accepted, "consumed": consumed, "started": p.started,
                 "underruns": p.underruns, "silence_frames": p.silence_frames,
                 "buffered": buffered, "done": p.done.is_set()}
@@ -67,8 +69,10 @@ class FileTimeline:
 
 
 class NativeTimeline:
-    def __init__(self, output, total, helper, device, gain):
+    def __init__(self, output, total, helper, device, gain, rate=live.RATE):
         self.output, self.device = output, device
+        nav.require(rate in (44100, 48000, 96000), "unsupported output clock")
+        self.rate = rate
         self.condition = threading.Condition()
         self.write_lock = threading.Lock()
         self.generation, self.started = 0, None
@@ -78,7 +82,7 @@ class NativeTimeline:
         self.done = threading.Event()
         self.log = (output / "device-stderr.log").open("wb")
         self.process = subprocess.Popen([str(helper), "--device", device, "--out", str(output),
-            "--total", str(total), "--gain", str(gain), "--interactive"],
+            "--total", str(total), "--gain", str(gain), "--rate", str(rate), "--interactive"],
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.log, bufsize=0)
         os.set_blocking(self.process.stdin.fileno(), False)
         self.thread = threading.Thread(target=self.read, daemon=True)
@@ -128,7 +132,7 @@ class NativeTimeline:
             if generation != self.generation:
                 return False
             count, remainder = divmod(len(pcm), live.FRAME_BYTES)
-            nav.require(not remainder and 0 < count <= live.SEGMENT, "invalid PCM packet")
+            nav.require(not remainder and 0 < count <= 2 * self.rate + 1, "invalid PCM packet")
             self.write(struct.pack("<QQQ", generation, start, count) + pcm)
             self.wait(lambda: self.states[generation]["accepted"] >= start + count)
             return True
@@ -142,7 +146,7 @@ class NativeTimeline:
     def snapshot(self, generation):
         with self.condition:
             state = dict(self.states[generation])
-        state["buffered"] = (state["accepted"] - state["consumed"]) / live.RATE
+        state["buffered"] = (state["accepted"] - state["consumed"]) / self.rate
         return state
 
     def read(self):
@@ -170,6 +174,7 @@ class NativeTimeline:
                             state.update(accepted=msg["accepted"], consumed=msg["consumed"])
                         elif kind in ("flushed", "finished"):
                             report = json.loads((self.output / f"generation-{generation}" / "device.json").read_text())
+                            nav.require(report["client_sample_rate"] == self.rate, "native output clock changed")
                             state.update(accepted=report["accepted_frames"], consumed=report["consumed_frames"],
                                          underruns=report["underruns"], silence_frames=report["silence_frames"],
                                          device_report=report, done=True)

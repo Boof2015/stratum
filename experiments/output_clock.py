@@ -55,8 +55,9 @@ class Converter:
     send(start, pcm) admits output PCM into the existing sink. The converter
     never pads, flushes during starvation, or resets at a quality change.
     """
-    def __init__(self, part, output_rate, send, directory):
+    def __init__(self, part, output_rate, send, directory, cancel=None):
         self.part, self.rate, self.send = part, output_rate, send
+        self.cancel = cancel
         self.input_rate = part['sample_rate']
         self.expected_input = part['input_end'] - part['input_origin']
         self.input_frames = self.raw_output_frames = self.output_frames = 0
@@ -84,7 +85,12 @@ class Converter:
                 self.close()
                 raise
 
+    def _check(self):
+        if self.cancel is not None and self.cancel.is_set():
+            raise nav.Cancelled("superseded output conversion")
+
     def _emit(self, data):
+        self._check()
         self.partial.extend(data)
         size = len(self.partial) // FRAME_BYTES * FRAME_BYTES
         if not size:
@@ -101,6 +107,7 @@ class Converter:
         # arrive at once. No source-frame count is used as an output-frame count.
         quantum = 2 * self.rate
         while lo < hi:
+            self._check()
             take = min(quantum, hi - lo)
             payload = block[(lo - start) * FRAME_BYTES:(lo - start + take) * FRAME_BYTES]
             self.send(self.part['output_start'] + self.output_frames, payload)
@@ -116,6 +123,7 @@ class Converter:
             self.selector.register(process.stdin, selectors.EVENT_WRITE)
         eof = False
         while payload or (not eof if final else self.raw_output_frames < target):
+            self._check()
             nav.require(time.monotonic() < local_deadline, 'resampler pipe timed out')
             for key, _ in self.selector.select(0.05):
                 if key.fileobj is process.stdin:
@@ -143,6 +151,7 @@ class Converter:
         return eof
 
     def append(self, source_start, pcm):
+        self._check()
         nav.require(not self.finished and not self.closed and len(pcm) % FRAME_BYTES == 0 and len(pcm) > 0,
                     'invalid converter input')
         frames = len(pcm) // FRAME_BYTES
@@ -161,6 +170,7 @@ class Converter:
             self.peak_pending_output_frames = max(self.peak_pending_output_frames, expected - self.raw_output_frames)
 
     def finish(self):
+        self._check()
         nav.require(not self.finished and not self.closed and self.input_frames == self.expected_input,
                     'converter finished before native EOF/context')
         if self.process is not None:
@@ -178,12 +188,17 @@ class Converter:
                 'discard_output_end': self.raw_output_frames - self.part['discard_output_start'] - self.output_frames}
 
     def close(self):
+        # Called by the owning worker, never concurrently with append/finish.
+        # Other threads cancel via the event; the output gate handles late sends.
         if self.closed:
             return
         self.closed = True
         if self.process is not None:
             if self.process.poll() is None:
-                self.process.terminate()
+                if self.cancel is not None and self.cancel.is_set():
+                    self.process.kill()  # Obsolete state must not drain into a blocked output pipe.
+                else:
+                    self.process.terminate()
                 try:
                     self.process.wait(timeout=2)
                 except subprocess.TimeoutExpired:

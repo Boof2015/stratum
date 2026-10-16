@@ -37,6 +37,9 @@ struct Underrun {
 }
 #[derive(Deserialize)]
 struct Delivery {
+    #[serde(default)]
+    seek: bool,
+    rendered_media_frames: Option<u64>,
     output_rate: u64,
     frames: u64,
     tracks: Vec<Track>,
@@ -49,7 +52,8 @@ fn main() -> Result<()> {
     let parent = path.parent().unwrap();
     let delivery: Delivery = serde_json::from_slice(&fs::read(&path)?)?;
     ensure!(
-        SOURCE_RATES.contains(&delivery.output_rate) && delivery.tracks.len() == 2,
+        SOURCE_RATES.contains(&delivery.output_rate)
+            && delivery.tracks.len() == if delivery.seek { 1 } else { 2 },
         "invalid output policy"
     );
     ensure!(
@@ -78,7 +82,8 @@ fn main() -> Result<()> {
             "invalid source range"
         );
         ensure!(
-            (index != 0 || end == source.info.frames) && (index != 1 || track.origin == 0),
+            delivery.seek
+                || ((index != 0 || end == source.info.frames) && (index != 1 || track.origin == 0)),
             "not real EOF into frame zero"
         );
         ensure!(
@@ -178,10 +183,18 @@ fn main() -> Result<()> {
             position += segment.frames;
             segments_seen += 1;
         }
-        ensure!(position == track.input_end, "native track incomplete");
+        ensure!(
+            delivery.seek || position == track.input_end,
+            "native track incomplete"
+        );
         let converted = fs::read(parent.join(&track.output_pcm))?;
         ensure!(
-            converted.len() as u64 == track.output_frames * 8,
+            converted.len().is_multiple_of(8)
+                && if delivery.seek {
+                    converted.len() as u64 <= track.output_frames * 8
+                } else {
+                    converted.len() as u64 == track.output_frames * 8
+                },
             "output track incomplete"
         );
         output.extend_from_slice(&converted);
@@ -193,9 +206,18 @@ fn main() -> Result<()> {
                 "evaluable_windows":codec_windows,"inconclusive":codec_inconclusive}}));
     }
     ensure!(
-        segments_seen == delivery.segments.len() && output_end == delivery.frames,
+        segments_seen == delivery.segments.len()
+            && output.len() as u64 == delivery.frames * 8
+            && (delivery.seek || output_end == delivery.frames),
         "unexpected native/output frames"
     );
+    if let Some(frames) = delivery.rendered_media_frames {
+        ensure!(
+            delivery.seek && frames <= delivery.frames,
+            "invalid consumed prefix"
+        );
+        output.truncate(frames as usize * 8);
+    }
     let (mut rendered, mut at) = (Vec::new(), 0);
     for underrun in delivery.underruns {
         let next = underrun.at_media_frame as usize * 8;
@@ -210,7 +232,7 @@ fn main() -> Result<()> {
     rendered.extend_from_slice(&output[at..]);
     println!(
         "{}",
-        json!({"tracks":checks,"frames":output_end,"exact_frames":true,
+        json!({"tracks":checks,"frames":delivery.frames,"exact_frames":true,
         "rendered_matches":rendered==fs::read(parent.join("rendered.s32le"))?})
     );
     Ok(())

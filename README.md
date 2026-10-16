@@ -186,6 +186,9 @@ processed output, with native lossless delivery checked separately from output
 resampling. It does not implement bit-perfect format changes. See the
 [policy, commands and results](docs/mixed-rate-proof.md).
 
+The [mixed-rate seek/skip proof](docs/mixed-seek-proof.md) exercises cancellation
+and late converter output while seeking and skipping between native rates.
+
 ## Checks
 
 ```sh

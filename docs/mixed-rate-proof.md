@@ -213,3 +213,6 @@ transport guarantees or remove the known Navidrome source-revision limitations.
 
 References: [FFmpeg resampler options](https://ffmpeg.org/ffmpeg-resampler.html)
 and [libswresample state and draining](https://ffmpeg.org/doxygen/trunk/group__lswr.html).
+
+The next [mixed-rate seek/skip proof](mixed-seek-proof.md) checks cancellation
+of converter input, buffered output and EOF drain after a position change.

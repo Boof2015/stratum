@@ -21,6 +21,7 @@ import time
 import urllib.parse
 
 import live
+from handoff import acquisition_interval, validate_envelope as validate_native_envelope
 import navidrome as nav
 from seek_output import FileTimeline, NativeTimeline
 from source_session import SourceSession
@@ -111,13 +112,18 @@ class SeekServer:
                     self.connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 4096)
                     url = urllib.parse.urlsplit(self.path)
                     params = urllib.parse.parse_qs(url.query, strict_parsing=True)
-                    nav.require(url.path == owner.route and set(params) == {"generation", "track", "start", "quality"},
+                    nav.require(url.path == owner.route and set(params) in ({"generation", "track", "start", "quality"},
+                                    {"generation", "track", "start", "frames", "quality"})
+                                and all(len(v) == 1 for v in params.values()),
                                 "invalid request")
                     gen, track, start = (int(params[k][0]) for k in ("generation", "track", "start"))
                     quality = params["quality"][0]
                     nav.require(0 <= gen < 5 and track in (0, 1) and quality in live.QUALITIES, "invalid identity")
-                    nav.require(nav.CONTEXT <= start and start + SEGMENT + nav.CONTEXT <= owner.infos[track]["frames"],
-                                "invalid source interval")
+                    rate = owner.infos[track]["sample_rate"]
+                    frames = int(params.get("frames", [str(SEGMENT)])[0])
+                    nav.require(0 < frames <= 2 * rate + 1 and 0 <= start
+                                and start + frames <= owner.infos[track]["frames"], "invalid source interval")
+                    begin, count, trim = acquisition_interval(start, frames, owner.infos[track]["frames"], rate)
                     cancel = owner.flag(gen)
                     with owner.lock:
                         nav.require(len(owner.records) < 80, "request budget exceeded")
@@ -125,17 +131,17 @@ class SeekServer:
                             owner.sessions[gen] = SourceSession(owner.account, owner.songs[track]["id"])
                         session = owner.sessions[gen]
                         record = {"generation": gen, "track": track, "source_start": start, "quality": quality,
-                                  "began": time.monotonic(), "sent_bytes": 0}
+                                  "frames": frames, "sample_rate": rate, "began": time.monotonic(), "sent_bytes": 0}
                         owner.records.append(record)
                         work = owner.output / f"request-{len(owner.records):03d}"
                         work.mkdir()
                     if cancel.is_set():
                         raise nav.Cancelled("cancelled before acquisition")
                     source = work / "source.flac"
-                    record["acquisition"] = nav.acquire(owner.account, owner.songs[track]["id"], start - nav.CONTEXT,
-                        SEGMENT + 2 * nav.CONTEXT, source, session=session, cancel=cancel)
+                    record["acquisition"] = nav.acquire(owner.account, owner.songs[track]["id"], begin,
+                        count, source, session=session, cancel=cancel, rate=rate)
                     segment = json.loads(nav.run([str(owner.binary), "segment", "--source", str(source),
-                        "--start-frame", str(nav.CONTEXT), "--frames", str(SEGMENT), "--quality", quality,
+                        "--start-frame", str(trim), "--frames", str(frames), "--quality", quality,
                         "--cache", str(work / "cache")], cancel=cancel))
                     payload = Path(segment["path"]).read_bytes()
                     nav.require(len(payload) <= live.MAX_PAYLOAD, "oversized segment")
@@ -144,7 +150,7 @@ class SeekServer:
                     if cancel.wait(0.06):
                         raise nav.Cancelled("cancelled before headers")
                     envelope = {"generation": gen, "track": track, "source_start": start,
-                                "frames": SEGMENT, "metadata": segment["metadata"]}
+                                "frames": frames, "metadata": segment["metadata"]}
                     self.send_response(200)
                     self.send_header("Content-Length", str(len(payload)))
                     self.send_header("X-Stratum-Test", base64.b64encode(json.dumps(envelope).encode()).decode())
@@ -196,16 +202,11 @@ class SeekServer:
             connection.close()
 
 
-def validate_envelope(envelope, generation, track, source_start, quality):
+def validate_envelope(envelope, generation, track, source_start, quality, frames=SEGMENT, rate=RATE):
     nav.require((envelope["generation"], envelope["track"], envelope["source_start"], envelope["frames"])
-                == (generation, track, source_start, SEGMENT), "response belongs to another playback position")
-    meta = envelope["metadata"]
-    nav.require(meta["quality"] == quality and meta["sample_rate"] == RATE and meta["channels"] == 2,
-                "response format mismatch")
-    nav.require(meta["presentation"]["frames"] == SEGMENT and
-                meta["discard_start_frames"] + SEGMENT + meta["discard_end_frames"] == meta["decoded_frames"],
-                "invalid segment trimming")
-    return meta
+                == (generation, track, source_start, frames), "response belongs to another playback position")
+    return validate_native_envelope(envelope, {"generation": generation, "track": track,
+        "source_start": source_start, "frames": frames}, quality, rate)
 
 
 class Client:
