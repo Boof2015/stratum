@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 /// Experimental clock: one frame contains one sample per channel.
 pub const RATE: u64 = 48_000;
+pub const SOURCE_RATES: [u64; 3] = [44_100, RATE, 96_000];
 pub const MAX_SEGMENT_FRAMES: u64 = 30 * RATE;
 /// Encoder context, separate from Ogg Opus pre-skip. An experimental value.
 pub const CONTEXT_FRAMES: u64 = 120 * RATE / 1000;
@@ -19,7 +20,7 @@ impl Interval {
     }
 
     pub fn at_rate(start: u64, frames: u64, total: u64, rate: u64) -> Result<Self> {
-        ensure!([44_100, RATE].contains(&rate), "unsupported source clock");
+        ensure!(SOURCE_RATES.contains(&rate), "unsupported source clock");
         ensure!(frames > 0, "an interval must contain at least one frame");
         ensure!(frames <= 30 * rate, "intervals are limited to 30 seconds");
         let end = start.checked_add(frames).context("interval overflow")?;
@@ -38,11 +39,14 @@ impl Interval {
     pub fn context_at_rate(self, total: u64, rate: u64) -> Self {
         let context = 120 * rate / 1000;
         let mut start = self.start.saturating_sub(context);
-        // 147 source frames = 160 Opus frames. Start the resampler on the
-        // same phase as a conversion anchored at the original track's zero.
-        if rate == 44_100 {
-            start -= start % 147;
-        }
+        // Align with the phase of a conversion anchored at track frame zero:
+        // 147 native frames = 160 Opus frames at 44.1 kHz; 2 = 1 at 96 kHz.
+        let stride = match rate {
+            44_100 => 147,
+            96_000 => 2,
+            _ => 1,
+        };
+        start -= start % stride;
         let end = self.end().saturating_add(context).min(total);
         Self {
             start,
@@ -99,5 +103,19 @@ mod tests {
         assert!(segment.start - context.start < 5292 + 147);
         assert!(Interval::at_rate(0, 30 * 44100 + 1, 32 * 44100, 44100).is_err());
         assert!(converted_frames(u64::MAX, 1, u64::MAX).is_err());
+    }
+
+    #[test]
+    fn high_rate_context_keeps_even_phase_and_exact_native_requests() {
+        for start in [0, 1, 2, 3, 150 * 96000 + 37, 150 * 96000 + 38] {
+            let interval = Interval::at_rate(start, 192001, 154 * 96000, 96000).unwrap();
+            let context = interval.context_at_rate(154 * 96000, 96000);
+            assert_eq!(context.start % 2, 0);
+            assert_eq!(context.end(), interval.end() + 11520);
+            let codec = converted_frames(context.frames, 96000, 48000).unwrap();
+            assert_eq!(codec * 2 - context.frames, context.frames % 2);
+        }
+        assert!(Interval::at_rate(0, 30 * 96000, 31 * 96000, 96000).is_ok());
+        assert!(Interval::at_rate(0, 30 * 96000 + 1, 31 * 96000, 96000).is_err());
     }
 }

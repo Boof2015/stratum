@@ -6,7 +6,7 @@ FLAC retains its rate and exact PCM, and the client output also runs at 44.1 kHz
 This differs from the previous Bluetooth runs, which supplied 48 kHz client PCM
 and let CoreAudio convert it to a 44.1 kHz device.
 
-The supported input set is now 44.1/48 kHz, mono/stereo, 16/24-bit FLAC or PCM WAV.
+At this stage, the supported input set was 44.1/48 kHz, mono/stereo, 16/24-bit FLAC or PCM WAV.
 The handoff/device harness requires stereo and two tracks at the **same rate**.
 There is no Astra integration or production Sidecar service in this change.
 
@@ -158,3 +158,10 @@ are not implemented by these proofs.
 
 Codec timing reference: [Ogg Opus PCM positions and trimming](https://www.rfc-editor.org/rfc/rfc7845.html#section-4).
 Conversion settings: [FFmpeg resampler documentation](https://ffmpeg.org/ffmpeg-resampler.html).
+
+## Subsequent 96 kHz extension
+
+The later [high-rate proof](high-rate-proof.md) adds 96 kHz sources, even-frame
+resampler-phase anchoring and native buffer allocation by seconds. The 44.1 kHz
+results above are unchanged historical runs; current support and the new
+measurement-window reasoning are documented there.

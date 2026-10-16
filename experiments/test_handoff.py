@@ -9,6 +9,61 @@ import live
 
 
 class HandoffTests(unittest.TestCase):
+    def test_high_rate_music_requires_independent_codec_alignment(self):
+        checks = {"sample_rate": 96000, "inconclusive": 0, "zero_lag": False,
+                  "native_lag_within_codec_frame": True,
+                  "nonzero_alignment_windows": [{"quality": "opus-64", "lag": 1}],
+                  "lossy_codec_alignment": {"sample_rate": 48000, "evaluable_windows": 6,
+                                            "inconclusive": 0, "zero_lag": True}}
+        self.assertTrue(handoff.alignment_passes(checks))
+        for key, value in (("sample_rate", 48000), ("inconclusive", 1),
+                           ("native_lag_within_codec_frame", False),
+                           ("nonzero_alignment_windows", [{"quality": "lossless", "lag": 1}]),
+                           ("lossy_codec_alignment", {})):
+            changed = copy.deepcopy(checks)
+            changed[key] = value
+            self.assertFalse(handoff.alignment_passes(changed))
+        for key, value in (("zero_lag", False), ("inconclusive", 1), ("evaluable_windows", 0),
+                           ("sample_rate", 96000)):
+            changed = copy.deepcopy(checks)
+            changed["lossy_codec_alignment"][key] = value
+            self.assertFalse(handoff.alignment_passes(changed))
+
+    def test_96000_clock_keeps_even_conversion_phase_and_odd_eof(self):
+        clock = handoff.Clock(96000)
+        plans = handoff.intervals([clock.boundary, clock.total - clock.boundary], rate=96000)
+        self.assertEqual(plans[6]["frames"], 1)
+        self.assertEqual(plans[7]["start"], 1152007)
+        self.assertEqual(sum(plan["frames"] for plan in plans), 3072016)
+        for start in (0, 1, 2, 3, 150 * 96000 + 37, 150 * 96000 + 38):
+            begin, frames, trim = handoff.acquisition_interval(start, 192001, 160 * 96000, 96000)
+            self.assertEqual(begin % 2, 0)
+            self.assertEqual(begin + trim, start)
+            self.assertEqual(begin + frames, start + 192001 + 11520)
+        with self.assertRaises(RuntimeError):
+            handoff.playback_ranges([{"frames": 160 * 96000, "sample_rate": 96000},
+                                    {"frames": 160 * 48000, "sample_rate": 48000}], True)
+
+    def test_96000_sink_and_codec_mapping_use_native_frames(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sink = live.Playback(Path(temporary), total=96000, start_buffer=1, rate=96000)
+            sink.append(0, bytes(96000 * 8))
+            self.assertEqual(sink.buffered(), 1)
+            self.assertEqual(sink.quantum, 1920)
+        plan = {"track": 1, "source_start": 0, "start": 1152007, "frames": 192001}
+        envelope = {**plan, "metadata": {"quality": "opus-64", "sample_rate": 96000, "channels": 2,
+                    "presentation": {"frames": 192001}, "encoded_interval": {"frames": 203521},
+                    "discard_start_frames": 0, "discard_end_frames": 11521,
+                    "decoded_frames": 203522, "codec_sample_rate": 48000,
+                    "codec_decoded_frames": 101761, "resample_tail_frames": 1}}
+        handoff.validate_envelope(envelope, plan, "opus-64", 96000)
+        for key, value in (("codec_sample_rate", 96000), ("codec_decoded_frames", 203522),
+                           ("resample_tail_frames", 2), ("sample_rate", 48000)):
+            changed = copy.deepcopy(envelope)
+            changed["metadata"][key] = value
+            with self.assertRaises(RuntimeError):
+                handoff.validate_envelope(changed, plan, "opus-64", 96000)
+
     def test_441_clock_preserves_native_frames_and_rejects_mixed_rates(self):
         clock = handoff.Clock(44100)
         plans = handoff.intervals([clock.boundary, clock.total - clock.boundary], rate=44100)

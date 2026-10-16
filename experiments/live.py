@@ -96,7 +96,7 @@ class Playback:
     also checked afterward against the source, separately from delivery timing.
     """
     def __init__(self, output, total=TOTAL, start_buffer=START_BUFFER, rate=RATE):
-        nav.require(rate in (44100, 48000), "unsupported playback clock")
+        nav.require(rate in (44100, 48000, 96000), "unsupported playback clock")
         self.rate, self.quantum = rate, rate // 50
         self.output = output
         self.total = total

@@ -7,7 +7,7 @@ fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let output = args
         .next()
-        .context("usage: cargo run --example fixture -- output.flac [44100|48000]")?;
+        .context("usage: cargo run --example fixture -- output.flac [44100|48000|96000]")?;
     let rate = args
         .next()
         .map(|value| value.parse::<u64>())

@@ -1,7 +1,7 @@
 use crate::{
     media::{decode, presentation_pcm, Engine, Quality, Segment, Source},
     process::{ffmpeg, run},
-    timeline::RATE,
+    timeline::{converted_frames, RATE, SOURCE_RATES},
 };
 use anyhow::{ensure, Result};
 use serde::Serialize;
@@ -26,7 +26,7 @@ pub fn fixture_at_rate(
     bits: u32,
     rate: u64,
 ) -> Result<()> {
-    ensure!([44_100, RATE].contains(&rate), "unsupported fixture rate");
+    ensure!(SOURCE_RATES.contains(&rate), "unsupported fixture rate");
     ensure!(
         (1..=2).contains(&channels) && [16, 24].contains(&bits),
         "unsupported fixture format"
@@ -49,7 +49,10 @@ pub fn fixture_at_rate(
                 + 0.13 * (TAU * 431.0 * time).sin()
                 + 0.09 * (TAU * 997.0 * time).sin())
             + 0.07 * noise
-            + 0.04 * pulse * (TAU * 3127.0 * time).sin();
+            + 0.04 * pulse * (TAU * 3127.0 * time).sin()
+            // Native high-band content exposes an accidental 48 kHz lossless
+            // round trip. Measurement fixture only; never headphone material.
+            + if rate == 96_000 { 0.03 * (TAU * 30_017.0 * time).sin() } else { 0.0 };
         for channel in 0..channels {
             let value = if channel == 0 {
                 base
@@ -129,9 +132,21 @@ pub struct Alignment {
 /// Compare against a separate full-source decode, not the segment's own metadata.
 /// Three windows per channel detect startup, mid-segment and end alignment.
 pub fn alignment(reference: &[i32], actual: &[i32], start: u64, channels: u32) -> Vec<Alignment> {
+    alignment_at_rate(reference, actual, start, channels, RATE)
+}
+
+/// Keep at least the original ~43 ms observation window at higher rates.
+/// This changes measurement duration, never the presented PCM or expected lag.
+pub fn alignment_at_rate(
+    reference: &[i32],
+    actual: &[i32],
+    start: u64,
+    channels: u32,
+    rate: u64,
+) -> Vec<Alignment> {
     let ch = channels as usize;
     let frames = actual.len() / ch;
-    let width = frames.min(2048);
+    let width = frames.min((2048 * rate.max(RATE) / RATE) as usize);
     if width < 128 {
         return Vec::new();
     }
@@ -176,6 +191,77 @@ pub fn alignment(reference: &[i32], actual: &[i32], start: u64, channels: u32) -
         }
     }
     results
+}
+
+/// Independent waveform comparison on Opus's 48 kHz grid for 96 kHz sources.
+/// The reference is a full-source decode at 48 kHz, not an encoded segment.
+/// Native frame ordering/counts must still be verified separately. This cannot
+/// establish sub-codec-frame accuracy of arbitrary lossy waveform estimates.
+pub fn opus_clock_alignment(
+    reference_48: &[i32],
+    actual_96: &[i32],
+    start_96: u64,
+    channels: u32,
+) -> Result<Vec<Alignment>> {
+    let ch = channels as usize;
+    ensure!(
+        (1..=2).contains(&channels) && actual_96.len().is_multiple_of(ch),
+        "invalid PCM layout"
+    );
+    // Begin on the full source's even native-frame phase. Removing this first
+    // diagnostic sample does not alter playback or its admission counts.
+    let skip = (start_96 % 2) as usize;
+    let frames = actual_96.len() / ch;
+    if frames < 256 + skip {
+        return Ok(Vec::new());
+    }
+    let temp = tempfile::NamedTempFile::new()?;
+    let mut writer = BufWriter::new(temp.reopen()?);
+    for sample in &actual_96[skip * ch..] {
+        writer.write_all(&sample.to_le_bytes())?;
+    }
+    writer.flush()?;
+    let expected = converted_frames((frames - skip) as u64, 96000, RATE)?;
+    let bytes = run(
+        ffmpeg()
+            .args([
+                "-f",
+                "s32le",
+                "-ar",
+                "96000",
+                "-ac",
+                &channels.to_string(),
+                "-i",
+            ])
+            .arg(temp.path())
+            .args([
+                "-af",
+                "aresample=48000:resampler=swr:exact_rational=1:async=0:dither_method=none",
+                "-f",
+                "s32le",
+                "-c:a",
+                "pcm_s32le",
+                "pipe:1",
+            ]),
+        Duration::from_secs(30),
+        expected * u64::from(channels) * 4 + 65536,
+    )?;
+    ensure!(
+        bytes.len() as u64 == expected * u64::from(channels) * 4,
+        "wrong diagnostic resampling count"
+    );
+    let pcm: Vec<i32> = bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|b| i32::from_le_bytes(*b))
+        .collect();
+    Ok(alignment(
+        reference_48,
+        &pcm,
+        (start_96 + skip as u64) / 2,
+        channels,
+    ))
 }
 
 #[derive(Serialize)]
@@ -261,7 +347,7 @@ pub fn demo(source: Option<&Path>, output: &Path) -> Result<Report> {
         let pcm = presentation_pcm(&segment)?;
         let a = (start * u64::from(channels)) as usize;
         let exact = (quality == Quality::Lossless).then(|| pcm == reference[a..a + pcm.len()]);
-        let checks_alignment = alignment(&reference, &pcm, start, channels);
+        let checks_alignment = alignment_at_rate(&reference, &pcm, start, channels, rate);
         rendered.extend_from_slice(&pcm);
         checks.push(SegmentCheck {
             segment,
@@ -307,7 +393,7 @@ pub fn demo(source: Option<&Path>, output: &Path) -> Result<Report> {
         alignment_inconclusive_windows: inconclusive,
         segments: checks, boundaries,
         scope: vec!["Offline assembly, not real-time playback or a network benchmark.",
-            "44.1/48 kHz mono/stereo 16/24-bit lossless sources; lossless is never resampled.",
+            "44.1/48/96 kHz mono/stereo 16/24-bit lossless sources; lossless is never resampled.",
             "Opus uses 48 kHz and explicit conversion back to the native source clock before presentation trimming.",
             "Lossless segments preserve source PCM, not original encoded bytes.",
             "Opus pre-skip is handled by the decoder; context trims are applied afterward.",

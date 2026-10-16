@@ -12,7 +12,7 @@ import navidrome as nav
 
 class DevicePlayback:
     def __init__(self, output, helper, device, total, gain, rate=nav.RATE):
-        nav.require(rate in (44100, 48000), "unsupported device client clock")
+        nav.require(rate in (44100, 48000, 96000), "unsupported device client clock")
         self.rate = rate
         self.output, self.helper, self.device = output, helper, device
         self.total, self.gain = total, gain

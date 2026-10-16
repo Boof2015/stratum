@@ -23,8 +23,7 @@
 #include <unistd.h>
 #include <vector>
 
-constexpr uint64_t Rate = 48000, Channels = 2, Quantum = 960;
-constexpr uint64_t Segment = 96001, Capacity = 12 * Rate, MaxFrames = 65 * Rate;
+constexpr uint64_t Rate = 48000, Channels = 2;
 using Clock = std::chrono::steady_clock;
 double seconds(Clock::time_point start) { return std::chrono::duration<double>(Clock::now() - start).count(); }
 void require(bool ok, const char* message) { if (!ok) throw std::runtime_error(message); }
@@ -92,18 +91,22 @@ std::string deviceJSON(const Device& device) {
 
 struct Underrun { uint64_t mediaFrame, silenceFrames; };
 struct PCM {
-    uint64_t total, rate, quantum, segment;
-    std::vector<int32_t> ring = std::vector<int32_t>(Capacity * Channels);
-    std::vector<int32_t> capture = std::vector<int32_t>(MaxFrames * Channels);
+    uint64_t total, rate, quantum, segment, capacity, maxFrames;
+    std::vector<int32_t> ring;
+    std::vector<int32_t> capture;
     std::array<Underrun, 4096> underruns{};
     std::atomic<uint64_t> written{0}, consumed{0}, rendered{0};
     std::atomic<int> error{0};
     uint64_t silence = 0, underrunCount = 0, callbacks = 0;
     bool starving = false;
     explicit PCM(uint64_t frames, uint64_t sampleRate = Rate)
-        : total(frames), rate(sampleRate), quantum(sampleRate / 50), segment(2 * sampleRate + 1) {
-        require(rate == 44100 || rate == Rate, "unsupported client rate");
+        : total(frames), rate(sampleRate), quantum(sampleRate / 50), segment(2 * sampleRate + 1),
+          capacity(12 * sampleRate), maxFrames(65 * sampleRate) {
+        require(rate == 44100 || rate == Rate || rate == 96000, "unsupported client rate");
         require(frames > 0 && frames <= 32 * rate + 100, "invalid duration");
+        // Allocate before playback; callbacks keep the same no-allocation rule.
+        ring.resize(capacity * Channels);
+        capture.resize(maxFrames * Channels);
     }
 
     // Single stdin producer. Publish only after the entire packet is present.
@@ -111,9 +114,9 @@ struct PCM {
         auto w = written.load(std::memory_order_relaxed);
         auto r = consumed.load(std::memory_order_acquire);
         require(start == w && count > 0 && count <= segment && count <= total - w, "invalid/reordered PCM packet");
-        require(count <= Capacity - (w - r), "PCM queue capacity exceeded");
-        auto first = std::min(count, Capacity - w % Capacity);
-        std::copy_n(samples, first * Channels, ring.data() + (w % Capacity) * Channels);
+        require(count <= capacity - (w - r), "PCM queue capacity exceeded");
+        auto first = std::min(count, capacity - w % capacity);
+        std::copy_n(samples, first * Channels, ring.data() + (w % capacity) * Channels);
         std::copy_n(samples + first * Channels, (count - first) * Channels, ring.data());
         written.store(w + count, std::memory_order_release);
     }
@@ -125,7 +128,7 @@ struct PCM {
         auto count = std::min(quantum, total - r);
         if (!count) return 0;
         auto out = rendered.load(std::memory_order_relaxed);
-        if (out + count > MaxFrames) { error.store(1); return 0; }
+        if (out + count > maxFrames) { error.store(1); return 0; }
         if (written.load(std::memory_order_acquire) - r < count) {
             if (!starving) {
                 if (underrunCount == underruns.size()) { error.store(2); return 0; }
@@ -137,8 +140,8 @@ struct PCM {
             std::fill_n(destination, count * Channels, 0);
         } else {
             starving = false;
-            auto first = std::min(count, Capacity - r % Capacity);
-            std::copy_n(ring.data() + (r % Capacity) * Channels, first * Channels, destination);
+            auto first = std::min(count, capacity - r % capacity);
+            std::copy_n(ring.data() + (r % capacity) * Channels, first * Channels, destination);
             std::copy_n(ring.data(), (count - first) * Channels, destination + first * Channels);
             consumed.store(r + count, std::memory_order_release);
         }
@@ -149,12 +152,12 @@ struct PCM {
 };
 
 void selfTest(uint64_t rate) {
-    auto state = std::make_unique<PCM>(2 * Capacity + 17, rate);
-    std::array<int32_t, Quantum * Channels> buffer{};
+    auto state = std::make_unique<PCM>(24 * rate + 17, rate);
+    std::vector<int32_t> buffer(state->quantum * Channels);
     require(state->take(buffer.data()) == state->quantum && state->consumed == 0, "starvation advanced media");
     require(std::all_of(buffer.begin(), buffer.end(), [](auto x) { return x == 0; }), "starvation was not silence");
     auto sample = [](uint64_t frame, uint64_t ch) { return int32_t((frame * 31 + ch * 7919) % 1000000) - 500000; };
-    std::vector<int32_t> packet(Segment * Channels);
+    std::vector<int32_t> packet(state->segment * Channels);
     while (state->consumed < state->total) {
         auto w = state->written.load();
         if (w < state->total && w - state->consumed < 3 * rate) {
@@ -174,7 +177,7 @@ void selfTest(uint64_t rate) {
     bool rejected = false;
     try { state->append(0, packet.data(), 1); } catch (...) { rejected = true; }
     require(rejected, "reordered packet accepted");
-    std::cout << "{\"self_test\":\"passed: starvation, ordering, wraparound, tail, capture, EOF\"}" << std::endl;
+    std::cout << "{\"sample_rate\":" << rate << ",\"self_test\":\"passed: starvation, ordering, wraparound, tail, capture, EOF\"}" << std::endl;
 }
 
 struct Control {
@@ -223,7 +226,7 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
         std::array<uint64_t, 3> wireHeader{};
         const size_t headerSize = (control ? 3 : 2) * sizeof(uint64_t);
         auto* header = wireHeader.data() + (control ? 1 : 0);
-        std::vector<int32_t> packet(Segment * Channels);
+        std::vector<int32_t> packet(pcm->segment * Channels);
         size_t headerBytes = 0, bodyBytes = 0;
         checked(fcntl(STDIN_FILENO, F_SETFL, fcntl(STDIN_FILENO, F_GETFL) | O_NONBLOCK) < 0 ? -1 : 0, "stdin nonblocking");
         auto genJSON = control ? ",\"generation\":" + std::to_string(control->generation) : "";
@@ -325,6 +328,7 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
         std::ostringstream report;
         report << "{\"device\":" << deviceJSON(device) << ",\"gain\":" << gain
                << ",\"hardware_sample_rate\":" << hardwareRate << ",\"client_sample_rate\":" << rate
+               << ",\"ring_capacity_frames\":" << pcm->capacity << ",\"capture_limit_frames\":" << pcm->maxFrames
                << ",\"consumed_frames\":" << pcm->consumed << ",\"rendered_frames\":" << pcm->rendered
                << ",\"silence_frames\":" << pcm->silence << ",\"callbacks\":" << pcm->callbacks
                << ",\"elapsed_seconds\":" << elapsed << ",\"queue_sample_time\":" << queueTime
@@ -354,7 +358,7 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
 int main(int argc, char** argv) {
     alarm(95); // Independent process lifetime bound, including framework/pipe stalls.
     try {
-        if (argc == 2 && std::string(argv[1]) == "--self-test") { selfTest(Rate); selfTest(44100); return 0; }
+        if (argc == 2 && std::string(argv[1]) == "--self-test") { selfTest(Rate); selfTest(44100); selfTest(96000); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--list") {
             auto list = devices(); std::cout << '[';
             for (size_t i = 0; i < list.size(); ++i) { if (i) std::cout << ','; std::cout << deviceJSON(list[i]); }
@@ -369,11 +373,11 @@ int main(int argc, char** argv) {
             else if (option == "--rate") {
                 require(!rateSeen && i + 1 < argc, "missing/duplicate rate"); rateSeen = true;
                 rate = std::stoull(argv[++i]);
-                require(rate == 44100 || rate == Rate, "unsupported client rate");
+                require(rate == 44100 || rate == Rate || rate == 96000, "unsupported client rate");
             } else throw std::runtime_error("unknown output option");
         }
         require(argc >= 9 && std::string(argv[1]) == "--device" && std::string(argv[3]) == "--out" &&
-                std::string(argv[5]) == "--total" && std::string(argv[7]) == "--gain", "usage: --list | --self-test | --device UID --out DIR --total FRAMES --gain 0..1 [--rate 44100|48000] [--interactive]");
+                std::string(argv[5]) == "--total" && std::string(argv[7]) == "--gain", "usage: --list | --self-test | --device UID --out DIR --total FRAMES --gain 0..1 [--rate 44100|48000|96000] [--interactive]");
         float gain = std::stof(argv[8]); require(std::isfinite(gain) && gain >= 0 && gain <= 1, "invalid gain");
         for (const auto& device : devices())
             if (device.uid == argv[2]) {

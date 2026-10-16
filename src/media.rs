@@ -1,6 +1,6 @@
 use crate::{
     process::{ffmpeg, run},
-    timeline::{converted_frames, Interval, RATE},
+    timeline::{converted_frames, Interval, RATE, SOURCE_RATES},
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -108,8 +108,8 @@ impl Source {
             .context("source has no audio stream")?;
         let rate: u64 = stream.sample_rate.parse()?;
         ensure!(
-            [44_100, RATE].contains(&rate),
-            "this proof supports 44.1/48 kHz audio; got {rate} Hz (no silent resampling)"
+            SOURCE_RATES.contains(&rate),
+            "this proof supports 44.1/48/96 kHz audio; got {rate} Hz (no silent resampling)"
         );
         ensure!(
             (1..=2).contains(&stream.channels),
@@ -245,9 +245,12 @@ impl Engine {
         } else {
             RATE
         };
+        // Downsampling 96 kHz needs twice as many native frames for the
+        // same filter window. Reject too-short whole sources instead of padding.
+        let minimum_context = if rate == 96_000 { 64 } else { 32 };
         ensure!(
-            codec_rate == rate || encoded.frames >= 32,
-            "rate-converted Opus needs at least 32 real source frames; no silence padding is added"
+            codec_rate == rate || encoded.frames >= minimum_context,
+            "rate-converted Opus needs at least {minimum_context} real source frames; no silence padding is added"
         );
         let codec_frames = converted_frames(encoded.frames, rate, codec_rate)?;
         let decoded_frames = converted_frames(codec_frames, codec_rate, rate)?;

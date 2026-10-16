@@ -91,7 +91,7 @@ Choose one `--scenario` for native output; `all` is rejected. Gain zero exercise
 the device callback without audible output. A nonzero gain plays sound. For
 listening, use real music with `--source`, not the synthetic measurement signal.
 The default excerpt starts at `80 * source_rate + 37`; `--origin` accepts another frame
-position. Inputs can be native 44.1/48 kHz stereo 16/24-bit lossless, at most 10 minutes
+position. Inputs can be native 44.1/48/96 kHz stereo 16/24-bit lossless, at most 10 minutes
 and 96 MiB, with enough frames for the excerpt. This creates an artificial track
 split in music, useful for hearing continuity independently of how an album was
 mastered. It is not a test of every kind of real album boundary.
@@ -204,3 +204,9 @@ configured device; the linked follow-up adds same-rate 44.1 kHz sources.
 Neither covers mixed sample rates between tracks, lossy original codecs, long albums, queue edits while preparing the
 next track, output-device changes, production authentication/discovery, or Astra
 integration. The earlier source-revision/Last-Modified limitations still apply.
+
+The [96 kHz follow-up](high-rate-proof.md) adds native high-rate sources and
+rate-sized native buffers. At 96 kHz the same plan presents 3,072,016 frames,
+with a one-frame EOF at timeline frame 1,152,007 and 1,920-frame output quanta.
+Mixed source rates are still rejected. The results above remain the original
+48 kHz measurements.

@@ -189,3 +189,17 @@ The earlier listening results above used 48 kHz client PCM. Separate native
 44.1 kHz source/client tests are recorded in [the native-rate proof](native-rate-proof.md).
 The interactive seek harness still supplies 48 kHz; full 44.1 kHz seek/cancellation
 scenarios have not been run.
+
+## 96 kHz follow-up
+
+The helper also accepts `--rate 96000`. Ring and capture storage are now sized
+from the selected client rate before playback: 12 and 65 seconds respectively.
+This preserves the duration budget at 96 kHz and removes the extra ring duration
+that the earlier fixed allocation happened to give 44.1 kHz. Packet storage and
+20 ms callback buffers scale with the selected rate as well. The report records
+these bounds. All callback allocation/I/O restrictions remain unchanged.
+
+Self-tests now cover all three rates. The selected hardware's own rate still
+remains untouched; CoreAudio can convert a 96 kHz client stream to the device's
+rate. See [the high-rate proof](high-rate-proof.md) for measured results and the
+distinction between exact client PCM and physical device output.

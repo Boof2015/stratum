@@ -464,7 +464,7 @@ def acquire(nav, song_id, start, frames, output, bounded=True, session=None, can
     or across acquisitions when given an authorized private source session.
     It does not rewrite audio or implement production auth.
     """
-    require(rate in (44100, 48000), "unsupported acquisition clock")
+    require(rate in (44100, 48000, 96000), "unsupported acquisition clock")
     seek_seconds, skip = divmod(start, rate)
     began = time.monotonic()
     with metered_source(nav, song_id, bounded=bounded, session=session) as (url, metrics):

@@ -5,7 +5,7 @@ final protocol. Changing it is expected as we test more formats and real deliver
 
 ## Clock and requests
 
-The proof accepts native 44,100 or 48,000 Hz, mono/stereo, 16/24-bit
+The proof accepts native 44,100, 48,000 or 96,000 Hz, mono/stereo, 16/24-bit
 lossless sources. Requests and presentation always use the source
 sample rate, including when a payload uses a different codec clock. The clock unit is one PCM frame (one sample per channel).
 Requests are half-open intervals `[start, start + frames)` with an integer start
@@ -13,7 +13,8 @@ and a positive count. No requested interval exceeds 30 seconds or the source end
 Invalid or short results fail; they are not padded with silence.
 
 The source must contain at least 16 frames. Rate-converted Opus also requires
-at least 32 real source frames in its context interval; shorter whole sources
+at least 32 real source frames at 44.1 kHz or 64 at 96 kHz in its context
+interval; shorter whole sources
 fail explicitly instead of receiving synthetic padding. It is fingerprinted with SHA-256 when
 opened. Files are assumed immutable during an engine session; size/mtime changes
 are detected before requests and after encoding. This is a local fixture identity,
@@ -36,7 +37,9 @@ the requested interval, clamped at track edges. Context is an experimental encod
 warm-up/tail choice. It is not the codec pre-skip and is not proof of inaudibility.
 At 44.1 kHz the context start is rounded down to a multiple of 147 native frames
 (160 Opus frames), keeping the resampler phase anchored to track frame zero.
-That can add up to 146 real preceding frames; context never extends outside the file.
+That can add up to 146 real preceding frames. At 96 kHz the start is aligned to
+an even native frame (two native frames per Opus frame), adding at most one
+preceding frame. Context never extends outside the file.
 Lossless intervals normally need no extra context; fragments shorter than FLAC's
 16-frame minimum block include neighboring real source audio and trim it afterward.
 An explicit 4,096-frame FLAC encoder block size also prevents an arbitrary seek's
@@ -73,8 +76,8 @@ discard_start_frames + presentation.frames + discard_end_frames == decoded_frame
 decoded_frames == encoded_interval.frames + resample_tail_frames
 ```
 
-At 48 kHz, or for lossless at either supported rate, the two clocks agree and
-`resample_tail_frames` is zero. For 44.1 kHz Opus, conversion can return either
+At 48 kHz, or for lossless at any supported rate, the two clocks agree and
+`resample_tail_frames` is zero. For 44.1/96 kHz Opus, conversion can return either
 N or N+1 native frames. The engine measures this, accepts only the rational
 round-trip bound, and records that explicit zero/one tail for the client to
 trim. It never fills a short result. A double-ceil calculation alone does not
@@ -114,7 +117,9 @@ cost is included in `prepare_ms` and may not belong on a future production path.
 
 The demo performs a separate, complete source decode as an oracle. Lossless
 sections must match it exactly. Each segment is checked in beginning/middle/end
-windows, per channel, for the best correlation within ±32 frames. An injected
+windows, per channel, for the best correlation within ±32 frames. Each window
+uses up to 2,048 native frames at 44.1/48 kHz or 4,096 at 96 kHz, keeping at
+least the original ~43 ms duration where enough frames are available. An injected
 one-frame shift test demonstrates that the check detects that error. Silence and
 periodic content can make the estimate inconclusive or ambiguous; correlation
 cannot by itself prove an audible transition is clean.
@@ -123,6 +128,17 @@ cannot by itself prove an audible transition is clean.
 `alignment_inconclusive_windows` too. The default synthetic fixture must have no
 inconclusive windows and pass all alignment checks. The demo records real music
 results without pretending a correlation estimate is a universal pass/fail rule.
+
+The 96 kHz handoff checker also compares lossy submissions on Opus's 48 kHz
+clock against a separately downconverted full source. Real-music native estimates
+can differ by one 96 kHz frame, half an Opus frame. These remain visible as
+`zero_lag: false` and `nonzero_alignment_windows`; the harness accepts them only
+when every nonzero native estimate is lossy and smaller than one codec frame,
+and the independent codec-clock windows all have zero lag with no inconclusive
+results. Exact native frame coverage, lossless samples and captured submissions
+are still mandatory. This establishes codec-resolution waveform alignment,
+not arbitrary lossy waveform accuracy at sub-codec resolution. See the
+[96 kHz investigation and results](high-rate-proof.md).
 
 Preparation time measures local encoding, decoder validation and cache publication
 or lookup. Source probing/hashing and the client's later decode are outside that

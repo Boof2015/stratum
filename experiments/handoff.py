@@ -36,7 +36,7 @@ class Clock:
     rate: int = RATE
 
     def __post_init__(self):
-        nav.require(self.rate in (44100, 48000), "unsupported source clock")
+        nav.require(self.rate in (44100, 48000, 96000), "unsupported source clock")
 
     @property
     def segment(self):
@@ -86,8 +86,8 @@ def acquisition_interval(start, frames, total, rate=RATE):
     context = 120 * rate // 1000
     nav.require(0 <= start < total and 0 < frames <= total - start, "invalid source interval")
     begin, end = max(0, start - context), min(total, start + frames + context)
-    if rate == 44100:
-        begin -= begin % 147
+    stride = {44100: 147, 48000: 1, 96000: 2}[rate]
+    begin -= begin % stride
     return begin, end - begin, start - begin
 
 
@@ -110,6 +110,23 @@ def validate_envelope(envelope, interval, quality, rate=RATE):
                     and meta["resample_tail_frames"] == meta["decoded_frames"] - native_frames,
                     "invalid native/codec clock mapping")
     return meta
+
+
+def alignment_passes(checks):
+    if checks["inconclusive"] != 0:
+        return False
+    if checks["zero_lag"]:
+        return True
+    # At 96 kHz, arbitrary lossy waveform estimates can differ by one native
+    # frame inside one Opus sample. Keep that diagnostic visible; require the
+    # independent 48 kHz comparison, never waive larger/codec-clock shifts.
+    codec = checks.get("lossy_codec_alignment", {})
+    return (checks.get("sample_rate") == 96000
+            and checks.get("native_lag_within_codec_frame") is True
+            and bool(checks.get("nonzero_alignment_windows"))
+            and all(w["quality"] != "lossless" for w in checks["nonzero_alignment_windows"])
+            and codec.get("sample_rate") == 48000 and codec.get("evaluable_windows", 0) > 0
+            and codec.get("inconclusive") == 0 and codec.get("zero_lag") is True)
 
 
 @contextlib.contextmanager
@@ -305,8 +322,11 @@ def run_case(name, account, songs, infos, sources, args, output):
                 "sample_rate": rate, "frames": total, "segments": segments, "underruns": playback.underruns}
     (output / "delivery.json").write_text(json.dumps(delivery, indent=2) + "\n")
     checks = json.loads(nav.run([str(args.checker), str(output / "delivery.json")]))
-    nav.require(all(checks[key] for key in ("exact_frames", "lossless_exact", "rendered_matches", "zero_lag"))
-                and checks["inconclusive"] == 0, "handoff audio verification failed")
+    nav.require(all(checks[key] for key in ("exact_frames", "lossless_exact", "rendered_matches"))
+                and alignment_passes(checks), "handoff audio verification failed")
+    if not checks["zero_lag"]:
+        print(f"{name}: {len(checks['nonzero_alignment_windows'])} sub-codec-frame native estimates; "
+              "independent Opus-clock alignment passed (see report)", flush=True)
     if name == "late-next":
         nav.require(playback.silence_frames > 0 and first_next["ready"] > boundary_time,
                     "negative control did not miss its deadline")
@@ -347,8 +367,8 @@ def run_case(name, account, songs, infos, sources, args, output):
 
 def inspect_source(source, binary):
     info = json.loads(nav.run([str(binary), "inspect", "--source", str(source)]))
-    nav.require(info["sample_rate"] in (44100, 48000) and info["channels"] == 2 and info["bits_per_sample"] in (16, 24),
-                "native 44.1/48 kHz stereo lossless input required")
+    nav.require(info["sample_rate"] in (44100, 48000, 96000) and info["channels"] == 2 and info["bits_per_sample"] in (16, 24),
+                "native 44.1/48/96 kHz stereo lossless input required")
     nav.require(info["bytes"] <= 96 * 1024 * 1024 and info["frames"] <= 600 * info["sample_rate"], "source outside proof bounds")
     return info
 
