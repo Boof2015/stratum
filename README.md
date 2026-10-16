@@ -170,10 +170,21 @@ both quality directions and automatic adaptation at both rates; native output
 also passes lossless-to-Opus album transitions. At 96 kHz, real-music waveform
 alignment is checked on the Opus clock as well as the native clock; see the
 measurement limits in the results below. Both tracks must
-have the same rate; mixed-rate track handoffs remain separate work. The older
+have the same rate; the separate fixed-output experiment below handles mixed
+rates. The older
 `live.py`, `seek.py` and standalone `navidrome.py` scenarios remain 48 kHz.
 See the [44.1 kHz results](docs/native-rate-proof.md) and
 [96 kHz results and measurement changes](docs/high-rate-proof.md).
+
+### Mixed source-rate handoffs
+
+`experiments/mixed_handoff.py` adds an explicit fixed client output clock for
+consecutive tracks with different native rates. Stratum still delivers each
+source natively; a continuous client converter maps it onto the chosen output
+rate without resetting the consumer at the track boundary. This tests normal
+processed output, with native lossless delivery checked separately from output
+resampling. It does not implement bit-perfect format changes. See the
+[policy, commands and results](docs/mixed-rate-proof.md).
 
 ## Checks
 

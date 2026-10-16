@@ -210,3 +210,10 @@ rate-sized native buffers. At 96 kHz the same plan presents 3,072,016 frames,
 with a one-frame EOF at timeline frame 1,152,007 and 1,920-frame output quanta.
 Mixed source rates are still rejected. The results above remain the original
 48 kHz measurements.
+
+## Mixed source rates
+
+The separate [mixed-rate output experiment](mixed-rate-proof.md) accepts different
+native rates with an explicit fixed client output rate. This command's native
+same-rate policy remains unchanged. Neither experiment changes Astra's existing
+bit-perfect format-transition behavior.

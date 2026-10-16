@@ -188,8 +188,8 @@ The core supports 44.1/48/96 kHz mono/stereo 16/24-bit FLAC and PCM WAV. The
 handoff/device harness requires stereo. The older `live.py`, `seek.py` and standalone
 `navidrome.py` scenario CLIs still use 48 kHz. Exact native 96 kHz seek positions
 and late original-track acquisition are checked, but full interactive 96 kHz
-rapid-seek/cancellation remains separate work. Mixed-rate track handoffs are
-explicitly rejected pending an output-clock policy.
+rapid-seek/cancellation remains separate work. This same-rate command explicitly rejects mixed-rate track handoffs; the
+separate fixed-output experiment linked below supplies an output policy.
 
 Other rates, lossy originals, sustained playback, output switching, queue edits,
 production authentication/discovery, stronger source revisions, and Astra
@@ -199,3 +199,9 @@ conversion contract; these results concern the tested FFmpeg build and settings.
 
 References: [Opus timing](https://www.rfc-editor.org/rfc/rfc7845.html#section-4)
 and [FFmpeg resampler settings](https://ffmpeg.org/ffmpeg-resampler.html).
+
+## Subsequent mixed-rate output experiment
+
+The [mixed-rate proof](mixed-rate-proof.md) adds a separate, explicitly selected
+fixed client output clock. It retains native source delivery and the limits
+above; the original same-rate handoff command still rejects mixed sources.
