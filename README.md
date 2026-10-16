@@ -4,10 +4,10 @@ An experimental audio transport for requesting precise intervals at different
 qualities on a shared playback timeline. The intended first server implementation,
 Astra Sidecar, will work alongside Navidrome; Astra will be a client.
 
-This repository currently contains the **audio proof of concept**, not a deployed
-server or an Astra integration. It generates independently decodable FLAC/Opus
-segments, trims them onto one sample timeline, and produces a switched listening
-sample with measurements.
+This repository contains **audio and delivery proofs of concept**, not a deployed
+server or an Astra integration. They generate independently decodable FLAC/Opus
+segments, trim them onto one sample timeline, acquire source intervals from a
+disposable Navidrome, and test delivery against a real-time consumption clock.
 
 ## Run the proof
 
@@ -93,14 +93,37 @@ listeners bind to loopback, and Navidrome is stopped after the test.
 - Independent reference comparisons for representation alignment, including a
   late seek, odd frame boundaries and a one-frame final request.
 - Cache reuse, source/quality/interval separation, and repair of corrupted entries.
+- Real-time delivery during a controlled bandwidth drop, including abandoning a
+  slow lossless request and retrying the same interval as Opus before it is needed.
 
-The proof assembles output **offline**. It does not yet establish real-time
-buffer behavior, efficient Navidrome reads, inaudibility on all music, adaptation
-under a changing connection, or gapless playback between different tracks.
+The original demo assembles output **offline**. The separate live experiment below
+uses real HTTP transfers and wall-clock PCM consumption, writing its output to a
+file. Neither establishes hardware audio playback, behavior across arbitrary WAN
+conditions, inaudibility on all music, or gapless playback between different tracks.
 
 The `lossless` representation is re-encoded FLAC with the same decoded PCM for
 supported inputs. It is not unchanged source bytes. Original delivery, other
 sample rates, and lossy originals remain separate work.
+
+## Live delivery proof
+
+Reuse the synthetic fixture from the Navidrome experiment above, then run:
+
+```sh
+cargo build --release --bins --examples
+python3 -B experiments/live.py \
+  --navidrome /path/to/navidrome \
+  --stratum target/release/stratum-poc \
+  --checker target/release/examples/live_check \
+  --fixture artifacts/navidrome-source.flac \
+  --out artifacts/live-run
+```
+
+This takes about two minutes. Three disposable-server runs compare a steady link,
+automatic quality through a bandwidth drop/recovery, and forced lossless through
+the same drop. Nothing plays through your speakers automatically. Each scenario
+produces `listening.wav`; real starvation is retained as silence in that file.
+See [method, results and limits](docs/live-delivery-proof.md).
 
 ## Checks
 
@@ -128,8 +151,9 @@ client. Discovery and Navidrome credentials do not belong in the audio engine.
    the local Rust engine; it is not a shipped Sidecar service.
 3. Extend the timing proof to 44.1/96 kHz and lossy originals before defining a
    production timeline/representation contract.
-4. Add a bounded real-time client/server experiment. Discovery, pairing, per-user
-   authorization, cache eviction and cancellation must be designed before deployment.
+4. Extend the real-time experiment to actual client audio output, harder network
+   conditions and seek/skip cancellation. Discovery, pairing, per-user authorization
+   and production cache eviction must be designed before deployment.
 
 The current cache is an unbounded experiment directory, not a server cache. No
-accounts, live servers, music libraries, or Astra settings are modified by the tests.
+existing accounts, servers, music libraries, or Astra settings are modified by the tests.
