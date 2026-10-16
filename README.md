@@ -100,7 +100,8 @@ The original demo assembles output **offline**. The separate live experiment bel
 uses real HTTP transfers and wall-clock PCM consumption, writing its output to a
 file. Its optional macOS output helper also exercises a selected audio device.
 These experiments do not establish behavior across arbitrary WAN conditions,
-inaudibility on all music, or gapless playback between different tracks.
+inaudibility on all music, or gapless playback across arbitrary source formats.
+The natural-handoff experiment below covers two separate same-format tracks.
 
 The `lossless` representation is re-encoded FLAC with the same decoded PCM for
 supported inputs. It is not unchanged source bytes. Original delivery, other
@@ -148,6 +149,17 @@ rejects intentionally late completions, and checks exact resume positions. Its
 default sink is a file; optional macOS playback uses one native process across
 all resets. See [the sequence, commands and limits](docs/seek-proof.md).
 
+### Natural track endings
+
+`experiments/handoff.py` crosses a real track ending in disposable Navidrome on one
+continuous timeline, including a one-frame EOF segment, different qualities at
+the boundary and next-track preparation under a slow connection. A deliberately
+late next track is the negative control. An independent source/PCM checker verifies
+the join and catches missing, repeated or silenced samples. Optional native output
+keeps the same queue running across the boundary. See [commands and limits](docs/handoff-proof.md).
+Add `--next-source` to use two actual album files, playing the first file's real
+ending into frame zero of the second instead of splitting one continuous source.
+
 ## Checks
 
 ```sh
@@ -174,8 +186,8 @@ client. Discovery and Navidrome credentials do not belong in the audio engine.
    the local Rust engine; it is not a shipped Sidecar service.
 3. Extend the timing proof to 44.1/96 kHz and lossy originals before defining a
    production timeline/representation contract.
-4. Extend the device and seek/skip experiments to Astra's pipeline, harder network
-   conditions, natural track handoffs and source-cache reuse across seeks. Discovery, pairing, per-user authorization
+4. Extend the device, seek/skip and natural-handoff experiments to Astra's pipeline,
+   harder network conditions, queue edits and source-cache reuse across seeks. Discovery, pairing, per-user authorization
    and production cache eviction must be designed before deployment.
 
 The current cache is an unbounded experiment directory, not a server cache. No

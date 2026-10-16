@@ -170,3 +170,6 @@ and [queue timeline](https://developer.apple.com/documentation/audiotoolbox/audi
 
 The later [seek/skip proof](seek-proof.md) adds explicit generation resets and
 tests cancellation while this native output is running.
+
+The [natural-handoff proof](handoff-proof.md) feeds two complete tracks into the
+same noninteractive output queue without a reset between them.
