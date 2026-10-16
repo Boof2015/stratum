@@ -47,7 +47,8 @@ class Policy:
     Has no access to the traffic profile. Include source/encode/decode overhead
     in the budget; compressed bytes alone are not the full preparation cost.
     """
-    def __init__(self, lossless_bytes):
+    def __init__(self, lossless_bytes, segment_seconds=SEGMENT / RATE):
+        self.segment_seconds = segment_seconds
         self.lossless_bytes = lossless_bytes
         self.capacity = None
         self.overhead = 0.8
@@ -68,7 +69,7 @@ class Policy:
     def choose(self, buffer_seconds):
         if self.capacity is None:
             return self.quality
-        budget = min(SEGMENT / RATE * 0.85, max(0.3, buffer_seconds - 1))
+        budget = min(self.segment_seconds * 0.85, max(0.3, buffer_seconds - 1))
         eligible = [q for q in QUALITIES if self.size(q) / (self.capacity * 0.8) + self.overhead < budget]
         best = eligible[-1] if eligible else "opus-64"
         if QUALITIES.index(best) < QUALITIES.index(self.quality):
@@ -94,7 +95,9 @@ class Playback:
     rendered.s32le includes every starvation quantum. Per-segment PCM files are
     also checked afterward against the source, separately from delivery timing.
     """
-    def __init__(self, output, total=TOTAL, start_buffer=START_BUFFER):
+    def __init__(self, output, total=TOTAL, start_buffer=START_BUFFER, rate=RATE):
+        nav.require(rate in (44100, 48000), "unsupported playback clock")
+        self.rate, self.quantum = rate, rate // 50
         self.output = output
         self.total = total
         self.start_buffer = min(total, start_buffer)
@@ -113,7 +116,7 @@ class Playback:
 
     def buffered(self):
         with self.lock:
-            return self.frames / RATE
+            return self.frames / self.rate
 
     def append(self, start, pcm):
         with self.lock:
@@ -160,14 +163,14 @@ class Playback:
             tick, starving = 0, False
             with (self.output / "rendered.s32le").open("wb") as sink:
                 while self.consumed < self.total and not self.cancel.is_set():
-                    deadline = self.started + tick * QUANTUM / RATE
+                    deadline = self.started + tick * self.quantum / self.rate
                     self.cancel.wait(max(0, deadline - time.monotonic()))
                     if self.cancel.is_set():
                         break
                     now = time.monotonic()
                     nav.require(now - self.started < 65, "playback lifetime exceeded")
                     self.max_wake_late_ms = max(self.max_wake_late_ms, (now - deadline) * 1000)
-                    pcm, count = self.consume(QUANTUM, deadline)
+                    pcm, count = self.consume(self.quantum, deadline)
                     if pcm is None:
                         if not starving:
                             self.underruns.append({"at_media_frame": self.consumed,
@@ -182,7 +185,7 @@ class Playback:
                     sink.write(pcm)
                     tick += 1
                 # Wait out the final quantum instead of ending a tick early.
-                end = self.started + (self.total + self.silence_frames) / RATE
+                end = self.started + (self.total + self.silence_frames) / self.rate
                 self.cancel.wait(max(0, end - time.monotonic()))
                 nav.require(not self.cancel.is_set(), "playback cancelled")
             self.elapsed = time.monotonic() - self.started
@@ -443,7 +446,7 @@ def validate_device_timing(device, duration):
     # clock can extend beyond the content, particularly with Bluetooth output.
     # Check it against the same run's wall clock and separately require it to
     # cover the content. Exact submitted frames are checked by live_check.
-    clock = device["queue_sample_time"] / RATE
+    clock = device["queue_sample_time"] / device.get("client_sample_rate", RATE)
     elapsed = device["elapsed_seconds"]
     nav.require(duration - 0.06 <= elapsed <= duration + 3, "device drain duration out of bounds")
     nav.require(clock >= duration - 0.06 and abs(clock - elapsed) < 0.25,

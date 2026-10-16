@@ -16,6 +16,17 @@ use std::{
 /// A reproducible non-periodic musical-ish signal with stereo distinction and
 /// transients. Quantized before encoding, so lossless comparisons are exact.
 pub fn fixture(path: &Path, frames: u64, channels: u32, bits: u32) -> Result<()> {
+    fixture_at_rate(path, frames, channels, bits, RATE)
+}
+
+pub fn fixture_at_rate(
+    path: &Path,
+    frames: u64,
+    channels: u32,
+    bits: u32,
+    rate: u64,
+) -> Result<()> {
+    ensure!([44_100, RATE].contains(&rate), "unsupported fixture rate");
     ensure!(
         (1..=2).contains(&channels) && [16, 24].contains(&bits),
         "unsupported fixture format"
@@ -26,7 +37,7 @@ pub fn fixture(path: &Path, frames: u64, channels: u32, bits: u32) -> Result<()>
     let mut rng = 0x1234_5678_u32;
     let mut noise = 0.0;
     for i in 0..frames {
-        let time = i as f64 / RATE as f64;
+        let time = i as f64 / rate as f64;
         rng ^= rng << 13;
         rng ^= rng >> 17;
         rng ^= rng << 5;
@@ -57,7 +68,7 @@ pub fn fixture(path: &Path, frames: u64, channels: u32, bits: u32) -> Result<()>
             "-f",
             "s32le",
             "-ar",
-            "48000",
+            &rate.to_string(),
             "-ac",
             &channels.to_string(),
             "-i",
@@ -77,6 +88,10 @@ pub fn fixture(path: &Path, frames: u64, channels: u32, bits: u32) -> Result<()>
 }
 
 pub fn write_wav(path: &Path, pcm: &[i32], channels: u32) -> Result<()> {
+    write_wav_at_rate(path, pcm, channels, RATE)
+}
+
+pub fn write_wav_at_rate(path: &Path, pcm: &[i32], channels: u32, rate: u64) -> Result<()> {
     let temp = tempfile::NamedTempFile::new()?;
     let mut writer = BufWriter::new(temp.reopen()?);
     for sample in pcm {
@@ -89,7 +104,7 @@ pub fn write_wav(path: &Path, pcm: &[i32], channels: u32) -> Result<()> {
                 "-f",
                 "s32le",
                 "-ar",
-                "48000",
+                &rate.to_string(),
                 "-ac",
                 &channels.to_string(),
                 "-i",
@@ -209,17 +224,18 @@ pub fn demo(source: Option<&Path>, output: &Path) -> Result<Report> {
         }
     };
     let source = Source::open(source_path)?;
+    let rate = source.info.sample_rate;
     for name in ["reference.wav", "switched.wav", "report.json"] {
         let destination = output.join(name);
         ensure!(destination.canonicalize().ok().as_deref() != Some(source.path()),
             "demo output would overwrite the source file: {name}; choose a different --out directory");
     }
     ensure!(
-        source.info.frames >= 6 * RATE,
+        source.info.frames >= 6 * rate,
         "demo needs at least six seconds of audio"
     );
     ensure!(
-        source.info.frames <= 180 * RATE,
+        source.info.frames <= 180 * rate,
         "demo is bounded to three minutes; use segment for longer sources"
     );
     let reference = decode(source.path(), source.info.channels, source.info.frames)?;
@@ -231,7 +247,7 @@ pub fn demo(source: Option<&Path>, output: &Path) -> Result<Report> {
     let mut start = 0;
     while start < total {
         // Deliberately not an Opus packet boundary: tests frame trimming.
-        let frames = (2 * RATE + 1).min(total - start);
+        let frames = (2 * rate + 1).min(total - start);
         let quality = if start < total / 3 || start >= 2 * total / 3 {
             Quality::Lossless
         } else if checks.len() % 2 == 0 {
@@ -269,7 +285,7 @@ pub fn demo(source: Option<&Path>, output: &Path) -> Result<Report> {
         }
         boundaries.push(Boundary {
             at_frame: at,
-            at_seconds: at as f64 / RATE as f64,
+            at_seconds: at as f64 / rate as f64,
             from: pair[0].segment.metadata.quality,
             to: pair[1].segment.metadata.quality,
             additional_step_peak: peak,
@@ -291,7 +307,8 @@ pub fn demo(source: Option<&Path>, output: &Path) -> Result<Report> {
         alignment_inconclusive_windows: inconclusive,
         segments: checks, boundaries,
         scope: vec!["Offline assembly, not real-time playback or a network benchmark.",
-            "48 kHz mono/stereo 16/24-bit lossless sources only; no resampling.",
+            "44.1/48 kHz mono/stereo 16/24-bit lossless sources; lossless is never resampled.",
+            "Opus uses 48 kHz and explicit conversion back to the native source clock before presentation trimming.",
             "Lossless segments preserve source PCM, not original encoded bytes.",
             "Opus pre-skip is handled by the decoder; context trims are applied afterward.",
             "No crossfade, silence padding, or offset correction is used to hide joins.",
@@ -299,8 +316,8 @@ pub fn demo(source: Option<&Path>, output: &Path) -> Result<Report> {
             "A full source hash and full reference decode are local proof work, not efficient upstream streaming.",
             "No Navidrome, discovery, authentication, HTTP service, or production cache limit yet."],
     };
-    write_wav(&output.join("reference.wav"), &reference, channels)?;
-    write_wav(&output.join("switched.wav"), &rendered, channels)?;
+    write_wav_at_rate(&output.join("reference.wav"), &reference, channels, rate)?;
+    write_wav_at_rate(&output.join("switched.wav"), &rendered, channels, rate)?;
     fs::write(
         output.join("report.json"),
         serde_json::to_vec_pretty(&report)?,

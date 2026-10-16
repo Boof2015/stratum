@@ -34,15 +34,17 @@ and returns to lossless near 10 seconds. The exact boundaries are in the report.
 Listen to both files; frame accounting cannot establish that every lossy transition
 is inaudible.
 
-Try your own **48 kHz, mono/stereo, 16/24-bit FLAC or PCM WAV**, from 6 seconds to
+Try your own **44.1/48 kHz, mono/stereo, 16/24-bit FLAC or PCM WAV**, from 6 seconds to
 3 minutes long:
 
 ```sh
 cargo run --release -- demo --source /path/to/music.flac --out artifacts/music
 ```
 
-Other rates, layouts and lossy source formats are explicitly rejected. There is
-no silent resampling or claim that a transcoded original is byte-preserving.
+Other rates, layouts and lossy source formats are explicitly rejected. Lossless keeps the source
+sample rate and PCM. For 44.1 kHz sources, Opus explicitly converts to 48 kHz
+and back before native-frame trimming; see [the native-rate proof](docs/native-rate-proof.md).
+There is no claim that re-encoded lossless delivery preserves the original bytes.
 Re-running a demo overwrites its generated listening files and report; use a
 dedicated output directory. Encoded cache entries can be reused.
 
@@ -104,8 +106,7 @@ inaudibility on all music, or gapless playback across arbitrary source formats.
 The natural-handoff experiment below covers two separate same-format tracks.
 
 The `lossless` representation is re-encoded FLAC with the same decoded PCM for
-supported inputs. It is not unchanged source bytes. Original delivery, other
-sample rates, and lossy originals remain separate work.
+supported inputs. It is not unchanged source bytes. Original-byte delivery, rates beyond 44.1/48 kHz, and lossy originals remain separate work.
 
 ## Live delivery proof
 
@@ -160,6 +161,17 @@ keeps the same queue running across the boundary. See [commands and limits](docs
 Add `--next-source` to use two actual album files, playing the first file's real
 ending into frame zero of the second instead of splitting one continuous source.
 
+### Native 44.1 kHz sources
+
+The core and natural-handoff harness accept 44.1 kHz sources, keeping requests,
+lossless PCM and the client output on that native clock. Opus has an explicit
+48 kHz codec clock and rate conversion. The file handoff proofs cover
+both quality directions and automatic adaptation at 44.1 kHz; native output
+also passes a lossless-to-Opus album transition. Both tracks must
+have the same rate; mixed-rate track handoffs remain separate work. The older
+`live.py`, `seek.py` and standalone `navidrome.py` scenarios remain 48 kHz.
+See [contract, measurements and limits](docs/native-rate-proof.md).
+
 ## Checks
 
 ```sh
@@ -184,7 +196,7 @@ client. Discovery and Navidrome credentials do not belong in the audio engine.
    still needs user-scoped authorization, source revision handling and integration
    with the engine. The Python experiment currently feeds acquired intervals into
    the local Rust engine; it is not a shipped Sidecar service.
-3. Extend the timing proof to 44.1/96 kHz and lossy originals before defining a
+3. Extend the timing proof beyond 44.1/48 kHz and to lossy originals before defining a
    production timeline/representation contract.
 4. Extend the device, seek/skip and natural-handoff experiments to Astra's pipeline,
    harder network conditions, queue edits and source-cache reuse across seeks. Discovery, pairing, per-user authorization

@@ -9,6 +9,49 @@ import live
 
 
 class HandoffTests(unittest.TestCase):
+    def test_441_clock_preserves_native_frames_and_rejects_mixed_rates(self):
+        clock = handoff.Clock(44100)
+        plans = handoff.intervals([clock.boundary, clock.total - clock.boundary], rate=44100)
+        self.assertEqual(plans[6]["frames"], 1)
+        self.assertEqual(plans[7]["start"], 529207)
+        self.assertEqual(sum(plan["frames"] for plan in plans), 1411216)
+        begin, frames, trim = handoff.acquisition_interval(150 * 44100 + 37, 88201, 160 * 44100, 44100)
+        self.assertEqual(begin % 147, 0)
+        self.assertEqual(begin + trim, 150 * 44100 + 37)
+        self.assertGreaterEqual(frames - trim, 88201)
+        with self.assertRaises(RuntimeError):
+            handoff.playback_ranges([{"frames": 160 * 44100, "sample_rate": 44100},
+                                    {"frames": 160 * 48000, "sample_rate": 48000}], True)
+
+    def test_441_file_sink_uses_native_clock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            sink = live.Playback(Path(temporary), total=44100, start_buffer=1, rate=44100)
+            sink.append(0, bytes(44100 * 8))
+            self.assertEqual(sink.buffered(), 1)
+            self.assertEqual(sink.quantum, 882)
+
+    def test_441_response_rejects_wrong_codec_clock_and_rounding_tail(self):
+        plan = {"track": 1, "source_start": 0, "start": 529207, "frames": 88201}
+        meta = {"quality": "opus-64", "sample_rate": 44100, "channels": 2,
+                "presentation": {"frames": 88201}, "encoded_interval": {"frames": 93493},
+                "discard_start_frames": 0, "discard_end_frames": 5293,
+                "decoded_frames": 93494, "codec_sample_rate": 48000,
+                "codec_decoded_frames": 101762, "resample_tail_frames": 1}
+        envelope = {**plan, "metadata": meta}
+        handoff.validate_envelope(envelope, plan, "opus-64", 44100)
+        for key, value in (("codec_sample_rate", 44100), ("codec_decoded_frames", 93494),
+                           ("resample_tail_frames", 0), ("sample_rate", 48000)):
+            changed = copy.deepcopy(envelope)
+            changed["metadata"][key] = value
+            with self.assertRaises(RuntimeError):
+                handoff.validate_envelope(changed, plan, "opus-64", 44100)
+        for delta in (-2, 1):
+            changed = copy.deepcopy(envelope)
+            for key in ("decoded_frames", "resample_tail_frames", "discard_end_frames"):
+                changed["metadata"][key] += delta
+            with self.assertRaises(RuntimeError):
+                handoff.validate_envelope(changed, plan, "opus-64", 44100)
+
     def test_actual_pair_reaches_original_eof_and_starts_next_at_zero(self):
         ranges = handoff.playback_ranges([{"frames": 10275429}, {"frames": 11415273}], True)
         plans = handoff.intervals([part["frames"] for part in ranges], [part["origin"] for part in ranges])

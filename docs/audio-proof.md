@@ -1,17 +1,20 @@
-# Audio interval proof, revision 1
+# Audio interval proof, revision 2
 
 This is an experimental contract exercised by the local CLI, not Stratum v1's
 final protocol. Changing it is expected as we test more formats and real delivery.
 
 ## Clock and requests
 
-The first proof deliberately uses only native 48,000 Hz, mono/stereo, 16/24-bit
-lossless sources. The clock unit is one PCM frame (one sample per channel).
+The proof accepts native 44,100 or 48,000 Hz, mono/stereo, 16/24-bit
+lossless sources. Requests and presentation always use the source
+sample rate, including when a payload uses a different codec clock. The clock unit is one PCM frame (one sample per channel).
 Requests are half-open intervals `[start, start + frames)` with an integer start
 and a positive count. No requested interval exceeds 30 seconds or the source end.
 Invalid or short results fail; they are not padded with silence.
 
-The source must contain at least 16 frames. It is fingerprinted with SHA-256 when
+The source must contain at least 16 frames. Rate-converted Opus also requires
+at least 32 real source frames in its context interval; shorter whole sources
+fail explicitly instead of receiving synthetic padding. It is fingerprinted with SHA-256 when
 opened. Files are assumed immutable during an engine session; size/mtime changes
 are detected before requests and after encoding. This is a local fixture identity,
 not an authentication mechanism or the eventual remote revision strategy.
@@ -20,7 +23,7 @@ not an authentication mechanism or the eventual remote revision strategy.
 
 | Request | Encoded payload | PCM treatment |
 | --- | --- | --- |
-| `lossless` | FLAC | Preserves the supported source PCM and bit depth |
+| `lossless` | FLAC | Preserves the source PCM, bit depth and native sample rate |
 | `opus-64` | Ogg Opus, 64 kbps CBR | Lossy, 48 kHz, same channels |
 | `opus-128` | Ogg Opus, 128 kbps CBR | Lossy, 48 kHz, same channels |
 
@@ -31,8 +34,13 @@ uses 20 ms packets, audio mode, and intensity-stereo phase inversion disabled.
 For Opus, the encoder receives up to 120 ms of real source audio before and after
 the requested interval, clamped at track edges. Context is an experimental encoder
 warm-up/tail choice. It is not the codec pre-skip and is not proof of inaudibility.
+At 44.1 kHz the context start is rounded down to a multiple of 147 native frames
+(160 Opus frames), keeping the resampler phase anchored to track frame zero.
+That can add up to 146 real preceding frames; context never extends outside the file.
 Lossless intervals normally need no extra context; fragments shorter than FLAC's
 16-frame minimum block include neighboring real source audio and trim it afterward.
+An explicit 4,096-frame FLAC encoder block size also prevents an arbitrary seek's
+tiny first input frame from being mistaken for the encoder's configured block size.
 
 Source extraction first seeks to the preceding whole second, then uses integer
 `atrim` sample positions. This avoids representing an odd frame boundary as a
@@ -46,20 +54,34 @@ For a segment's metadata:
 1. Decode the complete self-contained payload. The container decoder applies
    Opus pre-skip and final granule trimming. `codec_preskip_frames` is diagnostic;
    **do not discard that number again**.
-2. Verify the decoded frame count equals `decoded_frames`.
-3. Discard `discard_start_frames` of decoded PCM and any trailing
-   `discard_end_frames`.
-4. Present exactly `presentation.frames` beginning at `presentation.start` on the
+2. Verify the decoded codec-frame count equals `codec_decoded_frames` at
+   `codec_sample_rate` (native for FLAC; 48,000 for Opus).
+3. If that clock differs from `sample_rate`, convert to the native source rate
+   using the tested FFmpeg `swr` resampler, `exact_rational=1`, `async=0`, and
+   `dither_method=none`. Encoding uses the same explicit resampler settings.
+   Verify the resulting count equals `decoded_frames`.
+4. Discard `discard_start_frames` and `discard_end_frames`, both in the native
+   source clock. The latter includes any measured `resample_tail_frames`.
+5. Present exactly `presentation.frames` beginning at `presentation.start` on the
    source timeline. The next segment starts at the previous presentation end.
 
-The accounting invariant is:
+The accounting invariants are:
 
 ```text
-discard_start_frames + presentation.frames + discard_end_frames
-    == decoded_frames == encoded_interval.frames
+codec_decoded_frames = ceil(encoded_interval.frames * codec_sample_rate / sample_rate)
+discard_start_frames + presentation.frames + discard_end_frames == decoded_frames
+decoded_frames == encoded_interval.frames + resample_tail_frames
 ```
 
-For example, requesting `[96001, 192002)` at Opus quality from a sufficiently long
+At 48 kHz, or for lossless at either supported rate, the two clocks agree and
+`resample_tail_frames` is zero. For 44.1 kHz Opus, conversion can return either
+N or N+1 native frames. The engine measures this, accepts only the rational
+round-trip bound, and records that explicit zero/one tail for the client to
+trim. It never fills a short result. A double-ceil calculation alone does not
+predict which of these counts FFmpeg will flush; see the
+[native-rate investigation](native-rate-proof.md).
+
+For a 48 kHz example, requesting `[96001, 192002)` at Opus quality from a sufficiently long
 source encodes `[90241, 197762)`. The decoder returns 107,521 frames after codec
 trimming. Discarding 5,760 frames at each end leaves exactly 96,001 presentation
 frames. The reported codec pre-skip (312 frames with the tested build) is already
@@ -73,7 +95,8 @@ can be investigated rather than hidden by a timing assertion.
 ## Cache and resource behavior
 
 The key includes source SHA-256, experiment revision, FFmpeg build/configuration,
-quality and both intervals. Completed payloads and metadata are published from a
+quality and both intervals. Revision 2 uses `stratum-audio-poc-2`, so entries
+from the old single-clock contract are not reused. Completed payloads and metadata are published from a
 temporary directory. Cache hits verify metadata and the payload hash. Missing or
 damaged entries regenerate. Source edits require reopening the source.
 
@@ -111,6 +134,7 @@ timer. A warm cache reading fast on one machine is not a network streaming resul
 - [Ogg Opus: pre-skip, PCM positions, end trimming and seeking](https://www.rfc-editor.org/rfc/rfc7845.html#section-4).
 - [FFmpeg input seeking](https://ffmpeg.org/ffmpeg.html#Main-options).
 - [FFmpeg sample-based audio trimming](https://ffmpeg.org/ffmpeg-filters.html#atrim).
+- [FFmpeg resampler settings](https://ffmpeg.org/ffmpeg-resampler.html).
 
 These describe codec/tool behavior. Stratum's context size, supported formats and
 sample-domain contract above are experimental choices tested by this repository.

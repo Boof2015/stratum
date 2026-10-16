@@ -173,3 +173,19 @@ tests cancellation while this native output is running.
 
 The [natural-handoff proof](handoff-proof.md) feeds two complete tracks into the
 same noninteractive output queue without a reset between them.
+
+## Native-rate follow-up
+
+The helper now accepts optional `--rate 44100|48000`; omitting it preserves the
+original 48 kHz packet protocol and timing. The handoff harness supplies the
+source rate automatically. The selected client clock controls packet bounds,
+startup thresholds, 20 ms quanta and queue timing checks. Ring/capture allocation
+stays bounded at the previous 48 kHz maximum; at 44.1 kHz the ring therefore holds
+slightly more than 12 seconds, while the policy still targets about eight.
+
+`--self-test` now checks both clocks without opening a device. The muted legacy
+output probe still checks 48 kHz packet compatibility and generation resets.
+The earlier listening results above used 48 kHz client PCM. Separate native
+44.1 kHz source/client tests are recorded in [the native-rate proof](native-rate-proof.md).
+The interactive seek harness still supplies 48 kHz; full 44.1 kHz seek/cancellation
+scenarios have not been run.

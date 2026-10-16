@@ -92,7 +92,7 @@ std::string deviceJSON(const Device& device) {
 
 struct Underrun { uint64_t mediaFrame, silenceFrames; };
 struct PCM {
-    uint64_t total;
+    uint64_t total, rate, quantum, segment;
     std::vector<int32_t> ring = std::vector<int32_t>(Capacity * Channels);
     std::vector<int32_t> capture = std::vector<int32_t>(MaxFrames * Channels);
     std::array<Underrun, 4096> underruns{};
@@ -100,13 +100,17 @@ struct PCM {
     std::atomic<int> error{0};
     uint64_t silence = 0, underrunCount = 0, callbacks = 0;
     bool starving = false;
-    explicit PCM(uint64_t frames) : total(frames) { require(frames > 0 && frames <= 32 * Rate + 100, "invalid duration"); }
+    explicit PCM(uint64_t frames, uint64_t sampleRate = Rate)
+        : total(frames), rate(sampleRate), quantum(sampleRate / 50), segment(2 * sampleRate + 1) {
+        require(rate == 44100 || rate == Rate, "unsupported client rate");
+        require(frames > 0 && frames <= 32 * rate + 100, "invalid duration");
+    }
 
     // Single stdin producer. Publish only after the entire packet is present.
     void append(uint64_t start, const int32_t* samples, uint64_t count) {
         auto w = written.load(std::memory_order_relaxed);
         auto r = consumed.load(std::memory_order_acquire);
-        require(start == w && count > 0 && count <= Segment && count <= total - w, "invalid/reordered PCM packet");
+        require(start == w && count > 0 && count <= segment && count <= total - w, "invalid/reordered PCM packet");
         require(count <= Capacity - (w - r), "PCM queue capacity exceeded");
         auto first = std::min(count, Capacity - w % Capacity);
         std::copy_n(samples, first * Channels, ring.data() + (w % Capacity) * Channels);
@@ -118,7 +122,7 @@ struct PCM {
         ++callbacks;
         if (error.load(std::memory_order_relaxed)) return 0;
         auto r = consumed.load(std::memory_order_relaxed);
-        auto count = std::min(Quantum, total - r);
+        auto count = std::min(quantum, total - r);
         if (!count) return 0;
         auto out = rendered.load(std::memory_order_relaxed);
         if (out + count > MaxFrames) { error.store(1); return 0; }
@@ -144,17 +148,17 @@ struct PCM {
     }
 };
 
-void selfTest() {
-    auto state = std::make_unique<PCM>(2 * Capacity + 17);
+void selfTest(uint64_t rate) {
+    auto state = std::make_unique<PCM>(2 * Capacity + 17, rate);
     std::array<int32_t, Quantum * Channels> buffer{};
-    require(state->take(buffer.data()) == Quantum && state->consumed == 0, "starvation advanced media");
+    require(state->take(buffer.data()) == state->quantum && state->consumed == 0, "starvation advanced media");
     require(std::all_of(buffer.begin(), buffer.end(), [](auto x) { return x == 0; }), "starvation was not silence");
     auto sample = [](uint64_t frame, uint64_t ch) { return int32_t((frame * 31 + ch * 7919) % 1000000) - 500000; };
     std::vector<int32_t> packet(Segment * Channels);
     while (state->consumed < state->total) {
         auto w = state->written.load();
-        if (w < state->total && w - state->consumed < 3 * Rate) {
-            auto count = std::min(Segment, state->total - w);
+        if (w < state->total && w - state->consumed < 3 * rate) {
+            auto count = std::min(state->segment, state->total - w);
             for (uint64_t i = 0; i < count; ++i)
                 for (uint64_t ch = 0; ch < Channels; ++ch) packet[i * Channels + ch] = sample(w + i, ch);
             state->append(w, packet.data(), count);
@@ -165,7 +169,7 @@ void selfTest() {
             for (uint64_t ch = 0; ch < Channels; ++ch)
                 require(buffer[i * Channels + ch] == sample(before + i, ch), "ring order/tail mismatch");
     }
-    require(state->silence == Quantum && state->rendered == state->total + Quantum && state->underrunCount == 1, "bad capture counters");
+    require(state->silence == state->quantum && state->rendered == state->total + state->quantum && state->underrunCount == 1, "bad capture counters");
     require(state->take(buffer.data()) == 0, "EOF produced extra audio");
     bool rejected = false;
     try { state->append(0, packet.data(), 1); } catch (...) { rejected = true; }
@@ -178,14 +182,14 @@ struct Control {
     bool interrupted = false;
 };
 
-int play(const Device& device, const std::string& output, uint64_t total, float gain, Control* control = nullptr) {
-    auto owner = std::make_unique<PCM>(total);
+int play(const Device& device, const std::string& output, uint64_t total, float gain, uint64_t rate, Control* control = nullptr) {
+    auto owner = std::make_unique<PCM>(total, rate);
     PCM* pcm = owner.get();
     dispatch_queue_t callbacks = dispatch_queue_create("stratum.poc.output", DISPATCH_QUEUE_SERIAL);
     AudioQueueRef queue = nullptr;
     AudioQueueTimelineRef timeline = nullptr;
     AudioStreamBasicDescription format{};
-    format.mSampleRate = Rate; format.mFormatID = kAudioFormatLinearPCM;
+    format.mSampleRate = rate; format.mFormatID = kAudioFormatLinearPCM;
     format.mFormatFlags = kLinearPCMFormatFlagIsSignedInteger | kLinearPCMFormatFlagIsPacked;
     format.mBytesPerPacket = format.mBytesPerFrame = Channels * 4;
     format.mFramesPerPacket = 1; format.mChannelsPerFrame = Channels; format.mBitsPerChannel = 32;
@@ -211,7 +215,7 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
         checked(AudioQueueSetParameter(queue, kAudioQueueParam_Volume, gain), "set test gain");
         checked(AudioQueueCreateTimeline(queue, &timeline), "create queue timeline");
         std::array<AudioQueueBufferRef, 3> buffers{};
-        for (auto& buffer : buffers) checked(AudioQueueAllocateBuffer(queue, Quantum * Channels * 4, &buffer), "allocate output buffer");
+        for (auto& buffer : buffers) checked(AudioQueueAllocateBuffer(queue, pcm->quantum * Channels * 4, &buffer), "allocate output buffer");
         auto before = Clock::now(), started = before;
         bool running = false, stopping = false, eof = false;
         uint64_t discontinuities = 0, stalePackets = 0;
@@ -241,13 +245,13 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
                     headerBytes += got;
                     if (headerBytes == headerSize) {
                         if (control && header[0] == UINT64_MAX) {
-                            require(wireHeader[0] > control->generation && header[1] > 0 && header[1] <= 32 * Rate + 100,
+                            require(wireHeader[0] > control->generation && header[1] > 0 && header[1] <= 32 * rate + 100,
                                     "invalid seek command");
                             control->nextGeneration = wireHeader[0]; control->nextTotal = header[1];
                             control->interrupted = true;
                             break;
                         }
-                        require(header[1] > 0 && header[1] <= Segment, "invalid PCM packet size");
+                        require(header[1] > 0 && header[1] <= pcm->segment, "invalid PCM packet size");
                         if (!control || wireHeader[0] == control->generation)
                             require(header[0] == pcm->written && header[1] <= total - header[0], "invalid PCM header");
                         else require(wireHeader[0] < control->generation, "PCM from future generation");
@@ -267,7 +271,7 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
             }
             if (control && control->interrupted) break;
             require(!eof || pcm->written == total, "PCM producer ended early");
-            auto startupFrames = control && control->generation > 0 ? Segment : 3 * Segment;
+            auto startupFrames = control && control->generation > 0 ? pcm->segment : 3 * pcm->segment;
             if (!running && pcm->written >= std::min(startupFrames, total)) {
                 auto aq = queue;
                 for (auto buffer : buffers) dispatch_sync(callbacks, ^{ fill(aq, buffer); });
@@ -320,7 +324,7 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
         raw.close(); require(bool(raw), "capture write failed");
         std::ostringstream report;
         report << "{\"device\":" << deviceJSON(device) << ",\"gain\":" << gain
-               << ",\"hardware_sample_rate\":" << hardwareRate << ",\"client_sample_rate\":" << Rate
+               << ",\"hardware_sample_rate\":" << hardwareRate << ",\"client_sample_rate\":" << rate
                << ",\"consumed_frames\":" << pcm->consumed << ",\"rendered_frames\":" << pcm->rendered
                << ",\"silence_frames\":" << pcm->silence << ",\"callbacks\":" << pcm->callbacks
                << ",\"elapsed_seconds\":" << elapsed << ",\"queue_sample_time\":" << queueTime
@@ -350,25 +354,36 @@ int play(const Device& device, const std::string& output, uint64_t total, float 
 int main(int argc, char** argv) {
     alarm(95); // Independent process lifetime bound, including framework/pipe stalls.
     try {
-        if (argc == 2 && std::string(argv[1]) == "--self-test") { selfTest(); return 0; }
+        if (argc == 2 && std::string(argv[1]) == "--self-test") { selfTest(Rate); selfTest(44100); return 0; }
         if (argc == 2 && std::string(argv[1]) == "--list") {
             auto list = devices(); std::cout << '[';
             for (size_t i = 0; i < list.size(); ++i) { if (i) std::cout << ','; std::cout << deviceJSON(list[i]); }
             std::cout << ']' << std::endl; return 0;
         }
-        bool interactive = argc == 10 && std::string(argv[9]) == "--interactive";
-        require((argc == 9 || interactive) && std::string(argv[1]) == "--device" && std::string(argv[3]) == "--out" &&
-                std::string(argv[5]) == "--total" && std::string(argv[7]) == "--gain", "usage: --list | --self-test | --device UID --out DIR --total FRAMES --gain 0..1");
+        bool interactive = false;
+        uint64_t rate = Rate;
+        bool rateSeen = false;
+        for (int i = 9; i < argc; ++i) {
+            std::string option = argv[i];
+            if (option == "--interactive") { require(!interactive, "duplicate interactive flag"); interactive = true; }
+            else if (option == "--rate") {
+                require(!rateSeen && i + 1 < argc, "missing/duplicate rate"); rateSeen = true;
+                rate = std::stoull(argv[++i]);
+                require(rate == 44100 || rate == Rate, "unsupported client rate");
+            } else throw std::runtime_error("unknown output option");
+        }
+        require(argc >= 9 && std::string(argv[1]) == "--device" && std::string(argv[3]) == "--out" &&
+                std::string(argv[5]) == "--total" && std::string(argv[7]) == "--gain", "usage: --list | --self-test | --device UID --out DIR --total FRAMES --gain 0..1 [--rate 44100|48000] [--interactive]");
         float gain = std::stof(argv[8]); require(std::isfinite(gain) && gain >= 0 && gain <= 1, "invalid gain");
         for (const auto& device : devices())
             if (device.uid == argv[2]) {
-                if (!interactive) return play(device, argv[4], std::stoull(argv[6]), gain);
+                if (!interactive) return play(device, argv[4], std::stoull(argv[6]), gain, rate);
                 Control control;
                 uint64_t total = std::stoull(argv[6]);
                 for (unsigned count = 0; count < 8; ++count) {
                     auto path = std::filesystem::path(argv[4]) / ("generation-" + std::to_string(control.generation));
                     require(std::filesystem::create_directory(path), "generation output already exists");
-                    play(device, path.string(), total, gain, &control);
+                    play(device, path.string(), total, gain, rate, &control);
                     if (!control.interrupted) return 0;
                     total = control.nextTotal;
                     control = Control{control.nextGeneration, 0, 0, false};

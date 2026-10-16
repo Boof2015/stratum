@@ -90,8 +90,8 @@ Native output is opt-in. Build and select a device as described in
 Choose one `--scenario` for native output; `all` is rejected. Gain zero exercises
 the device callback without audible output. A nonzero gain plays sound. For
 listening, use real music with `--source`, not the synthetic measurement signal.
-The default excerpt starts at `80 * 48000 + 37`; `--origin` accepts another frame
-position. Inputs remain native 48 kHz stereo 16/24-bit lossless, at most 10 minutes
+The default excerpt starts at `80 * source_rate + 37`; `--origin` accepts another frame
+position. Inputs can be native 44.1/48 kHz stereo 16/24-bit lossless, at most 10 minutes
 and 96 MiB, with enough frames for the excerpt. This creates an artificial track
 split in music, useful for hearing continuity independently of how an album was
 mastered. It is not a test of every kind of real album boundary.
@@ -110,7 +110,11 @@ python3 -B experiments/handoff.py \
 
 Add the explicit audio options above for physical output. `--origin` is rejected
 with `--next-source` because this mode always tests the actual file ending. Both
-files must meet the supported-format limits; their bit depths may differ.
+files must meet the supported-format limits and have the same sample rate; their
+bit depths may differ. At 44.1 kHz, segments contain 88,201 frames, the boundary
+is frame 529,207, and the full output has 1,411,216 frames. The earlier numbers
+and recorded results below describe the original 48 kHz experiment. See the
+[44.1 kHz follow-up](native-rate-proof.md) for its separate results.
 
 ## Independent checks
 
@@ -195,7 +199,8 @@ Bluetooth output. Audible continuity still needs listening. Lossy boundary
 waveforms can differ despite correct timing; no crossfade or silence removal is
 used to conceal them. Lossless means exact source PCM, not original encoded bytes.
 
-This proof uses two native 48 kHz stereo lossless sources on one configured device.
-It does not yet cover sample-rate/codec changes, long albums, queue edits while preparing the
+The original recorded runs use two native 48 kHz stereo lossless sources on one
+configured device; the linked follow-up adds same-rate 44.1 kHz sources.
+Neither covers mixed sample rates between tracks, lossy original codecs, long albums, queue edits while preparing the
 next track, output-device changes, production authentication/discovery, or Astra
 integration. The earlier source-revision/Last-Modified limitations still apply.

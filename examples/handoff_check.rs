@@ -7,6 +7,7 @@ use stratum_poc::{media, proof};
 
 #[derive(Deserialize)]
 struct Delivery {
+    sample_rate: Option<u64>,
     tracks: Vec<Track>,
     frames: u64,
     segments: Vec<Segment>,
@@ -45,8 +46,18 @@ fn main() -> Result<()> {
         "expected two independent tracks"
     );
     let mut references = Vec::new();
+    let mut rate = None;
     for (index, track) in delivery.tracks.iter().enumerate() {
         let source = media::Source::open(&track.source)?;
+        ensure!(
+            rate.is_none() || rate == Some(source.info.sample_rate),
+            "mixed source clocks are not supported by this handoff proof"
+        );
+        rate = Some(source.info.sample_rate);
+        ensure!(
+            delivery.sample_rate.is_none() || delivery.sample_rate == rate,
+            "wrong playback clock"
+        );
         let end = track
             .origin
             .checked_add(track.frames)
@@ -134,7 +145,7 @@ fn main() -> Result<()> {
     let captured = fs::read(parent.join("rendered.s32le"))?;
     println!(
         "{}",
-        json!({"exact_frames": position == delivery.frames,
+        json!({"sample_rate": rate, "exact_frames": position == delivery.frames,
             "frames": position, "lossless_exact": exact,
             "rendered_matches": rendered == captured,
             "zero_lag": zero_lag && windows > 0, "evaluable_windows": windows,

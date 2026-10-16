@@ -456,7 +456,7 @@ def _metered_source(nav, song_id, bounded=True, block_source=None):
             metrics["block_cache_hits"] = block_source.hits
 
 
-def acquire(nav, song_id, start, frames, output, bounded=True, session=None, cancel=None):
+def acquire(nav, song_id, start, frames, output, bounded=True, session=None, cancel=None, rate=RATE):
     """Fetch an original-source interval over authenticated Navidrome HTTP.
 
     The temporary gateway keeps upstream credentials out of FFmpeg arguments and
@@ -464,13 +464,14 @@ def acquire(nav, song_id, start, frames, output, bounded=True, session=None, can
     or across acquisitions when given an authorized private source session.
     It does not rewrite audio or implement production auth.
     """
-    seek_seconds, skip = divmod(start, RATE)
+    require(rate in (44100, 48000), "unsupported acquisition clock")
+    seek_seconds, skip = divmod(start, rate)
     began = time.monotonic()
     with metered_source(nav, song_id, bounded=bounded, session=session) as (url, metrics):
         run(FFMPEG + ["-protocol_whitelist", "file,http,tcp", "-ss", str(seek_seconds),
             "-i", url, "-map", "0:a:0", "-vn", "-map_metadata", "-1", "-af",
             f"atrim=start_sample={skip}:end_sample={skip + frames},asetpts=PTS-STARTPTS",
-            "-c:a", "flac", "-sample_fmt", "s32", "-bits_per_raw_sample", "24", str(output)], cancel=cancel)
+            "-c:a", "flac", "-frame_size", "4096", "-sample_fmt", "s32", "-bits_per_raw_sample", "24", str(output)], cancel=cancel)
         acquisition_ms = (time.monotonic() - began) * 1000
     if any("error" in r for r in metrics["decoder_requests"]):
         raise RuntimeError("upstream acquisition had a transport error")
@@ -480,8 +481,9 @@ def acquire(nav, song_id, start, frames, output, bounded=True, session=None, can
             **metrics}
 
 
-def decode(path):
-    return run(FFMPEG + ["-i", str(path), "-map", "0:a:0", "-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
+def decode(path, rate=None):
+    conversion = [] if rate is None else ["-af", f"aresample={rate}:resampler=swr:exact_rational=1:async=0:dither_method=none"]
+    return run(FFMPEG + ["-i", str(path), "-map", "0:a:0"] + conversion + ["-f", "s32le", "-c:a", "pcm_s32le", "pipe:1"])
 
 
 def main():

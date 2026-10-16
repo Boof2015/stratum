@@ -1,6 +1,6 @@
 use crate::{
     process::{ffmpeg, run},
-    timeline::{Interval, RATE},
+    timeline::{converted_frames, Interval, RATE},
 };
 use anyhow::{bail, ensure, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -13,7 +13,7 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-pub const EXPERIMENT: &str = "stratum-audio-poc-1";
+pub const EXPERIMENT: &str = "stratum-audio-poc-2";
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -108,8 +108,8 @@ impl Source {
             .context("source has no audio stream")?;
         let rate: u64 = stream.sample_rate.parse()?;
         ensure!(
-            rate == RATE,
-            "this first proof requires 48 kHz audio; got {rate} Hz (no silent resampling)"
+            [44_100, RATE].contains(&rate),
+            "this proof supports 44.1/48 kHz audio; got {rate} Hz (no silent resampling)"
         );
         ensure!(
             (1..=2).contains(&stream.channels),
@@ -183,6 +183,12 @@ pub struct SegmentMetadata {
     pub encoder: String,
     pub quality: Quality,
     pub sample_rate: u64,
+    /// Actual payload decoder clock; Opus always uses 48 kHz in this proof.
+    pub codec_sample_rate: u64,
+    /// Frames after codec pre-skip/end trimming, before client rate conversion.
+    pub codec_decoded_frames: u64,
+    /// Explicit extra native frame from rounding a non-integral round trip.
+    pub resample_tail_frames: u64,
     pub channels: u32,
     pub presentation: Interval,
     pub encoded_interval: Interval,
@@ -225,14 +231,27 @@ impl Engine {
     pub fn segment(&self, start: u64, frames: u64, quality: Quality) -> Result<Segment> {
         let began = Instant::now();
         self.source.check_unchanged()?;
-        let presentation = Interval::new(start, frames, self.source.info.frames)?;
+        let rate = self.source.info.sample_rate;
+        let presentation = Interval::at_rate(start, frames, self.source.info.frames, rate)?;
         // FLAC cannot encode a block shorter than 16 frames. A tiny requested
         // tail includes real neighboring source audio, then the client trims it.
         let encoded = if quality == Quality::Lossless && frames >= 16 {
             presentation
         } else {
-            presentation.with_context(self.source.info.frames)
+            presentation.context_at_rate(self.source.info.frames, rate)
         };
+        let codec_rate = if quality == Quality::Lossless {
+            rate
+        } else {
+            RATE
+        };
+        ensure!(
+            codec_rate == rate || encoded.frames >= 32,
+            "rate-converted Opus needs at least 32 real source frames; no silence padding is added"
+        );
+        let codec_frames = converted_frames(encoded.frames, rate, codec_rate)?;
+        let decoded_frames = converted_frames(codec_frames, codec_rate, rate)?;
+        let resample_tail = decoded_frames - encoded.frames;
         let key = hash_bytes(&serde_json::to_vec(&(
             EXPERIMENT,
             &self.source.info.sha256,
@@ -248,13 +267,16 @@ impl Engine {
             source_sha256: self.source.info.sha256.clone(),
             encoder: self.encoder.clone(),
             quality,
-            sample_rate: RATE,
+            sample_rate: rate,
+            codec_sample_rate: codec_rate,
+            codec_decoded_frames: codec_frames,
+            resample_tail_frames: resample_tail,
             channels: self.source.info.channels,
             presentation,
             encoded_interval: encoded,
             discard_start_frames: start - encoded.start,
-            discard_end_frames: encoded.end() - presentation.end(),
-            decoded_frames: encoded.frames,
+            discard_end_frames: encoded.end() - presentation.end() + resample_tail,
+            decoded_frames,
             codec_preskip_frames: 0,
             source_bytes_preserved: false,
             source_pcm_preserved: quality == Quality::Lossless,
@@ -267,7 +289,20 @@ impl Engine {
                 metadata.payload_sha256 = saved.payload_sha256.clone();
                 metadata.payload_bytes = saved.payload_bytes;
                 metadata.codec_preskip_frames = saved.codec_preskip_frames;
-                if saved == metadata
+                // FFmpeg's resampler can flush either N or N+1 native frames
+                // after the fractional-rate codec round trip. Accept only the
+                // measured tail within that one-frame bound; never a short N.
+                let valid_tail = saved.resample_tail_frames <= resample_tail
+                    && saved.decoded_frames == encoded.frames + saved.resample_tail_frames
+                    && saved.discard_end_frames
+                        == encoded.end() - presentation.end() + saved.resample_tail_frames;
+                if valid_tail {
+                    metadata.resample_tail_frames = saved.resample_tail_frames;
+                    metadata.decoded_frames = saved.decoded_frames;
+                    metadata.discard_end_frames = saved.discard_end_frames;
+                }
+                if valid_tail
+                    && saved == metadata
                     && fs::metadata(&path).map(|m| m.len()).ok() == Some(saved.payload_bytes)
                     && hash_file(&path).ok().as_ref() == Some(&saved.payload_sha256)
                 {
@@ -285,9 +320,18 @@ impl Engine {
             .path()
             .join(format!("audio.{}", quality.extension()));
         // Seek to a whole second, then trim by integer frames. This avoids rounding
-        // a 1/48000-second boundary into FFmpeg's microsecond -ss argument.
-        let seek_seconds = encoded.start / RATE;
-        let skip = encoded.start - seek_seconds * RATE;
+        // a native-frame boundary into FFmpeg's microsecond -ss argument.
+        let seek_seconds = encoded.start / rate;
+        let skip = encoded.start - seek_seconds * rate;
+        let mut filter = format!(
+            "atrim=start_sample={skip}:end_sample={},asetpts=PTS-STARTPTS",
+            skip + encoded.frames
+        );
+        if rate != codec_rate {
+            filter.push_str(&format!(
+                ",aresample={codec_rate}:resampler=swr:exact_rational=1:async=0:dither_method=none"
+            ));
+        }
         let mut command = ffmpeg();
         command
             .args([
@@ -308,13 +352,10 @@ impl Engine {
                 "-1",
                 "-af",
             ])
-            .arg(format!(
-                "atrim=start_sample={skip}:end_sample={},asetpts=PTS-STARTPTS",
-                skip + encoded.frames
-            ))
+            .arg(filter)
             .args([
                 "-ar",
-                "48000",
+                &codec_rate.to_string(),
                 "-ac",
                 &self.source.info.channels.to_string(),
                 "-threads",
@@ -325,6 +366,8 @@ impl Engine {
                 command.args([
                     "-c:a",
                     "flac",
+                    "-frame_size",
+                    "4096",
                     "-sample_fmt",
                     "s32",
                     "-bits_per_raw_sample",
@@ -356,11 +399,26 @@ impl Engine {
         }
         run(command.arg(&output), TIMEOUT, 1_048_576)?;
         self.source.check_unchanged()?;
-        let decoded = decode(&output, self.source.info.channels, encoded.frames)?;
+        let decoded = decode(&output, self.source.info.channels, codec_frames)
+            .with_context(|| format!("codec frames: rate={rate}, start={start}, frames={frames}, encoded={encoded:?}, quality={quality:?}"))?;
         ensure!(
-            decoded.len() as u64 == encoded.frames * u64::from(self.source.info.channels),
+            decoded.len() as u64 == codec_frames * u64::from(self.source.info.channels),
             "encoder/decoder returned the wrong frame count"
         );
+        if rate != codec_rate {
+            let native = decode_between(
+                &output,
+                self.source.info.channels,
+                encoded.frames,
+                decoded_frames,
+                Some(rate),
+            )
+            .context("client rate conversion count")?;
+            metadata.decoded_frames = native.len() as u64 / u64::from(self.source.info.channels);
+            metadata.resample_tail_frames = metadata.decoded_frames - encoded.frames;
+            metadata.discard_end_frames =
+                encoded.end() - presentation.end() + metadata.resample_tail_frames;
+        }
         let payload = fs::read(&output)?;
         metadata.codec_preskip_frames = if quality == Quality::Lossless {
             0
@@ -384,30 +442,62 @@ impl Engine {
 }
 
 pub fn decode(path: &Path, channels: u32, expected_frames: u64) -> Result<Vec<i32>> {
-    let expected_bytes = expected_frames
+    decode_at_rate(path, channels, expected_frames, None)
+}
+
+pub fn decode_at_rate(
+    path: &Path,
+    channels: u32,
+    expected_frames: u64,
+    rate: Option<u64>,
+) -> Result<Vec<i32>> {
+    decode_between(path, channels, expected_frames, expected_frames, rate)
+}
+
+fn decode_between(
+    path: &Path,
+    channels: u32,
+    minimum_frames: u64,
+    maximum_frames: u64,
+    rate: Option<u64>,
+) -> Result<Vec<i32>> {
+    let minimum_bytes = minimum_frames
         .checked_mul(u64::from(channels))
         .and_then(|n| n.checked_mul(4))
         .context("PCM size overflow")?;
+    let maximum_bytes = maximum_frames
+        .checked_mul(u64::from(channels))
+        .and_then(|n| n.checked_mul(4))
+        .context("PCM size overflow")?;
+    let mut command = ffmpeg();
+    command
+        .args(["-protocol_whitelist", "file,pipe", "-i"])
+        .arg(path);
+    if let Some(rate) = rate {
+        // No async clock correction, padding, crossfade or dithering.
+        command.args([
+            "-af",
+            &format!("aresample={rate}:resampler=swr:exact_rational=1:async=0:dither_method=none"),
+        ]);
+    }
     let bytes = run(
-        ffmpeg()
-            .args(["-protocol_whitelist", "file,pipe", "-i"])
-            .arg(path)
-            .args([
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-f",
-                "s32le",
-                "-c:a",
-                "pcm_s32le",
-                "pipe:1",
-            ]),
+        command.args([
+            "-map",
+            "0:a:0",
+            "-vn",
+            "-f",
+            "s32le",
+            "-c:a",
+            "pcm_s32le",
+            "pipe:1",
+        ]),
         TIMEOUT,
-        expected_bytes + 65536,
+        maximum_bytes + 65536,
     )?;
     ensure!(
-        bytes.len() as u64 == expected_bytes,
-        "decoded {} bytes, expected {expected_bytes}",
+        (minimum_bytes..=maximum_bytes).contains(&(bytes.len() as u64))
+            && (bytes.len() as u64).is_multiple_of(u64::from(channels) * 4),
+        "decoded {} bytes, expected {minimum_bytes}..={maximum_bytes}",
         bytes.len()
     );
     Ok(bytes
@@ -424,7 +514,12 @@ pub fn presentation_pcm(segment: &Segment) -> Result<Vec<i32>> {
         "segment payload changed"
     );
     let metadata = &segment.metadata;
-    let pcm = decode(&segment.path, metadata.channels, metadata.decoded_frames)?;
+    let pcm = decode_at_rate(
+        &segment.path,
+        metadata.channels,
+        metadata.decoded_frames,
+        (metadata.codec_sample_rate != metadata.sample_rate).then_some(metadata.sample_rate),
+    )?;
     let start = usize::try_from(metadata.discard_start_frames * u64::from(metadata.channels))?;
     let count = usize::try_from(metadata.presentation.frames * u64::from(metadata.channels))?;
     Ok(pcm

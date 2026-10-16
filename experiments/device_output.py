@@ -11,7 +11,9 @@ import navidrome as nav
 
 
 class DevicePlayback:
-    def __init__(self, output, helper, device, total, gain):
+    def __init__(self, output, helper, device, total, gain, rate=nav.RATE):
+        nav.require(rate in (44100, 48000), "unsupported device client clock")
+        self.rate = rate
         self.output, self.helper, self.device = output, helper, device
         self.total, self.gain = total, gain
         self.condition = threading.Condition()
@@ -28,7 +30,7 @@ class DevicePlayback:
         with self.condition:
             # Excludes the helper's three 20 ms AudioQueue buffers. Conservative
             # by at most 60 ms relative to data waiting in the native PCM ring.
-            return max(0, self.accepted - self.consumed) / nav.RATE
+            return max(0, self.accepted - self.consumed) / self.rate
 
     def append(self, start, pcm):
         nav.require(self.ready.wait(12), "audio helper did not open")
@@ -77,7 +79,8 @@ class DevicePlayback:
         try:
             with (self.output / "device-stderr.log").open("wb") as log:
                 self.process = subprocess.Popen([str(self.helper), "--device", self.device,
-                    "--out", str(self.output), "--total", str(self.total), "--gain", str(self.gain)],
+                    "--out", str(self.output), "--total", str(self.total), "--gain", str(self.gain)]
+                    + (["--rate", str(self.rate)] if self.rate != nav.RATE else []),
                     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=log, bufsize=0)
                 os.set_blocking(self.process.stdin.fileno(), False)
                 watchdog = threading.Timer(90, self.stop)
@@ -112,7 +115,8 @@ class DevicePlayback:
                     detail = (self.output / "device-stderr.log").read_text(errors="replace")[-2000:]
                     raise RuntimeError("audio output failed: " + detail.strip())
                 report = json.loads((self.output / "device.json").read_text())
-                nav.require(report["consumed_frames"] == self.total and report["device"]["uid"] == self.device,
+                nav.require(report["consumed_frames"] == self.total and report["device"]["uid"] == self.device
+                            and report["client_sample_rate"] == self.rate,
                             "hardware output ended on the wrong track/device")
                 self.device_report = report
                 self.consumed = report["consumed_frames"]

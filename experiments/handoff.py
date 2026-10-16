@@ -9,6 +9,7 @@ or queue reset occurs at the track boundary. This is not an Astra integration.
 import argparse
 import base64
 import contextlib
+from dataclasses import dataclass
 import hashlib
 import http.server
 import json
@@ -28,17 +29,40 @@ from source_session import SourceSession
 RATE, FRAME_BYTES = live.RATE, live.FRAME_BYTES
 SEGMENT, TOTAL = live.SEGMENT, live.TOTAL
 BOUNDARY = 6 * SEGMENT + 1  # One-frame EOF segment; also inside a device quantum.
+
+
+@dataclass(frozen=True)
+class Clock:
+    rate: int = RATE
+
+    def __post_init__(self):
+        nav.require(self.rate in (44100, 48000), "unsupported source clock")
+
+    @property
+    def segment(self):
+        return 2 * self.rate + 1
+
+    @property
+    def total(self):
+        return 16 * self.segment
+
+    @property
+    def boundary(self):
+        return 6 * self.segment + 1
+
+
 SCENARIOS = ("lossless", "mixed", "reverse", "adaptive", "late-next")
 
 
-def intervals(lengths, origins=None):
+def intervals(lengths, origins=None, rate=RATE):
+    segment = Clock(rate).segment
     origins = [0] * len(lengths) if origins is None else origins
     nav.require(len(origins) == len(lengths) and all(origin >= 0 for origin in origins), "invalid source origins")
     result, position = [], 0
     for track, length in enumerate(lengths):
         nav.require(length >= 16, "source too short")
-        for start in range(0, length, SEGMENT):
-            frames = min(SEGMENT, length - start)
+        for start in range(0, length, segment):
+            frames = min(segment, length - start)
             result.append({"track": track, "source_start": origins[track] + start,
                            "start": position, "frames": frames})
             position += frames
@@ -46,30 +70,45 @@ def intervals(lengths, origins=None):
 
 
 def playback_ranges(infos, actual_pair):
+    clock = Clock(infos[0].get("sample_rate", RATE))
+    nav.require(all(info.get("sample_rate", RATE) == clock.rate for info in infos),
+                "mixed source rates need a separate output policy; no silent conversion")
     if not actual_pair:
-        nav.require([info["frames"] for info in infos] == [BOUNDARY, TOTAL - BOUNDARY], "invalid split fixture")
+        nav.require([info["frames"] for info in infos] == [clock.boundary, clock.total - clock.boundary], "invalid split fixture")
         return [{"origin": 0, "frames": info["frames"]} for info in infos]
-    nav.require(infos[0]["frames"] >= BOUNDARY and infos[1]["frames"] >= TOTAL - BOUNDARY,
+    nav.require(infos[0]["frames"] >= clock.boundary and infos[1]["frames"] >= clock.total - clock.boundary,
                 "album tracks too short for excerpt")
-    return [{"origin": infos[0]["frames"] - BOUNDARY, "frames": BOUNDARY},
-            {"origin": 0, "frames": TOTAL - BOUNDARY}]
+    return [{"origin": infos[0]["frames"] - clock.boundary, "frames": clock.boundary},
+            {"origin": 0, "frames": clock.total - clock.boundary}]
 
 
-def acquisition_interval(start, frames, total):
+def acquisition_interval(start, frames, total, rate=RATE):
+    context = 120 * rate // 1000
     nav.require(0 <= start < total and 0 < frames <= total - start, "invalid source interval")
-    begin, end = max(0, start - nav.CONTEXT), min(total, start + frames + nav.CONTEXT)
+    begin, end = max(0, start - context), min(total, start + frames + context)
+    if rate == 44100:
+        begin -= begin % 147
     return begin, end - begin, start - begin
 
 
-def validate_envelope(envelope, interval, quality):
+def validate_envelope(envelope, interval, quality, rate=RATE):
     nav.require(all(envelope[key] == value for key, value in interval.items()), "response track/interval mismatch")
     meta = envelope["metadata"]
-    nav.require(meta["quality"] == quality and meta["sample_rate"] == RATE and meta["channels"] == 2,
+    nav.require(meta["quality"] == quality and meta["sample_rate"] == rate and meta["channels"] == 2,
                 "response format mismatch")
     nav.require(meta["presentation"]["frames"] == interval["frames"] and
                 meta["discard_start_frames"] >= 0 and meta["discard_end_frames"] >= 0 and
                 meta["discard_start_frames"] + interval["frames"] + meta["discard_end_frames"] == meta["decoded_frames"],
                 "invalid segment trims")
+    if rate != RATE:
+        codec_rate = rate if quality == "lossless" else 48000
+        native_frames = meta["encoded_interval"]["frames"]
+        codec_frames = (native_frames * codec_rate + rate - 1) // rate
+        maximum_native = (codec_frames * rate + codec_rate - 1) // codec_rate
+        nav.require(meta["codec_sample_rate"] == codec_rate and meta["codec_decoded_frames"] == codec_frames
+                    and native_frames <= meta["decoded_frames"] <= maximum_native
+                    and meta["resample_tail_frames"] == meta["decoded_frames"] - native_frames,
+                    "invalid native/codec clock mapping")
     return meta
 
 
@@ -107,10 +146,10 @@ def endpoint(account, songs, infos, binary, output, playback, plans, impaired):
                     work = output / ("request-%03d" % len(records))
                     work.mkdir()
                 track = plan["track"]
-                begin, count, trim = acquisition_interval(plan["source_start"], plan["frames"], infos[track]["frames"])
+                begin, count, trim = acquisition_interval(plan["source_start"], plan["frames"], infos[track]["frames"], infos[track]["sample_rate"])
                 source = work / "source.flac"
                 record["acquisition"] = nav.acquire(account, songs[track]["id"], begin, count, source,
-                                                     session=sessions[track])
+                                                     session=sessions[track], rate=infos[track]["sample_rate"])
                 segment = json.loads(nav.run([str(binary), "segment", "--source", str(source),
                     "--start-frame", str(trim), "--frames", str(plan["frames"]), "--quality", quality,
                     "--cache", str(work / "cache")]))
@@ -158,13 +197,13 @@ def endpoint(account, songs, infos, binary, output, playback, plans, impaired):
             session.close()
 
 
-def receive(url, index, plan, quality, policy, playback, adaptive, output):
+def receive(url, index, plan, quality, policy, playback, adaptive, output, rate=RATE):
     began = time.monotonic()
     request = urllib.request.Request(url + "?" + urllib.parse.urlencode({"index": index, "quality": quality}))
     with nav.HTTP.open(request, timeout=10) as response:
         size = int(response.headers["Content-Length"])
         nav.require(0 < size <= live.MAX_PAYLOAD, "invalid payload size")
-        meta = validate_envelope(json.loads(base64.b64decode(response.headers["X-Stratum-Test"])), plan, quality)
+        meta = validate_envelope(json.loads(base64.b64decode(response.headers["X-Stratum-Test"])), plan, quality, rate)
         body_started, body = time.monotonic(), bytearray()
         while len(body) < size:
             chunk = response.read(min(4096, size - len(body)))
@@ -177,7 +216,7 @@ def receive(url, index, plan, quality, policy, playback, adaptive, output):
     nav.require(hashlib.sha256(body).hexdigest() == meta["payload_sha256"], "corrupt segment")
     encoded = output / (f"segment-{index}." + ("flac" if quality == "lossless" else "opus"))
     encoded.write_bytes(body)
-    pcm = nav.decode(encoded)
+    pcm = nav.decode(encoded, rate=rate if rate != 48000 and quality != "lossless" else None)
     nav.require(len(pcm) == meta["decoded_frames"] * FRAME_BYTES, "decoded duration mismatch")
     trim = meta["discard_start_frames"] * FRAME_BYTES
     pcm = pcm[trim:trim + plan["frames"] * FRAME_BYTES]
@@ -186,7 +225,7 @@ def receive(url, index, plan, quality, policy, playback, adaptive, output):
     pcm_path.write_bytes(pcm)
     # Tiny EOF segments have disproportionate overhead/headers. They should not
     # convince the controller that full-size segments have become cheap.
-    if plan["frames"] == SEGMENT:
+    if plan["frames"] == Clock(rate).segment:
         policy.observe(size, received - body_started, body_started - began + decoded - received)
     playback.append(plan["start"], pcm)
     return {**plan, "quality": quality, "pcm": pcm_path.name,
@@ -204,14 +243,16 @@ def wait_until(playback, predicate, timeout=25):
 
 def run_case(name, account, songs, infos, sources, args, output):
     output.mkdir()
+    clock = Clock(infos[0]["sample_rate"])
+    rate, segment_frames, total, boundary = clock.rate, clock.segment, clock.total, clock.boundary
     ranges = playback_ranges(infos, bool(args.next_source))
-    plans = intervals([part["frames"] for part in ranges], [part["origin"] for part in ranges])
+    plans = intervals([part["frames"] for part in ranges], [part["origin"] for part in ranges], rate)
     if args.audio_helper:
         from device_output import DevicePlayback
-        playback = DevicePlayback(output, args.audio_helper, args.audio_device, TOTAL, args.audio_gain)
+        playback = DevicePlayback(output, args.audio_helper, args.audio_device, total, args.audio_gain, rate=rate)
     else:
-        playback = live.Playback(output)
-    policy = live.Policy(infos[0]["bytes"] / (infos[0]["frames"] / RATE) * SEGMENT / RATE)
+        playback = live.Playback(output, total=total, start_buffer=3 * segment_frames, rate=rate)
+    policy = live.Policy(infos[0]["bytes"] / (infos[0]["frames"] / rate) * segment_frames / rate, segment_seconds=segment_frames / rate)
     player = threading.Thread(target=playback.play, daemon=True)
     segments, retries = [], []
     began = time.monotonic()
@@ -220,7 +261,7 @@ def run_case(name, account, songs, infos, sources, args, output):
         with endpoint(account, songs, infos, args.stratum, output, playback, plans,
                       name in ("mixed", "adaptive", "late-next")) as (url, records, sessions):
             for index, plan in enumerate(plans):
-                wait_until(playback, lambda: playback.buffered() < live.TARGET_BUFFER / RATE)
+                wait_until(playback, lambda: playback.buffered() < 4 * segment_frames / rate)
                 if plan["track"] == 1 and plan["source_start"] == 0:
                     if name in ("mixed", "adaptive"):
                         # Ensure preparation really begins on the impaired link;
@@ -230,22 +271,22 @@ def run_case(name, account, songs, infos, sources, args, output):
                     elif name == "late-next":
                         # Negative control: deliberately miss the handoff deadline.
                         wait_until(playback, lambda: playback.started is not None and
-                                   time.monotonic() - playback.started >= BOUNDARY / RATE + 0.5)
+                                   time.monotonic() - playback.started >= boundary / rate + 0.5)
                 if name == "adaptive":
-                    policy.lossless_bytes = infos[plan["track"]]["bytes"] / (infos[plan["track"]]["frames"] / RATE) * SEGMENT / RATE
+                    policy.lossless_bytes = infos[plan["track"]]["bytes"] / (infos[plan["track"]]["frames"] / rate) * segment_frames / rate
                     quality = policy.choose(playback.buffered()) if playback.started is not None else "lossless"
                 elif name == "reverse":
                     quality = "opus-64" if plan["track"] == 0 else "lossless"
                 else:
                     quality = "opus-64" if name in ("mixed", "late-next") and plan["track"] == 1 else "lossless"
                 try:
-                    segment = receive(url, index, plan, quality, policy, playback, name == "adaptive", output)
+                    segment = receive(url, index, plan, quality, policy, playback, name == "adaptive", output, rate)
                 except live.RetryLower:
                     retries.append({**plan, "from": quality, "at": time.monotonic()})
-                    segment = receive(url, index, plan, "opus-64", policy, playback, True, output)
+                    segment = receive(url, index, plan, "opus-64", policy, playback, True, output, rate)
                 segments.append(segment)
                 if len(segments) == 1 or plan["source_start"] == 0 or segments[-2]["quality"] != segment["quality"]:
-                    print(f"{name}: track {plan['track'] + 1}, timeline {plan['start'] / RATE:.3f}s → {segment['quality']}", flush=True)
+                    print(f"{name}: track {plan['track'] + 1}, timeline {plan['start'] / rate:.3f}s → {segment['quality']}", flush=True)
             nav.require(playback.done.wait(65), "consumer failed to finish")
             if playback.error:
                 raise playback.error
@@ -258,10 +299,10 @@ def run_case(name, account, songs, infos, sources, args, output):
         nav.require(not player.is_alive(), "consumer remained")
     nav.require(not any("error" in record for record in records), "segment request failed")
     first_next = next(segment for segment in segments if segment["track"] == 1)
-    boundary_time = playback.started + BOUNDARY / RATE
+    boundary_time = playback.started + boundary / rate
     delivery = {"tracks": [{"source": str(source), **part}
                             for source, part in zip(sources, ranges)],
-                "frames": TOTAL, "segments": segments, "underruns": playback.underruns}
+                "sample_rate": rate, "frames": total, "segments": segments, "underruns": playback.underruns}
     (output / "delivery.json").write_text(json.dumps(delivery, indent=2) + "\n")
     checks = json.loads(nav.run([str(args.checker), str(output / "delivery.json")]))
     nav.require(all(checks[key] for key in ("exact_frames", "lossless_exact", "rendered_matches", "zero_lag"))
@@ -276,9 +317,9 @@ def run_case(name, account, songs, infos, sources, args, output):
         nav.require(5 <= first_next["began"] - playback.started < 17, "next track not prepared during slow link")
     if args.audio_helper:
         nav.require(playback.device_report["timeline_discontinuities"] == 0, "device timeline changed")
-        live.validate_device_timing(playback.device_report, (TOTAL + playback.silence_frames) / RATE)
+        live.validate_device_timing(playback.device_report, (total + playback.silence_frames) / rate)
     else:
-        nav.require(abs(playback.elapsed - (TOTAL + playback.silence_frames) / RATE) < 0.1,
+        nav.require(abs(playback.elapsed - (total + playback.silence_frames) / rate) < 0.1,
                     "file consumer clock mismatch")
     for track, session in enumerate(sessions):
         metrics = session.summary()
@@ -287,7 +328,7 @@ def run_case(name, account, songs, infos, sources, args, output):
         nav.require(metrics["upstream_body_bytes"] == sum(record["acquisition"]["body_bytes_received"] for record in requests),
                     "source traffic counted twice")
         nav.require(metrics["peak_cached_bytes"] <= metrics["cache_limit_bytes"], "source cache limit exceeded")
-    result = {"scenario": name, "boundary_frame": BOUNDARY, "frames": TOTAL,
+    result = {"sample_rate": rate, "scenario": name, "boundary_frame": boundary, "frames": total,
               "startup_seconds": playback.started - began, "elapsed_seconds": playback.elapsed,
               "next_track_request_at_seconds": first_next["began"] - playback.started,
               "next_track_ready_margin_seconds": boundary_time - first_next["ready"],
@@ -297,26 +338,29 @@ def run_case(name, account, songs, infos, sources, args, output):
               "device": getattr(playback, "device_report", None)}
     (output / "report.json").write_text(json.dumps(result, indent=2) + "\n")
     # Preserve actual starvation in the optional listening file too.
-    nav.run(nav.FFMPEG + ["-f", "s32le", "-ar", str(RATE), "-ac", "2", "-i", str(output / "rendered.s32le"),
+    nav.run(nav.FFMPEG + ["-f", "s32le", "-ar", str(rate), "-ac", "2", "-i", str(output / "rendered.s32le"),
                          "-c:a", "pcm_s24le", str(output / "listening.wav")])
-    print(f"{name}: checks passed; {playback.silence_frames / RATE:.3f}s starvation; "
+    print(f"{name}: checks passed; {playback.silence_frames / rate:.3f}s starvation; "
           f"next track ready {result['next_track_ready_margin_seconds']:.3f}s before boundary", flush=True)
     return result
 
 
 def inspect_source(source, binary):
     info = json.loads(nav.run([str(binary), "inspect", "--source", str(source)]))
-    nav.require(info["sample_rate"] == RATE and info["channels"] == 2 and info["bits_per_sample"] in (16, 24),
-                "native 48 kHz stereo lossless input required")
-    nav.require(info["bytes"] <= 96 * 1024 * 1024 and info["frames"] <= 600 * RATE, "source outside proof bounds")
+    nav.require(info["sample_rate"] in (44100, 48000) and info["channels"] == 2 and info["bits_per_sample"] in (16, 24),
+                "native 44.1/48 kHz stereo lossless input required")
+    nav.require(info["bytes"] <= 96 * 1024 * 1024 and info["frames"] <= 600 * info["sample_rate"], "source outside proof bounds")
     return info
 
 
 def prepare_sources(source, origin, binary, output):
     info = inspect_source(source, binary)
-    nav.require(origin >= 0 and origin + TOTAL <= info["frames"], "excerpt outside source")
+    clock = Clock(info["sample_rate"])
+    if origin is None:
+        origin = 80 * clock.rate + 37
+    nav.require(origin >= 0 and origin + clock.total <= info["frames"], "excerpt outside source")
     sources, infos = [], []
-    for index, (offset, frames) in enumerate(((0, BOUNDARY), (BOUNDARY, TOTAL - BOUNDARY))):
+    for index, (offset, frames) in enumerate(((0, clock.boundary), (clock.boundary, clock.total - clock.boundary))):
         target = output / f"track-{index + 1}.flac"
         nav.run(nav.FFMPEG + ["-i", str(source), "-map", "0:a:0", "-vn", "-map_metadata", "-1", "-af",
             f"atrim=start_sample={origin + offset}:end_sample={origin + offset + frames},asetpts=PTS-STARTPTS",
@@ -326,7 +370,7 @@ def prepare_sources(source, origin, binary, output):
         nav.require(track["frames"] == frames, "fixture split changed duration")
         sources.append(target)
         infos.append(track)
-    reference = nav.decode(source)[origin * FRAME_BYTES:(origin + TOTAL) * FRAME_BYTES]
+    reference = nav.decode(source)[origin * FRAME_BYTES:(origin + clock.total) * FRAME_BYTES]
     nav.require(b"".join(nav.decode(path) for path in sources) == reference, "split changed source PCM")
     (output / "reference.s32le").write_bytes(reference)
     return sources, infos
@@ -357,7 +401,7 @@ def main():
         nav.require(infos[0]["sha256"] != infos[1]["sha256"], "actual handoff requires two different sources")
         playback_ranges(infos, True)
     else:
-        sources, infos = prepare_sources(args.source, args.origin if args.origin is not None else 80 * RATE + 37,
+        sources, infos = prepare_sources(args.source, args.origin,
                                         args.stratum, args.out)
     results = []
     for name in SCENARIOS if args.scenario == "all" else (args.scenario,):
