@@ -6,6 +6,30 @@ import live
 
 
 class Delivery(unittest.TestCase):
+    def test_device_clock_includes_drain_but_must_cover_content_and_track_wall_time(self):
+        # Actual first Bluetooth run: all 1,536,016 frames, 0.329 s total
+        # queue overhead. The old content-vs-clock equality rejected this.
+        report = {"timeline_discontinuities": 0, "queue_sample_time": 1549740,
+                  "elapsed_seconds": 32.3291}
+        live.validate_device_timing(report, 1536016 / 48000)
+        for changed in ({"queue_sample_time": 0}, {"queue_sample_time": 31.8 * 48000},
+                        {"queue_sample_time": 34 * 48000}, {"elapsed_seconds": 36},
+                        {"timeline_discontinuities": 1}):
+            with self.assertRaises(RuntimeError):
+                live.validate_device_timing({**report, **changed}, 1536016 / 48000)
+
+    def test_music_source_requires_native_format_and_complete_excerpt_context(self):
+        info = {"sample_rate": 48000, "channels": 2, "bits_per_sample": 24, "frames": 190 * 48000}
+        live.validate_source(info, 40_000_000, synthetic=False)
+        with self.assertRaisesRegex(RuntimeError, "synthetic"):
+            live.validate_source(info, 40_000_000, synthetic=True)
+        for changed in ({"sample_rate": 44100}, {"channels": 1}, {"bits_per_sample": 32}):
+            with self.assertRaisesRegex(RuntimeError, "native 48 kHz"):
+                live.validate_source({**info, **changed}, 40_000_000, synthetic=False)
+        for frames in (live.ORIGIN + live.TOTAL, 601 * live.RATE):
+            with self.assertRaisesRegex(RuntimeError, "excerpt"):
+                live.validate_source({**info, "frames": frames}, 40_000_000, synthetic=False)
+
     def test_partial_download_retries_exact_interval_before_deadline(self):
         policy = live.Policy(440000)
         self.assertFalse(policy.endangered(8192, 440000, 0.4, 6))

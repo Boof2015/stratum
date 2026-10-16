@@ -30,7 +30,9 @@ By default it runs three cases, taking about two minutes in total. Use
 one. All listeners bind loopback. Each case gets a separate temporary server,
 synthetic library and account, with the acquisition harness's 180-second server
 watchdog. Requests, subprocesses, playback and worker shutdown are bounded. No
-browser, Electron process, audio device or existing server is opened.
+browser, Electron process, audio device or existing server is opened by this
+default command. An optional [macOS device sink](device-output-proof.md) runs the
+same experiment through explicitly selected speakers or headphones.
 
 The current default is `--source-cache session`, reusing source byte blocks within
 the case. Use `--source-cache per-segment` for the original implementation measured

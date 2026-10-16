@@ -108,7 +108,7 @@ def stop_group(process):
 def disposable(navidrome_binary, fixture, state):
     music = state / "music"
     music.mkdir()
-    shutil.copy2(fixture, music / "Stratum fixture.flac")
+    shutil.copy2(fixture, music / ("Stratum fixture" + fixture.suffix.lower()))
     with socket.socket() as reservation:
         reservation.bind(("127.0.0.1", 0))
         port = reservation.getsockname()[1]
@@ -153,10 +153,10 @@ def disposable(navidrome_binary, fixture, state):
                 if songs:
                     break
                 if time.monotonic() > deadline:
-                    raise RuntimeError("Navidrome did not scan the synthetic track in 30 seconds")
+                    raise RuntimeError("Navidrome did not scan the test track in 30 seconds")
                 time.sleep(0.2)
             if len(songs) != 1:
-                raise RuntimeError("expected exactly one synthetic track")
+                raise RuntimeError("expected exactly one test track")
             yield nav, songs[0], Navidrome(base, username, "deliberately-wrong-password")
         finally:
             watchdog.cancel()

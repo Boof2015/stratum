@@ -98,8 +98,9 @@ listeners bind to loopback, and Navidrome is stopped after the test.
 
 The original demo assembles output **offline**. The separate live experiment below
 uses real HTTP transfers and wall-clock PCM consumption, writing its output to a
-file. Neither establishes hardware audio playback, behavior across arbitrary WAN
-conditions, inaudibility on all music, or gapless playback between different tracks.
+file. Its optional macOS output helper also exercises a selected audio device.
+These experiments do not establish behavior across arbitrary WAN conditions,
+inaudibility on all music, or gapless playback between different tracks.
 
 The `lossless` representation is re-encoded FLAC with the same decoded PCM for
 supported inputs. It is not unchanged source bytes. Original delivery, other
@@ -131,6 +132,14 @@ before using cached bytes. Add `--source-cache per-segment` to reproduce the ear
 independent-cache baseline. See [the source-session experiment](docs/source-session-proof.md)
 for traffic comparisons and cached-access rejection checks.
 
+### Listen through an audio device (macOS)
+
+The optional native helper uses an AudioQueue callback to consume the same live
+stream. Select an exact output from `--list`; the helper leaves the system's
+default output, volume and sample rate settings alone. The test uses its own
+reduced gain and stops after one excerpt. See [build and listening commands](docs/device-output-proof.md).
+Normal runs and automated unit tests still produce no sound.
+
 ## Checks
 
 ```sh
@@ -157,8 +166,8 @@ client. Discovery and Navidrome credentials do not belong in the audio engine.
    the local Rust engine; it is not a shipped Sidecar service.
 3. Extend the timing proof to 44.1/96 kHz and lossy originals before defining a
    production timeline/representation contract.
-4. Extend the real-time experiment to actual client audio output, harder network
-   conditions and seek/skip cancellation. Discovery, pairing, per-user authorization
+4. Extend the device experiment to Astra's pipeline, harder network conditions
+   and seek/skip cancellation. Discovery, pairing, per-user authorization
    and production cache eviction must be designed before deployment.
 
 The current cache is an unbounded experiment directory, not a server cache. No

@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""Bounded real-time delivery experiment; no speaker output or production service.
+"""Bounded real-time delivery experiment; file sink unless audio is explicitly selected.
 
 A disposable Navidrome feeds the Rust encoder on demand. A loopback segment
 endpoint meters delivery in real time. The client consumes PCM on a 48 kHz clock,
-recording silence on starvation instead of concealing missed deadlines.
+recording silence on starvation instead of concealing missed deadlines. An
+optional macOS helper lets an explicitly selected output device drive consumption.
 """
 import argparse
 import base64
@@ -342,11 +343,15 @@ def receive(url, start, quality, policy, playback, adaptive, output):
             "buffer_after_seconds": playback.buffered()}
 
 
-def scenario(name, navidrome, song, binary, output, source_cache="session"):
+def scenario(name, navidrome, song, binary, output, source_cache="session", audio=None, source_seconds=160):
     output.mkdir()
-    playback = Playback(output)
+    if audio is None:
+        playback = Playback(output)
+    else:
+        from device_output import DevicePlayback
+        playback = DevicePlayback(output, audio["helper"], audio["device"], TOTAL, audio["gain"])
     player = threading.Thread(target=playback.play, daemon=True)
-    policy = Policy(song["size"] / 160 * (SEGMENT / RATE))
+    policy = Policy(song["size"] / source_seconds * (SEGMENT / RATE))
     session = SourceSession(navidrome, song["id"]) if source_cache == "session" else None
     adaptive = name != "forced-lossless"
     started = time.monotonic()
@@ -398,6 +403,8 @@ def scenario(name, navidrome, song, binary, output, source_cache="session"):
                   "segments": segments, "retries": retries, "server_requests": server_records,
                   "acquired_after_playback_started": sum(r["began"] > 0 for r in server_records),
                   "received_after_playback_started": sum(s["ready"] > 0 for s in segments)}
+        if audio is not None:
+            result["device_output"] = playback.device_report
         (output / "delivery.json").write_text(json.dumps(result, indent=2) + "\n")
         print(f"{name}: {len(playback.underruns)} underruns, "
               f"{playback.silence_frames / RATE:.3f}s silence, {len(retries)} cancelled downloads; "
@@ -406,25 +413,64 @@ def scenario(name, navidrome, song, binary, output, source_cache="session"):
     finally:
         playback.cancel.set()
         playback.ready.set()
+        if audio is not None:
+            playback.stop()
         player.join(timeout=3)
         nav.require(not player.is_alive(), "consumer did not stop")
         if session is not None:
             session.close()
 
 
+def validate_source(info, size, synthetic):
+    nav.require(info["sample_rate"] == RATE and info["channels"] == 2 and info["bits_per_sample"] in (16, 24),
+                "live output requires native 48 kHz stereo 16/24-bit lossless audio")
+    nav.require(ORIGIN + TOTAL + nav.CONTEXT <= info["frames"] <= 600 * RATE and size <= nav.MAX_BYTES,
+                "source must cover the 1:20–1:52 excerpt plus context, and fit within 10 minutes / 96 MiB")
+    if synthetic:
+        nav.require(info["frames"] == 160 * RATE + 317 and info["bits_per_sample"] == 24,
+                    "use the synthetic Navidrome fixture, or --source for music")
+
+
+def validate_device_timing(device, duration):
+    nav.require(device["timeline_discontinuities"] == 0, "device timeline changed during playback")
+    # AudioQueue time is time since queue start, not a count of content frames.
+    # Stop(false) drains the device before IsRunning becomes false, so the final
+    # clock can extend beyond the content, particularly with Bluetooth output.
+    # Check it against the same run's wall clock and separately require it to
+    # cover the content. Exact submitted frames are checked by live_check.
+    clock = device["queue_sample_time"] / RATE
+    elapsed = device["elapsed_seconds"]
+    nav.require(duration - 0.06 <= elapsed <= duration + 3, "device drain duration out of bounds")
+    nav.require(clock >= duration - 0.06 and abs(clock - elapsed) < 0.25,
+                "device queue clock did not cover output or disagreed with elapsed time")
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("navidrome", "stratum", "checker", "fixture", "out"):
+    for name in ("navidrome", "stratum", "checker", "out"):
         parser.add_argument("--" + name, required=True, type=Path)
+    source_args = parser.add_mutually_exclusive_group(required=True)
+    source_args.add_argument("--fixture", type=Path, help="Original deterministic synthetic fixture")
+    source_args.add_argument("--source", type=Path, help="Local 48 kHz stereo FLAC/WAV music for listening")
     parser.add_argument("--scenario", choices=("all", "steady", "adaptive", "forced-lossless"), default="all")
     parser.add_argument("--source-cache", choices=("session", "per-segment"), default="session",
                         help="Reuse source reads across segments, or reproduce the original baseline")
+    parser.add_argument("--audio-helper", type=Path, help="Built macOS AudioQueue helper (explicit opt-in)")
+    parser.add_argument("--audio-device", help="Exact output UID from the helper's --list")
+    parser.add_argument("--audio-gain", type=float, default=0.25, help="Test-only gain, 0..1; default -12 dB")
     args = parser.parse_args()
-    for name in ("navidrome", "stratum", "checker", "fixture"):
+    nav.require(bool(args.audio_helper) == bool(args.audio_device), "provide both audio helper and output UID")
+    nav.require(0 <= args.audio_gain <= 1, "audio gain must be between zero and one")
+    audio = None
+    if args.audio_helper:
+        nav.require(args.scenario != "all", "choose one scenario for an audible test")
+        audio = {"helper": args.audio_helper.resolve(strict=True), "device": args.audio_device, "gain": args.audio_gain}
+    for name in ("navidrome", "stratum", "checker"):
         setattr(args, name, getattr(args, name).resolve(strict=True))
-    info = json.loads(nav.run([str(args.stratum), "inspect", "--source", str(args.fixture)]))
-    nav.require(info["frames"] == 160 * RATE + 317 and info["channels"] == 2 and info["bits_per_sample"] == 24,
-                "use the synthetic Navidrome fixture")
+    source = (args.source or args.fixture).resolve(strict=True)
+    info = json.loads(nav.run([str(args.stratum), "inspect", "--source", str(source)]))
+    validate_source(info, source.stat().st_size, synthetic=args.fixture is not None)
+    source_seconds = info["frames"] / RATE if args.source else 160
     args.out.mkdir(parents=True, exist_ok=False)
     args.out = args.out.resolve()
     names = ("steady", "adaptive", "forced-lossless") if args.scenario == "all" else (args.scenario,)
@@ -432,21 +478,24 @@ def main():
     for name in names:
         # A separate disposable server for each bounded run; no persistent account.
         with tempfile.TemporaryDirectory(prefix="stratum-live-nav-") as state:
-            with nav.disposable(args.navidrome, args.fixture, Path(state)) as (server, song, _):
-                reports.append(scenario(name, server, song, args.stratum, args.out / name, args.source_cache))
+            with nav.disposable(args.navidrome, source, Path(state)) as (server, song, _):
+                reports.append(scenario(name, server, song, args.stratum, args.out / name,
+                                        args.source_cache, audio, source_seconds))
         report = reports[-1]
         report["server_stopped"] = True
         # Full local source decode is an after-the-run oracle, never client input.
-        checks = json.loads(nav.run([str(args.checker), str(args.fixture), str(args.out / name / "delivery.json")]))
+        checks = json.loads(nav.run([str(args.checker), str(source), str(args.out / name / "delivery.json")]))
         report["audio_checks"] = checks
         raw = args.out / name / "rendered.s32le"
         nav.run(nav.FFMPEG + ["-f", "s32le", "-ar", str(RATE), "-ac", "2", "-i", str(raw),
                              "-c:a", "pcm_s24le", str(args.out / name / "listening.wav")])
     result = {"experiment": "stratum-live-delivery-poc-1", "scenarios": reports,
+              "source_kind": "music" if args.source else "synthetic", "source_info": info,
               "profile": {"fast_bits_per_second": 10000000, "slow_bits_per_second": 192000,
                           "slow_from_playback_seconds": 5, "recovery_seconds": 17,
                           "response_delay_ms": 60},
-              "scope": "Real HTTP and wall-clock PCM consumption, file sink; no audio device or Astra integration."}
+              "scope": ("Real HTTP and native AudioQueue output; pre-gain PCM capture, not an acoustic recording or bit-perfect/Bluetooth-fidelity test."
+                        if audio else "Real HTTP and wall-clock PCM consumption, file sink; no audio device or Astra integration.")}
     (args.out / "report.json").write_text(json.dumps(result, indent=2) + "\n")
     for report in reports:
         checks = report["audio_checks"]
@@ -458,8 +507,11 @@ def main():
             nav.require(report["silence_frames"] > 0, "negative control did not produce a stall")
         else:
             nav.require(report["silence_frames"] == 0, "playback starved")
-        nav.require(checks["rendered_matches"] and abs(report["elapsed_seconds"] -
-                    (TOTAL + report["silence_frames"]) / RATE) < 0.1, "consumer output/clock mismatch")
+        duration = (TOTAL + report["silence_frames"]) / RATE
+        nav.require(checks["rendered_matches"] and abs(report["elapsed_seconds"] - duration) < (3 if audio else 0.1),
+                    "consumer output/clock mismatch")
+        if audio:
+            validate_device_timing(report["device_output"], duration)
         nav.require(not any("error" in r for r in report["server_requests"]), "server request failed")
         if report["scenario"] == "adaptive":
             nav.require(report["retries"] and any(s["quality"] == "opus-64" for s in report["segments"])
