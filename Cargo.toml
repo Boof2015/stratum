@@ -1,0 +1,15 @@
+[package]
+name = "stratum-poc"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.88"
+publish = false
+description = "An experimental sample-addressed adaptive audio engine"
+
+[dependencies]
+anyhow = "1.0"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.10"
+tempfile = "3"
+
