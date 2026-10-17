@@ -3,8 +3,10 @@
 This is the first Rust HTTP service boundary for Sidecar. It checks credentials
 and track access against Navidrome and enforces those checks before returning
 cached data. **It is a loopback-only experiment, not a deployable streaming server.**
-The protected endpoint returns only the first 64 original-file bytes. It does not
-encode segments, play audio, discover servers, pair devices or integrate with Astra.
+This document describes checkpoint A's protected prefix endpoint, which returns
+only the first 64 original-file bytes. The service now additionally implements
+[checkpoint B's authenticated encoded segments](authenticated-audio-proof.md).
+Neither checkpoint discovers servers, pairs devices or integrates with Astra.
 
 ## Run the isolated proof
 
@@ -108,8 +110,9 @@ and [library access documentation](https://www.navidrome.org/docs/usage/features
 | Private cached media | 16 prefixes × 64 bytes per session; clear at capacity |
 | Service runtime | Default 900 seconds, maximum 3600, followed by bounded shutdown |
 
-There is no encoder, subprocess work queue or on-disk media cache in the service.
-The small prefix cache tests authorization only: it has **no strong source revision
+The prefix route itself uses no encoder, subprocess work queue or on-disk media
+cache. Checkpoint B's separate audio routes add bounded workers and private staged
+sources. The small prefix cache still tests authorization only: it has **no strong source revision
 validation** and must not be promoted into a playback cache. Cross-session or
 cross-user cache sharing is not implemented. Dropping credentials from memory is
 not a guarantee of zeroization. A disconnected login may leave an unseen session
@@ -141,6 +144,7 @@ expiry during work, session/cache/request limits, and stalled HTTP headers. Thos
 controlled cases supplement the real Navidrome proof; they are not all real-server
 fault injections. Existing audio proofs remain separate and silent.
 
-Source consistency, real encoded segments, original-file mutation, efficient
-progressive acquisition, production credentials/TLS/discovery and Astra playback
-remain the next checkpoints. This service cannot be enabled in Astra yet.
+The next checkpoint now evaluates source consistency, real encoded segments and
+original-file mutation; see [authenticated audio delivery](authenticated-audio-proof.md).
+Efficient progressive acquisition, production credentials/TLS/discovery and Astra
+playback remain open. This service cannot be enabled in Astra yet.

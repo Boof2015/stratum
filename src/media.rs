@@ -44,7 +44,7 @@ impl Quality {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SourceInfo {
     pub sha256: String,
     pub codec: String,

@@ -4,6 +4,10 @@ use tokio_util::sync::CancellationToken;
 
 #[tokio::main(worker_threads = 2)]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--audio-worker") {
+        stratum_poc::access::audio::worker_main();
+        return;
+    }
     if run().await.is_err() {
         // Never print deserialization/network errors containing supplied secrets.
         eprintln!("Sidecar access checkpoint failed; check the local configuration and port.");

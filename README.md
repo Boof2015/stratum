@@ -198,10 +198,13 @@ recovery and resource retirement over several minutes.
 
 `sidecar-access` adds a bounded, loopback-only Rust service that validates
 Navidrome credentials and rechecks track access before serving private cached
-test data. Its media route returns only a 64-byte original-file prefix; it cannot
-stream music or connect to Astra yet. The disposable two-user proof covers library
-restrictions, revocation, logout, expiry, password changes and upstream outages.
-See [commands, results and limits](docs/access-proof.md).
+test data. The initial media route returns a 64-byte original-file prefix. The
+[authenticated audio checkpoint](docs/authenticated-audio-proof.md) now also serves
+real FLAC/Opus segments from a bounded private source copy, through the same access
+checks. The disposable two-user proof covers library restrictions, revocation,
+logout, expiry, password changes and upstream outages. It is not connected to
+Astra yet. See [the initial access proof](docs/access-proof.md) and the audio
+checkpoint's source-staging trade-offs before treating this as a deployment design.
 
 ## Checks
 
@@ -214,7 +217,8 @@ python3 -B -m unittest discover -s experiments -p 'test_*.py'
 
 Integration tests run actual FFmpeg encodes and decodes, including a synthetic
 154-second source. They fail if FFmpeg is missing. Each subprocess has a timeout,
-direct arguments and output bounds; no shell, GUI or playback process is launched.
+direct arguments and output bounds. Worker-cleanup tests also use bounded shell
+shims to hold subprocesses deliberately. No GUI or audible playback is launched.
 
 `src/timeline.rs` owns interval arithmetic; `src/media.rs` owns source validation,
 encoding and cache metadata; `src/proof.rs` is the disposable fixture/reference
@@ -223,10 +227,10 @@ client. Discovery and Navidrome credentials do not belong in the audio engine.
 ## Next experiments
 
 1. Listen to music at the joins and investigate any audible switching artifacts.
-2. Build on the disposable Navidrome acquisition result: a production source adapter
-   still needs user-scoped authorization, source revision handling and integration
-   with the engine. The Python experiment currently feeds acquired intervals into
-   the local Rust engine; it is not a shipped Sidecar service.
+2. Build on authenticated Rust delivery: evaluate progressive source identity
+   against the measured full-copy baseline, establish protected transport/trust,
+   and connect Astra Standard playback. The loopback service remains a proof,
+   not a shipped Sidecar deployment.
 3. Extend the timing proof beyond 44.1/48/96 kHz and to lossy originals before defining a
    production timeline/representation contract.
 4. Extend the device, seek/skip and natural-handoff experiments to Astra's pipeline,

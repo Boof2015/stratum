@@ -278,6 +278,8 @@ async fn expiry_cancels_fetch_before_it_can_finish() {
                 expires: Instant::now() + Duration::from_millis(200),
                 cancelled: CancellationToken::new(),
                 prefixes: Mutex::new(HashMap::new()),
+                playbacks: Mutex::new(HashMap::new()),
+                playback_slots: Arc::new(Semaphore::new(2)),
             }),
         );
     }
@@ -570,6 +572,8 @@ async fn expiry_cleans_private_bytes_and_rate_limit_recovers() {
         expires: Instant::now() + Duration::from_secs(1),
         cancelled: CancellationToken::new(),
         prefixes: Mutex::new(HashMap::from([("x".into(), Bytes::from_static(b"data"))])),
+        playbacks: Mutex::new(HashMap::new()),
+        playback_slots: Arc::new(Semaphore::new(2)),
     });
     service
         .0

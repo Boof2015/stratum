@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Real disposable Navidrome + Rust access service. Silent; synthetic files only.
 
-The service delivers 64-byte original prefixes, not encoded/playable segments.
+By default this checks 64-byte prefixes; --audio adds real FLAC/Opus delivery.
 Never reads Astra credentials or accepts an existing server URL.
 """
 import argparse
@@ -81,13 +81,15 @@ def wait_ready(base, path, process):
     raise RuntimeError("test server startup timed out")
 
 
-def fixture(path, frequency):
+def fixture(path, frequency, seconds=1):
     with wave.open(str(path), "wb") as output:
         output.setnchannels(2)
         output.setsampwidth(2)
         output.setframerate(48000)
-        output.writeframes(b"".join(struct.pack("<hh", sample, sample) for sample in
-                                  (int(3000 * math.sin(2 * math.pi * frequency * n / 48000)) for n in range(48000))))
+        for second in range(seconds):
+            output.writeframesraw(b"".join(struct.pack("<hh", sample, sample) for sample in
+                                          (int(3000 * math.sin(2 * math.pi * frequency * n / 48000))
+                                           for n in range(second * 48000, (second + 1) * 48000))))
 
 
 def main(args):
@@ -107,8 +109,8 @@ def main(args):
         state = Path(temporary)
         a_dir, b_dir = state / "library-a", state / "library-b"
         a_dir.mkdir(); b_dir.mkdir()
-        fixture(a_dir / "alpha.wav", 220)
-        fixture(b_dir / "beta.wav", 330)
+        fixture(a_dir / "alpha.wav", 220, 60 if args.audio else 1)
+        fixture(b_dir / "beta.wav", 330, 60 if args.audio else 1)
         expected_a = (a_dir / "alpha.wav").read_bytes()[:64]
         expected_b = (b_dir / "beta.wav").read_bytes()[:64]
         nav_port = port()
@@ -183,6 +185,11 @@ def main(args):
                 wrong = {**credentials["alice"], "token": "0" * 32}
                 check("wrong credentials denied", request(side, "/access/v1/sessions", "POST", wrong)[0] == 401)
                 a, b = login(side, "alice"), login(side, "bob")
+                audio = None
+                if args.audio:
+                    from authenticated_audio import AudioProbe
+                    audio = AudioProbe(side, {"alice": a, "bob": b}, {"alice": song_a, "bob": song_b},
+                                       {"alice": a_dir / "alpha.wav", "bob": b_dir / "beta.wav"}, out, check)
                 check("Alice receives exact original prefix", media(side, a, song_a)[2] == expected_a)
                 warm = media(side, a, song_a)
                 check("Alice warm cache served after revalidation", warm[0] == 200 and warm[1].get("x-stratum-cache-hit") == "1" and warm[2] == expected_a)
@@ -194,8 +201,10 @@ def main(args):
                 before = time.monotonic()
                 check("library revocation blocks Alice warm cache", media(side, a, song_a)[0] == 404)
                 revoked_latency = time.monotonic() - before
+                if audio: audio.denied("alice", 404, "library revocation")
                 native(f"/user/{users['alice']['id']}/library", "PUT", {"libraryIds": [1]})
                 check("restored permission can acquire again", media(side, a, song_a)[0] == 200)
+                if audio: audio.reopen("alice", a)
 
                 other, other_process = start_sidecar(stack, "other-sidecar")
                 check("bearer cannot cross Sidecar instances", media(other, a, song_a)[0] == 401)
@@ -206,10 +215,13 @@ def main(args):
                 check("expired warm session denied", media(expired, exp, song_a)[0] == 401)
                 check("logout succeeds", request(side, "/access/v1/session", "DELETE", headers={"Authorization": "Bearer " + a})[0] == 204)
                 check("logged out bearer denied", media(side, a, song_a)[0] == 401)
+                if audio: audio.denied("alice", 401, "logout")
                 a = login(side, "alice")
+                if audio: audio.reopen("alice", a)
                 replacement = secrets.token_urlsafe(24)
                 secrets_used.append(replacement)
                 native("/user/" + users["alice"]["id"], "PUT", {"userName": "alice", "name": "alice", "isAdmin": False, "password": replacement})
+                if audio: audio.denied("alice", 401, "changed password")
                 check("password change invalidates existing upstream credential", media(side, a, song_a)[0] == 401)
                 new_salt = secrets.token_hex(16)
                 new_token = hashlib.md5((replacement + new_salt).encode()).hexdigest()
@@ -224,7 +236,9 @@ def main(args):
                       hashlib.md5((replacement + fresh_payload["subsonicSalt"]).encode()).hexdigest() == fresh_payload["subsonicToken"])
                 fresh_a = login(side, "alice")
                 check("changed password can establish a fresh session", media(side, fresh_a, song_a)[0] == 200)
+                if audio: audio.reopen("alice", fresh_a)
                 native("/user/" + users["alice"]["id"], "DELETE")
+                if audio: audio.denied("alice", 401, "deleted account")
                 check("account deletion blocks its warm session", media(side, fresh_a, song_a)[0] == 401)
                 credentials["alice"] = old_credentials
                 check("deleted account cannot create session", request(side, "/access/v1/sessions", "POST", credentials["alice"])[0] == 401)
@@ -234,6 +248,9 @@ def main(args):
                 stop_group(nav_process)
                 unavailable = media(side, b, song_b)
                 check("upstream outage blocks warm cache without blaming password", unavailable[0] == 503 and json.loads(unavailable[2])["error"] == "upstream_unavailable")
+                if audio:
+                    audio.denied("bob", 503, "upstream outage")
+                    audio.finish()
                 stop_group(side_process)
                 restarted, restarted_process = start_sidecar(stack, "restarted-sidecar")
                 check("restart rejects old session before upstream contact", media(restarted, b, song_b)[0] == 401)
@@ -252,7 +269,7 @@ def main(args):
 
     report = {"checks": checks, "passed": len(checks), "seconds": time.monotonic() - started,
               "revocation_request_seconds": revoked_latency, "playback": False,
-              "probe_bytes": 64, "all_children_stopped": True,
+              "probe_bytes": 64, "encoded_audio": args.audio, "all_children_stopped": True,
               "limits": "No TLS/discovery/encoding/source-revision claim. Two disposable ordinary users."}
     (out / "report.json").write_text(json.dumps(report, indent=2) + "\n")
     print(json.dumps({"passed": len(checks), "seconds": report["seconds"], "all_children_stopped": True}))
@@ -263,4 +280,5 @@ if __name__ == "__main__":
     parser.add_argument("--navidrome", type=Path, required=True)
     parser.add_argument("--sidecar", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--audio", action="store_true", help="Also test real encoded delivery from generated 60-second WAVs")
     main(parser.parse_args())

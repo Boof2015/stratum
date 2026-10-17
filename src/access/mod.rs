@@ -1,5 +1,6 @@
-//! Loopback access checkpoint. The 64-byte probe is NOT a playback endpoint.
-//! No audio engine, user password store, discovery or production pairing here.
+//! Loopback experimental access and authenticated-audio service.
+//! The original 64-byte probe remains separate from the encoded audio routes.
+pub mod audio;
 mod transport;
 
 use axum::{
@@ -88,6 +89,8 @@ struct Session {
     cancelled: CancellationToken,
     // Private to this session. No source revision or cross-session cache claim.
     prefixes: Mutex<HashMap<String, Bytes>>,
+    playbacks: Mutex<HashMap<String, Arc<audio::Playback>>>,
+    playback_slots: Arc<Semaphore>,
 }
 impl Session {
     fn active(&self) -> bool {
@@ -96,6 +99,9 @@ impl Session {
     fn revoke(&self) {
         self.cancelled.cancel();
         self.prefixes.lock().unwrap().clear();
+        for playback in self.playbacks.lock().unwrap().drain().map(|(_, p)| p) {
+            playback.cancelled.cancel();
+        }
     }
 }
 
@@ -109,6 +115,7 @@ struct Inner {
     attempts: Mutex<VecDeque<Instant>>,
     requests: Arc<Semaphore>,
     stopped: CancellationToken,
+    audio: audio::Store,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -121,6 +128,10 @@ enum Failure {
     Busy,
     UnsafeUpstream,
     Internal,
+    Unsupported,
+    TooLarge,
+    Playback,
+    Encoding,
 }
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
@@ -136,6 +147,10 @@ impl IntoResponse for Failure {
                 "upstream_does_not_validate_credentials",
             ),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+            Self::Unsupported => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_source"),
+            Self::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "source_limit_exceeded"),
+            Self::Playback => (StatusCode::NOT_FOUND, "playback_unavailable"),
+            Self::Encoding => (StatusCode::UNPROCESSABLE_ENTITY, "audio_preparation_failed"),
         };
         (status, Json(json!({"error": code}))).into_response()
     }
@@ -202,23 +217,31 @@ impl Service {
             attempts: Mutex::new(VecDeque::new()),
             requests: Arc::new(Semaphore::new(8)),
             stopped: CancellationToken::new(),
+            audio: audio::Store::new()?,
         })))
     }
 
     pub fn router(&self) -> Router {
-        Router::new()
-            .route(
-                "/access/v1/capabilities",
-                get(|| async {
-                    Json(json!({
-                        "protocol": "stratum-access-proof-1", "playback": false,
-                        "authentication": "subsonic-token", "probeBytes": PREFIX_BYTES
-                    }))
-                }),
+        audio::routes()
+            .merge(
+                Router::new()
+                    .route(
+                        "/access/v1/capabilities",
+                        get(|| async {
+                            Json(json!({
+                                "protocol": "stratum-access-proof-1", "playback": false,
+                                "authentication": "subsonic-token", "probeBytes": PREFIX_BYTES,
+                                "audioExperiment": "stratum-authenticated-audio-1",
+                                "audioSource": "complete-private-copy",
+                                "maxSourceBytes": audio::MAX_SOURCE_BYTES,
+                                "maxSegmentSeconds": audio::MAX_SEGMENT_SECONDS
+                            }))
+                        }),
+                    )
+                    .route("/access/v1/sessions", post(create_session))
+                    .route("/access/v1/session", delete(delete_session))
+                    .route("/access/v1/media/{track}", get(media)),
             )
-            .route("/access/v1/sessions", post(create_session))
-            .route("/access/v1/session", delete(delete_session))
-            .route("/access/v1/media/{track}", get(media))
             .fallback(|| async { Failure::Input })
             .layer(middleware::from_fn_with_state(self.clone(), guard))
             .with_state(self.clone())
@@ -513,6 +536,8 @@ async fn create_session(
         expires: Instant::now() + service.0.ttl,
         cancelled: CancellationToken::new(),
         prefixes: Mutex::new(HashMap::new()),
+        playbacks: Mutex::new(HashMap::new()),
+        playback_slots: Arc::new(Semaphore::new(2)),
     });
     {
         let mut sessions = service.0.sessions.lock().unwrap();
@@ -658,6 +683,7 @@ pub async fn serve(
     service.clear();
     shutdown.cancel();
     let _ = reaper.await;
+    service.0.audio.drain().await;
     result
 }
 
