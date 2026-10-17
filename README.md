@@ -61,8 +61,9 @@ The source must be long enough. JSON on stdout describes the encoded file, its
 presentation interval and the trimming required after decoding. Qualities are
 `lossless`, `opus-64` and `opus-128`. One frame is one sample per channel.
 
-The CLI is an experimental adapter to the engine. There is no HTTP listener,
-discovery endpoint or finalized wire protocol. See [the interval contract](docs/audio-proof.md).
+The audio CLI is an experimental adapter to the engine. It has no HTTP listener,
+discovery endpoint or finalized wire protocol. A separate, loopback-only access
+service is described below. See [the interval contract](docs/audio-proof.md).
 
 ## Disposable Navidrome proof
 
@@ -192,6 +193,15 @@ and late converter output while seeking and skipping between native rates.
 The [sustained silent session](docs/session-proof.md) combines multi-track
 playback, repeated quality changes, seeks/skips and an outage while checking
 recovery and resource retirement over several minutes.
+
+## Authenticated Sidecar access checkpoint
+
+`sidecar-access` adds a bounded, loopback-only Rust service that validates
+Navidrome credentials and rechecks track access before serving private cached
+test data. Its media route returns only a 64-byte original-file prefix; it cannot
+stream music or connect to Astra yet. The disposable two-user proof covers library
+restrictions, revocation, logout, expiry, password changes and upstream outages.
+See [commands, results and limits](docs/access-proof.md).
 
 ## Checks
 
