@@ -134,7 +134,7 @@ async fn original(
     let mut response = service
         .upstream(
             "stream",
-            &session.credential,
+            &session.credential(),
             &[
                 ("id", playback.track.clone()),
                 ("format", "raw".into()),
@@ -293,7 +293,7 @@ async fn open(
     let result = tokio::select! {
         biased;
         _ = session.cancelled.cancelled() => Err(Failure::Session),
-        _ = tokio::time::sleep_until(session.expires) => Err(Failure::Session),
+        _ = session.expired() => Err(Failure::Session),
         result = work => result,
     };
     if matches!(result, Err(Failure::Session)) {
@@ -404,7 +404,7 @@ async fn segment(
     let result = tokio::select! {
         biased;
         _ = session.cancelled.cancelled() => Err(Failure::Session),
-        _ = tokio::time::sleep_until(session.expires) => Err(Failure::Session),
+        _ = session.expired() => Err(Failure::Session),
         _ = playback.cancelled.cancelled() => Err(Failure::Playback),
         result = work => result,
     };
@@ -550,18 +550,14 @@ mod tests {
     async fn body_delivery_checks_logout_and_playback_close_between_chunks() {
         use futures_util::StreamExt;
         for logout in [false, true] {
-            let session = Arc::new(Session {
-                credential: Credential {
+            let session = Arc::new(Session::new(
+                Credential {
                     username: "test".into(),
                     token: "a".repeat(32),
                     salt: "test".into(),
                 },
-                expires: Instant::now() + Duration::from_secs(10),
-                cancelled: CancellationToken::new(),
-                prefixes: Mutex::new(HashMap::new()),
-                playbacks: Mutex::new(HashMap::new()),
-                playback_slots: Arc::new(Semaphore::new(2)),
-            });
+                Instant::now() + Duration::from_secs(10),
+            ));
             let cancelled = session.cancelled.child_token();
             let mut body = final_body(session.clone(), cancelled.clone(), vec![1; 32768].into())
                 .into_data_stream();

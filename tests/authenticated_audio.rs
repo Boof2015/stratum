@@ -662,3 +662,53 @@ async fn staging_measurement_includes_slow_chunked_source_acquisition() {
     test.decoded(&token, handle, 48000, 48000, "opus-64").await;
     assert_eq!(test.state.full_reads.load(Ordering::SeqCst), 1);
 }
+
+#[tokio::test]
+async fn renewal_retains_current_and_next_audio_handles_without_refetching_sources() {
+    let h = Harness::configured(48000, 2).await;
+    let token = h.login("alice").await;
+    let current = h.handle(&token).await;
+    let next = h.handle(&token).await;
+    let first = h
+        .decoded(
+            &token,
+            current["playback"].as_str().unwrap(),
+            0,
+            48000,
+            "lossless",
+        )
+        .await;
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    let response = h
+        .http
+        .post(format!("{}/access/v1/session", h.base))
+        .bearer_auth(&token)
+        .json(&json!({"username":"alice","token":"a".repeat(32),"salt":"fresh"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.json::<Value>().await.unwrap()["session"], token);
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    let repeated = h
+        .decoded(
+            &token,
+            current["playback"].as_str().unwrap(),
+            0,
+            48000,
+            "lossless",
+        )
+        .await;
+    assert_eq!(first.1, repeated.1);
+    let following = h
+        .decoded(
+            &token,
+            next["playback"].as_str().unwrap(),
+            48000,
+            48000,
+            "opus-64",
+        )
+        .await;
+    assert_eq!(following.0["presentation"]["start"], 48000);
+    assert_eq!(h.state.full_reads.load(Ordering::SeqCst), 2);
+}

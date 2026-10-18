@@ -55,6 +55,7 @@ changing backend requires restarting and invalidates every old bearer.
 | --- | --- |
 | `GET /access/v1/capabilities` | Public protocol marker, explicitly `playback: false` |
 | `POST /access/v1/sessions` | Accept `{username, token, salt}` as bounded JSON; validate with Navidrome |
+| `POST /access/v1/session` | Revalidate fresh same-user credentials; retain bearer and playback handles ([renewal](session-renewal-proof.md)) |
 | `DELETE /access/v1/session` | Revoke the bearer session and cancel its work |
 | `GET /access/v1/media/{track}` | Return a protected 64-byte prefix; test endpoint only |
 

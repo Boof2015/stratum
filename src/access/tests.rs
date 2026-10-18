@@ -13,6 +13,8 @@ struct Mock {
     songs: AtomicUsize,
     mode: AtomicUsize,
     hold: AtomicUsize,
+    hold_login: AtomicUsize,
+    login_error: AtomicUsize,
     reached: Notify,
     release: Notify,
     redirect: Mutex<String>,
@@ -57,6 +59,13 @@ async fn fake(State(state): State<Arc<Mock>>, request: Request) -> Response {
         return refused(40);
     }
     if path.ends_with("/ping.view") {
+        if state.hold_login.load(Ordering::SeqCst) != 0 {
+            state.reached.notify_one();
+            state.release.notified().await;
+        }
+        if state.login_error.load(Ordering::SeqCst) != 0 {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        }
         return ok(json!({"status":"ok"}));
     }
     if path.ends_with("/getSong.view") {
@@ -273,14 +282,10 @@ async fn expiry_cancels_fetch_before_it_can_finish() {
         let old = sessions.remove(&token).unwrap();
         sessions.insert(
             token.clone(),
-            Arc::new(Session {
-                credential: old.credential.clone(),
-                expires: Instant::now() + Duration::from_millis(200),
-                cancelled: CancellationToken::new(),
-                prefixes: Mutex::new(HashMap::new()),
-                playbacks: Mutex::new(HashMap::new()),
-                playback_slots: Arc::new(Semaphore::new(2)),
-            }),
+            Arc::new(Session::new(
+                old.credential(),
+                Instant::now() + Duration::from_millis(200),
+            )),
         );
     }
     test.mock.hold.store(1, Ordering::SeqCst);
@@ -563,18 +568,19 @@ async fn final_check_catches_permission_loss_during_fetch() {
 #[tokio::test(start_paused = true)]
 async fn expiry_cleans_private_bytes_and_rate_limit_recovers() {
     let service = Service::new(&config("http://127.0.0.1:9".into())).unwrap();
-    let session = Arc::new(Session {
-        credential: Credential {
+    let session = Arc::new(Session::new(
+        Credential {
             username: "a".into(),
             token: "a".repeat(32),
             salt: "s".into(),
         },
-        expires: Instant::now() + Duration::from_secs(1),
-        cancelled: CancellationToken::new(),
-        prefixes: Mutex::new(HashMap::from([("x".into(), Bytes::from_static(b"data"))])),
-        playbacks: Mutex::new(HashMap::new()),
-        playback_slots: Arc::new(Semaphore::new(2)),
-    });
+        Instant::now() + Duration::from_secs(1),
+    ));
+    session
+        .prefixes
+        .lock()
+        .unwrap()
+        .insert("x".into(), Bytes::from_static(b"data"));
     service
         .0
         .sessions
@@ -705,4 +711,166 @@ async fn bounded_listener_closes_slow_headers_and_releases_sockets() {
         .await
         .unwrap()
         .unwrap();
+}
+
+async fn renew(service: &Service, token: &str, username: &str, valid: bool) -> Response {
+    call(service, "POST", "/access/v1/session", Some(token), json!({
+        "username": username, "token": if valid { "a".repeat(32) } else { "b".repeat(32) }, "salt":"fresh-salt"
+    })).await
+}
+
+#[tokio::test]
+async fn renewal_preserves_private_session_and_updates_credentials() {
+    let test = setup().await;
+    let token = login(&test.service, "alice").await;
+    let session = test.service.0.sessions.lock().unwrap()[&token].clone();
+    session
+        .prefixes
+        .lock()
+        .unwrap()
+        .insert("retained".into(), Bytes::from_static(b"private"));
+    let old_expiry = session.auth.lock().unwrap().expires;
+    let response = renew(&test.service, &token, "alice", true).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value: Value = serde_json::from_slice(&bytes(response).await).unwrap();
+    assert_eq!(value["session"], token);
+    assert_eq!(value["expiresInSeconds"], 600);
+    assert!(Arc::ptr_eq(
+        &session,
+        &test.service.0.sessions.lock().unwrap()[&token]
+    ));
+    assert!(session.auth.lock().unwrap().expires > old_expiry);
+    assert_eq!(session.credential().salt, "fresh-salt");
+    assert_eq!(session.prefixes.lock().unwrap()["retained"], b"private"[..]);
+    assert_eq!(test.service.0.sessions.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn renewal_cannot_change_account_or_use_bearer_alone_and_refusal_revokes() {
+    let test = setup().await;
+    let token = login(&test.service, "alice").await;
+    assert_eq!(
+        renew(&test.service, &token, "bob", true).await.status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        call(
+            &test.service,
+            "POST",
+            "/access/v1/session",
+            Some(&token),
+            Value::Null
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(test.service.0.sessions.lock().unwrap().len(), 1);
+    assert_eq!(
+        renew(&test.service, &token, "alice", false).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+    assert!(test.service.0.sessions.lock().unwrap().is_empty());
+    assert_eq!(
+        renew(&test.service, &token, "alice", true).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn renewed_deadline_keeps_an_inflight_fetch_alive_past_old_expiry() {
+    let test = setup().await;
+    let token = login(&test.service, "alice").await;
+    let session = test.service.0.sessions.lock().unwrap()[&token].clone();
+    session.auth.lock().unwrap().expires = Instant::now() + Duration::from_millis(200);
+    test.mock.hold.store(1, Ordering::SeqCst);
+    let service = test.service.clone();
+    let bearer = token.clone();
+    let pending = tokio::spawn(async move {
+        call(
+            &service,
+            "GET",
+            "/access/v1/media/song",
+            Some(&bearer),
+            Value::Null,
+        )
+        .await
+    });
+    tokio::time::timeout(Duration::from_secs(1), test.mock.reached.notified())
+        .await
+        .unwrap();
+    assert_eq!(
+        renew(&test.service, &token, "alice", true).await.status(),
+        StatusCode::OK
+    );
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    test.service.reap();
+    test.mock.release.notify_one();
+    assert_eq!(pending.await.unwrap().status(), StatusCode::OK);
+    assert!(session.active());
+}
+
+#[tokio::test]
+async fn late_renewal_cannot_resurrect_logout_shutdown_or_expiry() {
+    for mode in 0..3 {
+        let test = setup().await;
+        let token = login(&test.service, "alice").await;
+        let session = test.service.0.sessions.lock().unwrap()[&token].clone();
+        if mode == 2 {
+            session.auth.lock().unwrap().expires = Instant::now() + Duration::from_millis(200);
+        }
+        test.mock.hold_login.store(1, Ordering::SeqCst);
+        let service = test.service.clone();
+        let bearer = token.clone();
+        let pending = tokio::spawn(async move { renew(&service, &bearer, "alice", true).await });
+        tokio::time::timeout(Duration::from_secs(1), test.mock.reached.notified())
+            .await
+            .unwrap();
+        match mode {
+            0 => test.service.revoke(&token),
+            1 => test.service.clear(),
+            _ => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+        test.mock.release.notify_one();
+        let response = pending.await.unwrap();
+        assert!([StatusCode::UNAUTHORIZED, StatusCode::SERVICE_UNAVAILABLE]
+            .contains(&response.status()));
+        test.service.reap();
+        assert!(!session.active());
+        assert!(test.service.0.sessions.lock().unwrap().is_empty());
+    }
+}
+
+#[tokio::test]
+async fn renewal_rechecks_permissive_upstream_and_does_not_extend_on_outage() {
+    let test = setup().await;
+    let token = login(&test.service, "alice").await;
+    let session = test.service.0.sessions.lock().unwrap()[&token].clone();
+    let expires = session.auth.lock().unwrap().expires;
+    test.mock.login_error.store(1, Ordering::SeqCst);
+    assert_eq!(
+        renew(&test.service, &token, "alice", true).await.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    assert_eq!(session.auth.lock().unwrap().expires, expires);
+    test.mock.login_error.store(0, Ordering::SeqCst);
+    test.mock.mode.store(2, Ordering::SeqCst);
+    assert_eq!(
+        renew(&test.service, &token, "alice", true).await.status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert!(!session.active());
+}
+
+#[tokio::test]
+async fn renewal_uses_existing_login_rate_limit() {
+    let test = setup().await;
+    let token = login(&test.service, "alice").await;
+    for _ in 1..30 {
+        test.service.admit_login().unwrap();
+    }
+    assert_eq!(
+        renew(&test.service, &token, "alice", true).await.status(),
+        StatusCode::TOO_MANY_REQUESTS
+    );
 }

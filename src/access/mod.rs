@@ -84,17 +84,46 @@ impl Credential {
 }
 
 struct Session {
-    credential: Credential,
-    expires: Instant,
+    auth: Mutex<SessionAuth>,
     cancelled: CancellationToken,
     // Private to this session. No source revision or cross-session cache claim.
     prefixes: Mutex<HashMap<String, Bytes>>,
     playbacks: Mutex<HashMap<String, Arc<audio::Playback>>>,
     playback_slots: Arc<Semaphore>,
 }
+struct SessionAuth {
+    credential: Credential,
+    expires: Instant,
+}
 impl Session {
+    fn new(credential: Credential, expires: Instant) -> Self {
+        Self {
+            auth: Mutex::new(SessionAuth {
+                credential,
+                expires,
+            }),
+            cancelled: CancellationToken::new(),
+            prefixes: Mutex::new(HashMap::new()),
+            playbacks: Mutex::new(HashMap::new()),
+            playback_slots: Arc::new(Semaphore::new(2)),
+        }
+    }
+    fn credential(&self) -> Credential {
+        self.auth.lock().unwrap().credential.clone()
+    }
     fn active(&self) -> bool {
-        !self.cancelled.is_cancelled() && Instant::now() < self.expires
+        !self.cancelled.is_cancelled() && Instant::now() < self.auth.lock().unwrap().expires
+    }
+    async fn expired(&self) {
+        // Renewal only extends the deadline. Wake at the old deadline and read
+        // it again, so requests already in flight survive a successful renewal.
+        loop {
+            let deadline = self.auth.lock().unwrap().expires;
+            tokio::time::sleep_until(deadline).await;
+            if Instant::now() >= self.auth.lock().unwrap().expires {
+                return;
+            }
+        }
     }
     fn revoke(&self) {
         self.cancelled.cancel();
@@ -231,6 +260,7 @@ impl Service {
                             Json(json!({
                                 "protocol": "stratum-access-proof-1", "playback": false,
                                 "authentication": "subsonic-token", "probeBytes": PREFIX_BYTES,
+                                "sessionRenewal": "fresh-credentials-same-user",
                                 "audioExperiment": "stratum-authenticated-audio-1",
                                 "audioSource": "complete-private-copy",
                                 "maxSourceBytes": audio::MAX_SOURCE_BYTES,
@@ -239,7 +269,10 @@ impl Service {
                         }),
                     )
                     .route("/access/v1/sessions", post(create_session))
-                    .route("/access/v1/session", delete(delete_session))
+                    .route(
+                        "/access/v1/session",
+                        delete(delete_session).post(renew_session),
+                    )
                     .route("/access/v1/media/{track}", get(media)),
             )
             .fallback(|| async { Failure::Input })
@@ -307,6 +340,22 @@ impl Service {
             return Err(Failure::Busy);
         }
         attempts.push_back(now);
+        Ok(())
+    }
+
+    async fn authenticate(&self, credential: &Credential) -> Result<(), Failure> {
+        // Recheck on renewal too: a proxy can become permissive after login.
+        let bogus = Credential {
+            username: format!("stratum-invalid-{}", random_token()?),
+            token: random_token()?[..32].into(),
+            salt: random_token()?,
+        };
+        match self.json("ping", &bogus, &[]).await {
+            Err(Failure::Session) => {}
+            Ok(_) => return Err(Failure::UnsafeUpstream),
+            Err(error) => return Err(error),
+        }
+        self.json("ping", credential, &[]).await?;
         Ok(())
     }
 
@@ -427,7 +476,7 @@ impl Service {
     }
     async fn authorize(&self, session: &Session, track: &str) -> Result<u64, Failure> {
         let value = self
-            .json("getSong", &session.credential, &[("id", track.into())])
+            .json("getSong", &session.credential(), &[("id", track.into())])
             .await?;
         if value["song"]["id"].as_str() != Some(track) {
             return Err(Failure::Upstream);
@@ -436,7 +485,7 @@ impl Service {
             .as_u64()
             .filter(|n| *n >= PREFIX_BYTES as u64)
             .ok_or(Failure::Upstream)?;
-        self.range(&session.credential, track, size, 1).await?;
+        self.range(&session.credential(), track, size, 1).await?;
         Ok(size)
     }
 }
@@ -499,11 +548,7 @@ async fn guard(State(service): State<Service>, request: Request, next: Next) -> 
     response
 }
 
-async fn create_session(
-    State(service): State<Service>,
-    request: Request,
-) -> Result<Response, Failure> {
-    service.admit_login()?;
+async fn read_credential(request: Request) -> Result<Credential, Failure> {
     if request
         .headers()
         .get(header::CONTENT_TYPE)
@@ -517,28 +562,19 @@ async fn create_session(
         .map_err(|_| Failure::Input)?;
     let credential: Credential = serde_json::from_slice(&bytes).map_err(|_| Failure::Input)?;
     credential.validate()?;
-    // Detect an upstream/proxy that authenticates everyone regardless of supplied credentials.
-    let bogus = Credential {
-        username: format!("stratum-invalid-{}", random_token()?),
-        token: random_token()?[..32].into(),
-        salt: random_token()?,
-    };
-    match service.json("ping", &bogus, &[]).await {
-        Err(Failure::Session) => {}
-        Ok(_) => return Err(Failure::UnsafeUpstream),
-        Err(error) => return Err(error),
-    }
-    service.json("ping", &credential, &[]).await?;
+    Ok(credential)
+}
+
+async fn create_session(
+    State(service): State<Service>,
+    request: Request,
+) -> Result<Response, Failure> {
+    service.admit_login()?;
+    let credential = read_credential(request).await?;
+    service.authenticate(&credential).await?;
     service.reap();
     let token = random_token()?;
-    let session = Arc::new(Session {
-        credential,
-        expires: Instant::now() + service.0.ttl,
-        cancelled: CancellationToken::new(),
-        prefixes: Mutex::new(HashMap::new()),
-        playbacks: Mutex::new(HashMap::new()),
-        playback_slots: Arc::new(Semaphore::new(2)),
-    });
+    let session = Arc::new(Session::new(credential, Instant::now() + service.0.ttl));
     {
         let mut sessions = service.0.sessions.lock().unwrap();
         if service.0.stopped.is_cancelled() {
@@ -554,6 +590,57 @@ async fn create_session(
         Json(json!({"session": token, "expiresInSeconds": service.0.ttl.as_secs()})),
     )
         .into_response())
+}
+
+/// Keep the same bearer and private playback handles. A bearer alone cannot
+/// extend its lifetime: fresh same-user Navidrome credentials must still work.
+async fn renew_session(
+    State(service): State<Service>,
+    request: Request,
+) -> Result<Response, Failure> {
+    let (token, session) = service.session(request.headers())?;
+    service.admit_login()?;
+    let credential = read_credential(request).await?;
+    if credential.username != session.credential().username {
+        return Err(Failure::Input);
+    }
+    let result = tokio::select! {
+        biased;
+        _ = session.cancelled.cancelled() => Err(Failure::Session),
+        _ = session.expired() => Err(Failure::Session),
+        result = service.authenticate(&credential) => result,
+    };
+    if let Err(error) = result {
+        if matches!(
+            error,
+            Failure::Session | Failure::Access | Failure::UnsafeUpstream
+        ) {
+            service.revoke(&token);
+        }
+        return Err(error);
+    }
+    {
+        // Match revoke/reap's lock order. Logout, shutdown and expiry win over
+        // an authentication response arriving late; never insert a new entry.
+        let sessions = service.0.sessions.lock().unwrap();
+        if service.0.stopped.is_cancelled()
+            || !sessions
+                .get(&token)
+                .is_some_and(|s| Arc::ptr_eq(s, &session))
+        {
+            return Err(Failure::Session);
+        }
+        let mut auth = session.auth.lock().unwrap();
+        if session.cancelled.is_cancelled() || Instant::now() >= auth.expires {
+            return Err(Failure::Session);
+        }
+        auth.credential = credential;
+        auth.expires = Instant::now() + service.0.ttl;
+    }
+    Ok(
+        Json(json!({"session": token, "expiresInSeconds": service.0.ttl.as_secs()}))
+            .into_response(),
+    )
 }
 
 async fn delete_session(
@@ -587,7 +674,7 @@ async fn media(
             Some(bytes) => bytes,
             None => {
                 service
-                    .range(&session.credential, &track, size, PREFIX_BYTES)
+                    .range(&session.credential(), &track, size, PREFIX_BYTES)
                     .await?
             }
         };
@@ -636,7 +723,7 @@ async fn media(
     let result = tokio::select! {
         biased;
         _ = session.cancelled.cancelled() => Err(Failure::Session),
-        _ = tokio::time::sleep_until(session.expires) => Err(Failure::Session),
+        _ = session.expired() => Err(Failure::Session),
         result = work => result,
     };
     if let Err(error) = result {
