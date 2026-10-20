@@ -57,6 +57,9 @@ async fn upstream(State(state): State<Arc<Upstream>>, request: Request) -> Respo
     ))
     .unwrap();
     let params: HashMap<_, _> = url.query_pairs().into_owned().collect();
+    if !params.contains_key("u") && endpoint.ends_with("ping.view") {
+        return subsonic(json!({"type":"navidrome","status":"failed","error":{"code":10}}));
+    }
     if !["alice", "bob"].contains(&params["u"].as_str()) || params["t"] != "a".repeat(32) {
         return denied(40);
     }
@@ -189,6 +192,41 @@ impl Harness {
     }
     async fn installed(rate: u64) -> Self {
         Self::launch(rate, 600, true).await
+    }
+    async fn owner_cookie(&self) -> String {
+        self.http
+            .post(format!(
+                "{}/admin/api/login",
+                self.base.trim_end_matches("/stratum")
+            ))
+            .header(header::HOST, "localhost:7843")
+            .header(header::ORIGIN, "https://localhost:7843")
+            .json(&json!({"password":"disposable owner password"}))
+            .send()
+            .await
+            .unwrap()
+            .headers()[header::SET_COOKIE]
+            .to_str()
+            .unwrap()
+            .split(';')
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+    async fn dashboard(&self, cookie: &str) -> Value {
+        let response = self
+            .http
+            .get(format!(
+                "{}/admin/api/dashboard",
+                self.base.trim_end_matches("/stratum")
+            ))
+            .header(header::HOST, "localhost:7843")
+            .header(header::COOKIE, cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        response.json().await.unwrap()
     }
     async fn launch(rate: u64, ttl: u64, installed: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
@@ -562,6 +600,76 @@ impl Harness {
             200
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_dashboard_observes_real_delivery_and_removes_closed_sessions() {
+    let mut test = Harness::installed(48000).await;
+    let cookie = test.owner_cookie().await;
+    assert_eq!(
+        test.dashboard(&cookie).await["activity"]["clients"],
+        json!([])
+    );
+    let token = test.login("alice").await;
+    let first = test.handle(&token).await;
+    let second = test.handle(&token).await;
+    let handle = first["playback"].as_str().unwrap();
+    let value = test.dashboard(&cookie).await;
+    let clients = value["activity"]["clients"].as_array().unwrap();
+    assert_eq!(clients.len(), 1);
+    assert_eq!(clients[0]["streams"].as_array().unwrap().len(), 2);
+    assert_eq!(clients[0]["streams"][0]["quality"], Value::Null);
+    assert_eq!(value["bytes_per_second"], 0);
+    assert!(!value.to_string().contains(&token));
+    assert!(!value.to_string().contains("alice"));
+    assert!(!value.to_string().contains(handle));
+    test.decoded(&token, handle, 0, 48000, "lossless").await;
+    let value = test.dashboard(&cookie).await;
+    assert!(value["bytes_per_second"].as_u64().unwrap() > 0);
+    assert_eq!(
+        value["activity"]["clients"][0]["streams"][0]["quality"],
+        "lossless"
+    );
+    test.decoded(&token, handle, 48000, 48000, "opus-64").await;
+    let (warm, _) = test.decoded(&token, handle, 48000, 48000, "opus-64").await;
+    assert_eq!(warm["retained_cache_hit"], true);
+    let value = test.dashboard(&cookie).await;
+    assert_eq!(
+        value["activity"]["clients"][0]["streams"][0]["quality"],
+        "opus-64"
+    );
+    test.close_playback(&token, handle).await;
+    let value = test.dashboard(&cookie).await;
+    assert_eq!(
+        value["activity"]["clients"][0]["streams"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        value["activity"]["clients"][0]["streams"][0]["quality"],
+        Value::Null
+    );
+    test.close_playback(&token, second["playback"].as_str().unwrap())
+        .await;
+    test.http
+        .delete(format!("{}/access/v1/session", test.base))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        test.dashboard(&cookie).await["activity"]["clients"],
+        json!([])
+    );
+    let token = test.login("alice").await;
+    test.handle(&token).await;
+    test.restart_installed().await;
+    let cookie = test.owner_cookie().await;
+    let value = test.dashboard(&cookie).await;
+    assert_eq!(value["activity"]["clients"], json!([]));
+    assert_eq!(value["bytes_per_second"], 0);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

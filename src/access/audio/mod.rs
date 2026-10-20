@@ -24,6 +24,7 @@ const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 const WORKER_LIMIT: Duration = Duration::from_secs(8);
 
 pub(crate) struct Store {
+    pub(crate) traffic: Arc<super::live::Traffic>,
     root: Arc<TempDir>,
     sources: Arc<Semaphore>,
     workers: Scheduler,
@@ -40,6 +41,7 @@ impl Store {
     }
     pub(crate) fn new() -> anyhow::Result<Self> {
         Ok(Self {
+            traffic: Arc::new(super::live::Traffic::default()),
             root: Arc::new(
                 tempfile::Builder::new()
                     .prefix("stratum-audio-")
@@ -160,6 +162,7 @@ impl Store {
 }
 
 pub(super) struct Playback {
+    live: Arc<super::live::Stream>,
     directory: TempDir,
     // Keep the parent alive until cancellation cleanup has reaped its worker.
     _root: Arc<TempDir>,
@@ -176,6 +179,11 @@ pub(super) struct Playback {
 impl Drop for Playback {
     fn drop(&mut self) {
         self.cancelled.cancel();
+    }
+}
+impl Playback {
+    pub(super) fn dashboard(&self) -> Value {
+        self.live.view()
     }
 }
 #[derive(Clone, Serialize, Deserialize)]
@@ -227,12 +235,17 @@ fn invalidate(session: &Session, handle: &str) {
         playback.cancelled.cancel();
     }
 }
-fn final_body(session: Arc<Session>, cancelled: CancellationToken, bytes: Bytes) -> Body {
+fn final_body(
+    session: Arc<Session>,
+    cancelled: CancellationToken,
+    bytes: Bytes,
+    delivery: Option<super::live::Delivery>,
+) -> Body {
     // Bound each yielded chunk and recheck liveness when the socket asks for more.
     // Already-delivered/socket-buffered bytes cannot be recalled.
     Body::from_stream(futures_util::stream::unfold(
-        (session, cancelled, bytes, 0),
-        |(session, cancelled, bytes, offset)| async move {
+        (session, cancelled, bytes, 0, delivery),
+        |(session, cancelled, bytes, offset, delivery)| async move {
             if offset == bytes.len() {
                 return None;
             }
@@ -242,13 +255,16 @@ fn final_body(session: Arc<Session>, cancelled: CancellationToken, bytes: Bytes)
                         std::io::ErrorKind::PermissionDenied,
                         "playback ended",
                     )),
-                    (session, cancelled, bytes.clone(), bytes.len()),
+                    (session, cancelled, bytes.clone(), bytes.len(), delivery),
                 ));
             }
             let end = (offset + 16 * 1024).min(bytes.len());
+            if let Some(delivery) = &delivery {
+                delivery.sent(offset, end);
+            }
             Some((
                 Ok(bytes.slice(offset..end)),
-                (session, cancelled, bytes, end),
+                (session, cancelled, bytes, end, delivery),
             ))
         },
     ))
@@ -371,6 +387,7 @@ async fn open(
         }
         let reservation = service.0.audio.reserve(size).await?;
         let playback = Arc::new(Playback {
+            live: Arc::new(super::live::Stream::default()),
             _reservation: reservation,
             directory: tempfile::tempdir_in(service.0.audio.root.path())
                 .map_err(|_| Failure::Internal)?,
@@ -418,6 +435,7 @@ async fn open(
             serde_json::to_vec(&value)
                 .map_err(|_| Failure::Internal)?
                 .into(),
+            None,
         ));
         *response.status_mut() = StatusCode::CREATED;
         response
@@ -569,10 +587,17 @@ async fn segment(
             }
         }
         active(&session, &playback)?;
+        let payload_offset = 4 + u32::from_be_bytes(output[..4].try_into().unwrap()) as usize;
         let mut response = Response::new(final_body(
             session.clone(),
             playback.cancelled.clone(),
             output.into(),
+            Some(super::live::Delivery {
+                traffic: service.0.audio.traffic.clone(),
+                stream: playback.live.clone(),
+                quality: interval.quality,
+                payload_offset,
+            }),
         ));
         response.headers_mut().insert(
             header::CONTENT_TYPE,
@@ -805,8 +830,21 @@ mod tests {
                 Instant::now() + Duration::from_secs(10),
             ));
             let cancelled = session.cancelled.child_token();
-            let mut body = final_body(session.clone(), cancelled.clone(), vec![1; 32768].into())
-                .into_data_stream();
+            let traffic = Arc::new(super::super::live::Traffic::default());
+            let live = Arc::new(super::super::live::Stream::default());
+            let delivery = super::super::live::Delivery {
+                traffic: traffic.clone(),
+                stream: live,
+                quality: Quality::Lossless,
+                payload_offset: 0,
+            };
+            let mut body = final_body(
+                session.clone(),
+                cancelled.clone(),
+                vec![1; 32768].into(),
+                Some(delivery),
+            )
+            .into_data_stream();
             assert_eq!(body.next().await.unwrap().unwrap().len(), 16384);
             if logout {
                 session.revoke();
@@ -815,6 +853,7 @@ mod tests {
             }
             assert!(body.next().await.unwrap().is_err());
             assert!(body.next().await.is_none());
+            assert_eq!(traffic.bytes_per_second(), 16384 / 5);
         }
     }
     #[cfg(unix)]
@@ -835,6 +874,7 @@ mod tests {
             .unwrap()
             .executable = script;
         let playback = Arc::new(Playback {
+            live: Arc::new(super::super::live::Stream::default()),
             directory: tempfile::tempdir_in(service.0.audio.root.path()).unwrap(),
             _root: service.0.audio.root.clone(),
             _reservation: None,

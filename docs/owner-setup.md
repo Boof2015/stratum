@@ -16,20 +16,31 @@ After owner sign-in:
    network hostname may be appropriate instead.
 2. **Check and continue** makes a bounded, credential-free OpenSubsonic ping.
    Navidrome identifies itself even when rejecting the missing listener sign-in.
-   The page says “Navidrome detected. Sign-in has not been checked.” It never
-   treats detection as authentication or permission to read music.
+   Success advances the progress indicator to Connections. The connection
+   details explain that this is detection, not listener authentication or
+   permission to read music.
 3. Enter a primary HTTPS listener address and optional additional addresses.
-   Choose **Direct to Sidecar** or **Through an HTTPS reverse proxy** for each.
+   Choose **Direct to Sidecar** or **Reverse proxy** for each.
    Keep any path prefix. Addresses are checked for valid syntax and duplicates,
    but not for reachability from every future listener.
-4. **Save connections** persists the settings and shows the summary. You can
-   change either part or recheck Navidrome. Reloading or restarting resumes from
-   the saved step; unsaved text is not retained across a page reload.
+4. **Continue** saves connections and advances to Discovery. Explicitly choose
+   **Enable discovery** (temporary Navidrome administrator authorization) or
+   **Use manual setup** (no announcement or administrator credentials).
+   Publishing is never automatic. A failed initial publication keeps the setup
+   step with retry/manual choices, including after a page reload.
+5. Setup finishes on **Overview**. **Settings → Connections** lets you edit or
+   recheck either connection. Cancel returns to Settings without saving.
+   Reloading or restarting resumes from saved progress; unsaved text is not
+   retained across a page reload.
 
-The summary also has [Storage controls](owner-cache.md): retained cache usage,
+Settings also has [Storage controls](owner-cache.md): retained cache usage,
 its limit, clear/disable confirmations, and separate temporary working usage.
 [Resource controls](owner-resources.md) set simultaneous conversions and the
 temporary working-storage budget.
+The [live overview](owner-dashboard.md) shows sessions, prepared streams, quality
+and transfer readings separately from these settings. Extra technical help is
+available in expandable details. The setup footer consistently offers Back and
+Continue; connection editing instead offers Cancel and Save changes.
 
 Direct addresses record `sidecar_key`, for verification against Sidecar's
 persistent SPKI identity. Proxy addresses record `https_proxy`, for normal
@@ -43,7 +54,8 @@ neither changes the bound port nor reconfigures the administration allowlist,
 certificate, DNS, container network or reverse proxy. The existing admin page
 is still hosted at `/`, not a proxy subpath. A listener base path is stripped by
 the reverse proxy before forwarding to Sidecar (see the streaming guide).
-Nothing is announced to Navidrome during this flow.
+Saving connections does not announce anything to Navidrome; the optional final
+discovery step requires a separate explicit publication action.
 
 ## Terminal/config alternative
 

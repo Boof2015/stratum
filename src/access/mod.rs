@@ -1,6 +1,7 @@
 //! Loopback experimental access and authenticated-audio service.
 //! The original 64-byte probe remains separate from the encoded audio routes.
 pub mod audio;
+mod live;
 pub(crate) mod transport;
 
 use axum::{
@@ -84,6 +85,7 @@ impl Credential {
 }
 
 struct Session {
+    display_id: u64,
     auth: Mutex<SessionAuth>,
     cancelled: CancellationToken,
     // Private to this session. No source revision or cross-session cache claim.
@@ -98,6 +100,7 @@ struct SessionAuth {
 impl Session {
     fn new(credential: Credential, expires: Instant) -> Self {
         Self {
+            display_id: live::next_id(),
             auth: Mutex::new(SessionAuth {
                 credential,
                 expires,
@@ -333,6 +336,28 @@ impl Service {
             session.revoke();
         }
         sessions.clear();
+    }
+    pub(crate) fn dashboard(&self) -> Value {
+        self.reap();
+        let sessions = self.0.sessions.lock().unwrap();
+        let mut clients: Vec<_> = sessions
+            .values()
+            .filter(|s| s.active())
+            .map(|session| {
+                let mut streams: Vec<_> = session
+                    .playbacks
+                    .lock()
+                    .unwrap()
+                    .values()
+                    .filter(|p| !p.cancelled.is_cancelled())
+                    .map(|p| p.dashboard())
+                    .collect();
+                streams.sort_by_key(|s| s["id"].as_u64());
+                json!({"id": session.display_id, "streams": streams})
+            })
+            .collect();
+        clients.sort_by_key(|c| c["id"].as_u64());
+        json!({"clients": clients})
     }
     fn session(&self, headers: &HeaderMap) -> Result<(String, Arc<Session>), Failure> {
         self.reap();

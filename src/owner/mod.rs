@@ -1,6 +1,7 @@
 //! Persistent owner-access foundation. Listener credentials and the experimental
 //! audio service remain separate; these cookies never authorize music access.
 pub mod discovery;
+mod health;
 mod listener;
 pub mod setup;
 mod store;
@@ -130,6 +131,7 @@ impl Service {
             .route("/admin/api/login", post(login))
             .route("/admin/api/logout", post(logout))
             .route("/admin/api/setup", get(setup_state))
+            .route("/admin/api/dashboard", get(dashboard))
             .route("/admin/api/setup/navidrome", post(save_navidrome))
             .route("/admin/api/setup/listeners", post(save_listeners))
             .route("/admin/api/setup/check", post(check_navidrome))
@@ -411,6 +413,21 @@ async fn storage_state(
             .await
             .map_err(|_| Failure::Storage)?,
     ))
+}
+async fn dashboard(
+    State(service): State<Service>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, Failure> {
+    service.authorize(&headers).await?;
+    let value = service
+        .0
+        .listener
+        .dashboard()
+        .await
+        .map_err(|_| Failure::Storage)?;
+    // A logout/reset that happened during the storage read must win.
+    service.authorize(&headers).await?;
+    Ok(Json(value))
 }
 async fn change_storage(
     State(service): State<Service>,

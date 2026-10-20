@@ -63,6 +63,62 @@ async fn enrolled(store: &Store, service: &Service) -> String {
 }
 
 #[tokio::test]
+async fn dashboard_requires_current_owner_and_does_not_authorize_listener_tokens() {
+    let (_dir, store, service) = fixture();
+    assert_eq!(
+        call(&service, "GET", "/admin/api/dashboard", None, json!({}))
+            .await
+            .status(),
+        401
+    );
+    let cookie = enrolled(&store, &service).await;
+    let response = call(
+        &service,
+        "GET",
+        "/admin/api/dashboard",
+        Some(&cookie),
+        json!({}),
+    )
+    .await;
+    assert_eq!(response.status(), 200);
+    assert_eq!(response.headers()[header::CACHE_CONTROL], "no-store");
+    let value = json(response).await;
+    assert_eq!(value["ready"], false);
+    assert_eq!(value["activity"]["clients"], json!([]));
+    assert_eq!(value["navidrome"]["status"], "setup_required");
+    assert_eq!(value["bytes_per_second"], 0);
+    assert!(value.to_string().find(PASSWORD).is_none());
+    store
+        .set_password("new disposable owner password", true)
+        .unwrap();
+    assert_eq!(
+        call(
+            &service,
+            "GET",
+            "/admin/api/dashboard",
+            Some(&cookie),
+            json!({})
+        )
+        .await
+        .status(),
+        401
+    );
+    let response = service
+        .router()
+        .oneshot(
+            Request::builder()
+                .uri("/admin/api/dashboard")
+                .header(header::HOST, "localhost:7843")
+                .header(header::AUTHORIZATION, format!("Bearer {}", "a".repeat(64)))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 401);
+}
+
+#[tokio::test]
 async fn resource_controls_share_revisions_without_resetting_connections_or_cache() {
     let (_dir, store, service) = fixture();
     assert_eq!(

@@ -25,6 +25,7 @@ struct Inner {
     requests: Semaphore,
     storage_jobs: Arc<Semaphore>,
     stopped: CancellationToken,
+    health: super::health::Health,
 }
 #[derive(Default)]
 struct Current {
@@ -59,6 +60,7 @@ impl Listener {
             requests: Semaphore::new(8),
             storage_jobs: Arc::new(Semaphore::new(2)),
             stopped: CancellationToken::new(),
+            health: super::health::Health::new()?,
         })))
     }
     pub(super) fn router(&self) -> Router {
@@ -122,6 +124,23 @@ impl Listener {
             let _permit = permit;
             Ok(json!({"settings":store.config()?.storage, "cache": audio.retained().unwrap().stats(), "working_bytes":audio.working_bytes()?,"resources":store.config()?.resources,"runtime":audio.resource_stats()}))
         }).await?
+    }
+    pub(super) async fn dashboard(&self) -> anyhow::Result<serde_json::Value> {
+        let storage = self.storage().await?;
+        let current = self.0.state.lock().await;
+        let activity = current
+            .engine
+            .as_ref()
+            .map(|engine| engine.dashboard())
+            .unwrap_or_else(|| json!({"clients":[]}));
+        Ok(json!({
+            "ready": current.engine.is_some(),
+            "activity": activity,
+            "bytes_per_second": self.0.audio.traffic.bytes_per_second(),
+            "rate_window_seconds": 5,
+            "storage": storage,
+            "navidrome": self.0.health.view(current.key.clone(), self.0.stopped.clone()),
+        }))
     }
 
     pub(super) async fn maintain(&self, stop: CancellationToken) {

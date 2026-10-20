@@ -15,6 +15,7 @@ import subprocess
 import tempfile
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 
 from access_proof import child, fixture, port, wait_ready, request, payload
@@ -69,6 +70,22 @@ def main(args):
 
         def audio(path, method="GET", body=None, token=None):
             return audio_request(side, path, method, body, token, opener=opener)
+
+        def owner_api(path, body=None, cookie=None, expected=200):
+            headers = {"Origin":origin, "Content-Type":"application/json"}
+            if cookie:
+                headers["Cookie"] = cookie
+            req = urllib.request.Request(origin + "/admin/api/" + path,
+                data=None if body is None else json.dumps(body).encode(), headers=headers)
+            try:
+                response = opener.open(req, timeout=12)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                require(response.status == expected, "unexpected owner API status")
+                result = response.read(65537)
+                require(len(result) <= 65536, "owner response exceeded limit")
+                return json.loads(result), response.headers.get("Set-Cookie")
 
         env = {k:v for k,v in os.environ.items() if not k.startswith("ND_")}
         env.update({"ND_ADDRESS":"127.0.0.1", "ND_PORT":str(nav_port), "ND_BASEURL":"/music",
@@ -131,6 +148,13 @@ def main(args):
                       and cap["spkiSha256"] == descriptor["spkiSha256"]
                       and cap["installation"] == descriptor["installation"] and cap["ready"] is True)
                 check("anonymous audio denied", audio("/audio/v1/playbacks/" + tracks["alice"], "POST")[0] == 401)
+                owner_api("dashboard", expected=401)
+                _, owner_cookie = owner_api("login", {"password":owner_password})
+                owner_cookie = owner_cookie.split(";", 1)[0]
+                sensitive.append(owner_cookie.split("=", 1)[1])
+                live, _ = owner_api("dashboard", cookie=owner_cookie)
+                check("owner dashboard starts empty and requires owner sign-in",
+                      live["activity"]["clients"] == [] and live["bytes_per_second"] == 0)
                 check("wrong listener sign-in denied", audio("/access/v1/sessions", "POST",
                       {**credentials["alice"], "token":"0"*32})[0] == 401)
                 tokens = {}
@@ -139,12 +163,23 @@ def main(args):
                     sensitive.append(tokens[name])
                 probe = AudioProbe(side, tokens, tracks, {"alice":a_dir/"alpha.wav", "bob":b_dir/"beta.wav"},
                                    root, check, opener=opener)
+                live, _ = owner_api("dashboard", cookie=owner_cookie)
+                clients = live["activity"]["clients"]
+                check("dashboard observes real streamed quality and cached delivery",
+                      len(clients) == 2 and sum(len(c["streams"]) for c in clients) == 2
+                      and all(c["streams"][0]["quality"] == "opus-128" for c in clients)
+                      and live["bytes_per_second"] > 0)
+                check("dashboard detects real Navidrome without retaining listener identity",
+                      live["navidrome"]["status"] == "responding"
+                      and not any(secret in json.dumps(live) for secret in [*tokens.values(), "alice", "bob"]))
                 native(f"/user/{users['alice']['id']}/library", "PUT", {"libraryIds":[int(library_b["id"])]})
                 probe.denied("alice", 404, "live library revocation")
                 native(f"/user/{users['alice']['id']}/library", "PUT", {"libraryIds":[1]})
                 probe.reopen("alice", tokens["alice"])
                 check("logout succeeds", audio("/access/v1/session", "DELETE", token=tokens["alice"])[0] == 204)
                 probe.denied("alice", 401, "logout")
+                live, _ = owner_api("dashboard", cookie=owner_cookie)
+                check("dashboard removes a logged-out listener", len(live["activity"]["clients"]) == 1)
                 stop_group(nav)
                 probe.denied("bob", 503, "upstream outage")
                 stop_group(service)

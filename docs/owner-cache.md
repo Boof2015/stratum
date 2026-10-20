@@ -12,16 +12,18 @@ optimization is separate work.
 
 ## Owner controls
 
-After connection setup, the owner page's Storage section shows retained usage
-and temporary working usage separately. These are snapshots; **Refresh storage
-use** updates them. The live dashboard comes later.
+After connection setup, Overview shows separate cache and temporary-storage
+meters. **Settings → Storage** contains the cache controls. The
+[live dashboard](owner-dashboard.md) updates readings while visible;
+**Refresh usage** in Settings updates readings without replacing unsaved controls
+or their original revision guards.
 
 - Retention starts **on**, with a **5 GB** limit. The browser and CLI accept
   custom whole-GB limits from **1 GB** upward, with no arbitrary storage tier
   maximum. Limits use decimal GB and do not reserve disk space.
 - Saving a smaller limit evicts the least recently used retained entries until
   usage fits. The service does not touch active working files.
-- **Clear cached audio…** requires a second confirmation. Future listening can
+- **Clear cache…** requires a second confirmation. Future listening can
   refill the cache when retention is on.
 - Turning retention off requires one combined **Turn off and clear**
   confirmation. Temporary storage remains necessary for active streams.

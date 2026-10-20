@@ -8,133 +8,184 @@
   <script src="/owner.js" defer></script>
 </head>
 <body>
-  <main>
-    <p class="eyebrow">ASTRA SIDECAR</p>
-    <h1 id="title">Connecting…</h1>
-    <p id="description">Opening your server’s administration page.</p>
-    <form id="owner-form" hidden>
+  <main id="app" class="setup-layout">
+    <header class="app-header">
+      <a class="brand" href="#" id="brand" aria-label="Sidecar overview">Sidecar</a>
+      <nav id="page-nav" aria-label="Main" hidden>
+        <button id="nav-overview" type="button" aria-current="page">Overview</button>
+        <button id="nav-settings" type="button">Settings</button>
+      </nav>
+      <button id="logout" type="button" class="quiet" hidden>Sign out</button>
+    </header>
+    <ol id="setup-progress" class="steps" aria-label="Setup progress" hidden>
+      <li data-step="navidrome"><span class="step-number">1</span>Navidrome</li>
+      <li data-step="listeners"><span class="step-number">2</span>Connections</li>
+      <li data-step="discovery"><span class="step-number">3</span>Discovery</li>
+    </ol>
+    <div class="page-heading">
+      <h1 id="title" tabindex="-1">Connecting…</h1>
+      <p id="description"></p>
+    </div>
+    <div class="feedback">
+      <p id="message" role="status" aria-live="polite"></p>
+      <button id="retry" type="button" hidden>Try again</button>
+      <button id="reload" type="button" hidden>Reload saved settings</button>
+    </div>
+    <form id="owner-form" class="panel" hidden>
       <label id="code-label" hidden>Setup code
-        <input id="code" name="code" autocomplete="off" spellcheck="false" maxlength="64">
+        <input id="code" name="code" autocomplete="off" spellcheck="false" maxlength="64" aria-describedby="code-help">
+        <span id="code-help" class="hint">From your server’s terminal or container logs.</span>
       </label>
-      <label>Password
-        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      <label>Owner password
+        <input id="password" name="password" type="password" autocomplete="current-password" required aria-describedby="password-help">
+        <span id="password-help" class="hint" hidden>At least 12 characters.</span>
       </label>
       <label id="confirm-label" hidden>Confirm password
         <input id="confirm" name="confirm" type="password" autocomplete="new-password">
       </label>
-      <button id="submit" type="submit">Sign in</button>
+      <div class="form-footer"><button id="submit" type="submit" class="primary">Sign in</button></div>
     </form>
-    <p id="message" role="status" aria-live="polite"></p>
-    <button id="retry" type="button" hidden>Try again</button>
-    <button id="reload" type="button" hidden>Reload saved settings</button>
     <section id="ready" hidden>
       <section id="navidrome-section" hidden>
-        <form id="navidrome-form">
+        <form id="navidrome-form" class="panel">
           <label>Navidrome address
-            <input id="navidrome-url" type="url" required maxlength="1024" placeholder="http://127.0.0.1:4533" spellcheck="false" autocomplete="off">
+            <input id="navidrome-url" type="url" required maxlength="1024" placeholder="http://navidrome:4533" spellcheck="false" autocomplete="off" aria-describedby="navidrome-help">
+            <span id="navidrome-help" class="hint">Use the address reachable from Sidecar, including any path.</span>
           </label>
-          <p class="hint">Inside a container, localhost means that container. Use Navidrome’s container name or an address reachable from Sidecar.</p>
-          <p class="hint">This checks for Navidrome without sending credentials. Listeners will use their own Navidrome sign-in.</p>
-          <button id="navidrome-save" type="submit">Check and continue</button>
+          <details><summary>Connecting from Docker or another machine</summary><p>In Docker, localhost points to Sidecar’s container. Use Navidrome’s container name or its network address instead.</p><p>This checks for Navidrome. Listeners sign in with their own Navidrome accounts.</p></details>
+          <div class="form-footer">
+            <button id="cancel-navidrome" type="button" class="quiet" hidden>Cancel</button>
+            <button id="navidrome-save" type="submit" class="primary">Check and continue</button>
+          </div>
         </form>
       </section>
       <section id="listeners-section" hidden>
-        <form id="listeners-form">
+        <form id="listeners-form" class="panel">
           <div id="addresses"></div>
-          <button id="add-address" type="button">Add another address</button>
-          <p class="hint">Direct connections use Sidecar’s identity key. With a reverse proxy, clients verify its HTTPS certificate and trust it to forward the connection to Sidecar.</p>
-          <p class="hint">Keep any path your proxy uses, such as /stratum. Saving an address doesn’t check whether listeners can reach it.</p>
-          <div class="actions">
-            <button id="back-navidrome" type="button">Back</button>
-            <button type="submit">Save connections</button>
+          <button id="add-address" type="button" class="text-button">+ Add another address</button>
+          <details><summary>Connection details</summary><p>Direct connections verify Sidecar’s identity key. A reverse proxy uses its HTTPS certificate and forwards the connection to Sidecar.</p><p>Saving an address does not test whether a listener can reach it. The first address is the primary one.</p></details>
+          <div class="form-footer">
+            <button id="back-navidrome" type="button" class="quiet">Back</button>
+            <button id="listeners-save" type="submit" class="primary">Continue</button>
           </div>
         </form>
       </section>
+      <section id="discovery-section" hidden></section>
       <section id="summary-section" hidden>
-        <h2>Navidrome</h2>
-        <p id="saved-navidrome" class="address"></p>
-        <div class="actions">
-          <button id="edit-navidrome" type="button">Change address</button>
-          <button id="check-again" type="button">Check again</button>
-        </div>
-        <h2>Listener addresses</h2>
-        <ul id="saved-addresses" class="address"></ul>
-        <button id="edit-listeners" type="button">Change addresses</button>
-        <section aria-labelledby="discovery-heading">
-          <h2 id="discovery-heading">Discovery</h2>
-          <p id="discovery-status"></p>
-          <p id="discovery-error" role="status"></p>
-          <p class="hint">Publishing adds a Stratum entry to Navidrome’s internet radio list so compatible clients can find Sidecar. Other clients may show it as a radio station. Manual setup needs no announcement.</p>
-          <div class="actions">
-            <button id="publish-discovery" type="button">Publish discovery</button>
-            <button id="manual-discovery" type="button">Use manual setup</button>
-            <button id="remove-discovery" type="button" hidden>Remove announcement</button>
-          </div>
-          <form id="discovery-form" hidden>
-            <p id="discovery-target" class="address"></p>
-            <label>Navidrome administrator username
-              <input id="navidrome-admin" autocomplete="off" required maxlength="256" spellcheck="false">
-            </label>
-            <label>Navidrome administrator password
-              <input id="navidrome-password" type="password" autocomplete="off" required maxlength="1024">
-            </label>
-            <p class="hint">Used for this operation only. Sidecar does not save this sign-in. It is separate from your Sidecar owner password.</p>
-            <div class="actions">
-              <button id="discovery-submit" type="submit">Publish discovery</button>
-              <button id="discovery-cancel" type="button">Cancel</button>
+        <section id="overview-panel" aria-label="Overview">
+          <section id="dashboard" aria-labelledby="dashboard-heading">
+            <div class="health-strip panel">
+              <div><span class="field-caption">Sidecar</span><strong id="live-health" class="status" data-state="checking">Checking…</strong></div>
+              <div><span class="field-caption">Navidrome</span><strong id="live-navidrome" class="status" data-state="checking">Checking…</strong><span id="live-checked" class="hint"></span></div>
+              <button id="health-settings" type="button" class="quiet">Connection settings</button>
+              <p id="live-connection-error" class="inline-problem" hidden></p>
             </div>
-          </form>
+            <div id="overview-discovery-notice" class="notice-row" hidden><p id="overview-discovery-message"></p><button id="discovery-settings" type="button">Review discovery</button></div>
+            <div class="section-heading"><h2 id="dashboard-heading">Activity</h2><span id="dashboard-status" role="status">Loading…</span></div>
+            <div class="metrics">
+              <div><span>Signed-in sessions</span><strong id="live-clients">—</strong></div>
+              <div><span>Prepared streams</span><strong id="live-streams">—</strong></div>
+              <div><span>Transfer rate</span><strong id="live-rate">—</strong></div>
+              <div><span>Conversions</span><strong id="live-jobs">—</strong><span id="live-waiting"></span></div>
+            </div>
+            <div class="panel sessions-panel">
+              <div class="section-heading"><h3>Sessions</h3><span class="column-label">Last sent quality</span></div>
+              <ul id="live-list" class="stream-list"></ul>
+            </div>
+            <details class="reading-details"><summary>About these readings</summary><p>Sessions can remain signed in while idle. Prepared streams include upcoming tracks; the last quality sent may be ahead of what a listener hears.</p><p>Transfer rate averages encoded audio sent over five seconds. It includes cached audio and excludes headers. Navidrome’s status checks reachability, not a listener’s sign-in.</p></details>
+          </section>
+          <section class="panel" aria-labelledby="overview-storage-heading">
+            <div class="section-heading"><h2 id="overview-storage-heading">Storage</h2><button id="manage-storage" type="button" class="text-button">Manage storage</button></div>
+            <div class="storage-grid">
+              <div class="usage-block">
+                <div class="usage-heading"><h3>Audio cache</h3><span id="overview-cache-state" class="tag">On</span></div>
+                <p id="overview-cache-usage" class="usage-value">—</p>
+                <div id="overview-cache-meter" class="meter" role="meter" aria-label="Audio cache usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="meter-fill"></span></div>
+                <p class="hint">Saved audio for the next play.</p>
+              </div>
+              <div class="usage-block">
+                <div class="usage-heading"><h3>Working storage</h3></div>
+                <p id="overview-working-usage" class="usage-value">—</p>
+                <div id="overview-working-meter" class="meter working-meter" role="meter" aria-label="Working storage usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="meter-reserved"></span><span class="meter-fill"></span></div>
+                <p id="overview-reserved" class="hint">Temporary space for active streams.</p>
+              </div>
+            </div>
+            <p id="overview-storage-problem" class="inline-problem" hidden></p>
+          </section>
         </section>
-        <section aria-labelledby="storage-heading">
-          <h2 id="storage-heading">Storage</h2>
-          <p id="storage-usage">Load storage use to view the cache.</p>
-          <p id="storage-working"></p>
-          <p id="storage-problem" role="status"></p>
-          <form id="storage-form" hidden>
-            <label>Retain prepared audio
-              <select id="cache-enabled"><option value="true">On</option><option value="false">Off</option></select>
-            </label>
-            <p class="hint">Reuse prepared audio between plays to avoid repeated conversion. Active streams still need temporary working storage when this is off.</p>
-            <label>Cache limit (GB)
-              <input id="cache-limit" type="number" min="1" step="1" required>
-            </label>
-            <div class="actions">
-              <button type="submit">Save cache settings</button>
-              <button id="cache-clear" type="button">Clear cached audio…</button>
-            </div>
-          </form>
-          <div id="cache-confirmation" role="alertdialog" aria-labelledby="cache-confirm-title" aria-describedby="cache-confirm-message" hidden>
-            <h3 id="cache-confirm-title"></h3>
-            <p id="cache-confirm-message"></p>
-            <div class="actions">
-              <button id="cache-cancel" type="button">Cancel</button>
-              <button id="cache-confirm" type="button">Clear cached audio</button>
-            </div>
+        <section id="settings-panel" aria-label="Settings" hidden>
+          <nav class="settings-links" aria-label="Settings sections"><a href="#connection-settings">Connections</a><a href="#discovery-panel">Discovery</a><a href="#storage-settings">Storage</a><a href="#resource-settings">Resources</a></nav>
+          <section id="connection-settings" class="panel" aria-labelledby="connection-heading">
+            <h2 id="connection-heading">Connections</h2>
+            <div class="setting-row"><div><h3>Navidrome</h3><p id="saved-navidrome" class="address"></p></div><div class="actions"><button id="check-again" type="button" class="quiet">Check</button><button id="edit-navidrome" type="button">Edit</button></div></div>
+            <div class="setting-row"><div><h3>Listener addresses</h3><ul id="saved-addresses" class="address-list"></ul></div><button id="edit-listeners" type="button">Edit</button></div>
+          </section>
+          <div id="discovery-settings-slot">
+            <section id="discovery-panel" class="panel" aria-labelledby="discovery-heading">
+              <h2 id="discovery-heading">Discovery</h2>
+              <p id="discovery-status"></p>
+              <p id="discovery-error" class="inline-problem" role="status"></p>
+              <div class="discovery-explanation">
+                <p>Sidecar adds a Stratum entry to Navidrome’s internet radio list.</p>
+                <p class="discovery-reason">Compatible apps use it to find Sidecar automatically, so listeners don’t need to enter another server address.</p>
+                <p class="discovery-note">Other apps may show this entry as a radio station, but it won’t play audio.</p>
+              </div>
+              <div class="discovery-help">
+                <p class="hint">Let compatible apps find Sidecar through Navidrome.</p>
+                <details><summary>How discovery works</summary><p>Publishing adds a Stratum entry to Navidrome’s internet radio list. Other apps may display it as a radio station. With manual setup, listeners enter a Sidecar address themselves.</p></details>
+              </div>
+              <div id="discovery-actions" class="actions">
+                <button id="publish-discovery" type="button" class="primary">Enable discovery</button>
+                <button id="manual-discovery" type="button" class="quiet">Use manual setup</button>
+                <button id="remove-discovery" type="button" class="quiet" hidden>Remove announcement</button>
+              </div>
+              <form id="discovery-form" class="inset-form" hidden>
+                <p id="discovery-target" class="address hint"></p>
+                <p id="discovery-effect" class="hint"></p>
+                <label>Navidrome administrator username<input id="navidrome-admin" autocomplete="off" required maxlength="256" spellcheck="false"></label>
+                <label>Navidrome administrator password<input id="navidrome-password" type="password" autocomplete="off" required maxlength="1024"></label>
+                <p class="hint">Used once for this change. Never saved.</p>
+                <div class="form-footer"><button id="discovery-cancel" type="button" class="quiet">Cancel</button><button id="discovery-submit" type="submit" class="primary">Enable discovery</button></div>
+              </form>
+              <div id="discovery-back-row" class="form-footer" hidden><button id="back-listeners" type="button" class="quiet">Back</button></div>
+            </section>
           </div>
-          <h2>Resources</h2>
-          <p id="resources-status"></p>
-          <form id="resources-form" hidden>
-            <label>Simultaneous conversions
-              <select id="resource-conversions">
-                <option value="automatic">Automatic</option>
-                <option value="1">1</option><option value="2">2</option>
-                <option value="3">3</option><option value="4">4</option>
-              </select>
-            </label>
-            <p class="hint">Automatic chooses a conservative limit for this machine. Cached audio does not use a conversion slot.</p>
-            <label>Temporary working-storage limit (MB)
-              <input id="resource-working" type="number" min="128" step="1" required>
-            </label>
-            <p class="hint">Separate from the retained cache. Lowering a limit lets current jobs finish and keeps their files until they are no longer needed. New work waits or retries when capacity is full.</p>
-            <button type="submit">Save resource settings</button>
-          </form>
-          <button id="storage-refresh" type="button">Refresh resource and storage use</button>
+          <section id="storage-settings" class="panel" aria-labelledby="storage-heading">
+            <div class="section-heading"><h2 id="storage-heading">Audio cache</h2><button id="storage-refresh" type="button" class="text-button">Refresh usage</button></div>
+            <div class="usage-block">
+              <p id="storage-usage" class="usage-value">—</p>
+              <div id="cache-meter" class="meter" role="meter" aria-label="Audio cache usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="meter-fill"></span></div>
+              <p id="storage-problem" class="inline-problem" role="status"></p>
+            </div>
+            <form id="storage-form" hidden>
+              <div class="form-grid"><label>Keep audio between plays<select id="cache-enabled"><option value="true">On</option><option value="false">Off</option></select></label><label>Cache limit <span class="label-unit">GB</span><input id="cache-limit" type="number" min="1" step="1" required></label></div>
+              <p class="hint">Reuses prepared audio to save conversion work.</p>
+              <details><summary>When caching is off</summary><p>The retained cache is cleared. Active streams still use temporary working storage.</p></details>
+              <div class="form-footer"><button id="cache-clear" type="button" class="quiet">Clear cache…</button><button type="submit" class="primary">Save changes</button></div>
+            </form>
+            <div id="cache-confirmation" class="confirmation" role="alertdialog" aria-labelledby="cache-confirm-title" aria-describedby="cache-confirm-message" hidden>
+              <h3 id="cache-confirm-title"></h3><p id="cache-confirm-message"></p>
+              <div class="actions"><button id="cache-cancel" type="button">Cancel</button><button id="cache-confirm" type="button" class="danger">Clear cached audio</button></div>
+            </div>
+          </section>
+          <section id="resource-settings" class="panel" aria-labelledby="resources-heading">
+            <div class="section-heading"><h2 id="resources-heading">Resources</h2><span id="resources-status" class="hint"></span></div>
+            <div class="usage-block">
+              <h3>Working storage</h3><p id="storage-working" class="usage-value">—</p>
+              <div id="working-meter" class="meter working-meter" role="meter" aria-label="Working storage usage" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><span class="meter-reserved"></span><span class="meter-fill"></span></div>
+              <p id="storage-reserved" class="hint"></p>
+            </div>
+            <form id="resources-form" hidden>
+              <div class="form-grid"><label>Simultaneous conversions<select id="resource-conversions"><option value="automatic">Automatic</option><option value="1">1</option><option value="2">2</option><option value="3">3</option><option value="4">4</option></select></label><label>Working storage limit <span class="label-unit">MB</span><input id="resource-working" type="number" min="128" step="1" required></label></div>
+              <details><summary>How these limits work</summary><p>Automatic chooses a conservative conversion limit for this machine. Cached audio does not use a conversion slot.</p><p>Working storage is separate from the retained cache. The lighter bar shows reserved capacity, including space not yet used. Lowering limits lets current work finish; new work waits or retries when capacity is full.</p></details>
+              <div class="form-footer"><button type="submit" class="primary">Save changes</button></div>
+            </form>
+          </section>
         </section>
-        <p class="preview">Development preview: authenticated audio is available with these connections. Storage and resource controls are available. The live dashboard and deployment packaging are still being built.</p>
       </section>
-      <footer><button id="logout" type="button">Sign out</button></footer>
     </section>
-    <noscript>This administration page needs JavaScript. Setup is also available through the Sidecar command line.</noscript>
+    <footer class="app-footer">Development preview</footer>
+    <noscript>This page needs JavaScript. Setup is also available through the Sidecar command line.</noscript>
   </main>
 </body>
 </html>

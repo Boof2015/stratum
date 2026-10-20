@@ -5,8 +5,9 @@ Checkpoint 4a connects the existing authenticated audio engine to the persistent
 now lead to an actual HTTPS audio endpoint. Checkpoint 4b adds
 [retained encoded segments and owner cache controls](owner-cache.md), and 4c
 adds [conversion limits and working-storage recovery](owner-resources.md).
-This is a development server: the live dashboard, deployment packaging and the
-production Astra discovery/enable flow are still subsequent work.
+The [live owner dashboard](owner-dashboard.md) reports activity and resource use.
+This is a development server: deployment packaging and the production Astra
+discovery/enable flow are still subsequent work.
 
 Build `sidecar` with the repository's Rust toolchain. Audio requires `ffmpeg` and
 `ffprobe` on PATH, with FFmpeg's `libopus` encoder. The service/worker implementation

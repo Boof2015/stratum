@@ -7,18 +7,20 @@ current four-playback service, not a claim of production capacity on every host.
 
 ## Owner controls
 
-After connection setup, the owner page's Resources group offers:
+After connection setup, **Settings → Resources** offers:
 
 - **Simultaneous conversions:** Automatic, or a custom maximum of 1–4.
-- **Temporary working-storage limit:** 512 MB by default, at least 128 MB.
+- **Working storage limit:** 512 MB by default, at least 128 MB.
   MB here means 1,000,000 bytes. This limit is separate from retained cache.
 - A snapshot of running/waiting jobs and the effective conversion limit.
 - Temporary bytes used and capacity reserved against the working limit.
-  **Refresh resource and storage use** updates these snapshots.
+  **Refresh usage** in the Audio cache section updates these snapshots without
+  replacing unsaved settings.
 
 Saving a lower limit does not stop current jobs or delete active files. New work
 must fit the new limit. Increasing it makes capacity available immediately.
-Neither change signs listeners out. The live dashboard remains a later step.
+Neither change signs listeners out. The [live dashboard](owner-dashboard.md)
+updates the readings while visible without overwriting edits to the controls.
 
 Equivalent commands, after owner enrollment:
 
@@ -148,5 +150,6 @@ That includes full-source inspection/hash work; it is not a portable throughput
 benchmark or a measurement of peak memory/disk use.
 
 Complete-source acquisition and the other [streaming limits](owner-streaming.md)
-remain. Progressive source reuse, live statistics, deployment packaging, wider
-machine validation, and production Astra discovery/enablement are separate work.
+remain. The [live dashboard](owner-dashboard.md) now reports activity. Progressive
+source reuse, deployment packaging, wider machine validation, and production
+Astra discovery/enablement are separate work.

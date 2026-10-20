@@ -12,6 +12,8 @@ and [discovery maintenance](docs/owner-discovery.md). It now serves the existing
 authenticated audio engine over HTTPS; see [streaming integration](docs/owner-streaming.md)
 for the development limits and [resource controls](docs/owner-resources.md) for
 conversion scheduling, working storage and crash recovery.
+The [live owner dashboard](docs/owner-dashboard.md) shows sessions, prepared
+streams, last sent quality, transfer rate and resource use.
 The loopback `sidecar-access` proof remains available.
 
 This repository contains **audio and delivery proofs of concept**, plus a development Sidecar server, not a finished deployment package. They generate independently decodable FLAC/Opus
@@ -219,7 +221,9 @@ The installed `sidecar` binary now provides owner setup, discovery publication
 and [authenticated HTTPS streaming](docs/owner-streaming.md), with a
 [retained encoded-segment cache and owner controls](docs/owner-cache.md) and
 [configurable resource limits](docs/owner-resources.md).
-Production Astra discovery/enable UI and deployment packaging remain in progress.
+The [owner dashboard](docs/owner-dashboard.md) updates activity and resource use
+while open. Production Astra discovery/enable UI and deployment packaging remain
+in progress.
 
 ## Checks
 

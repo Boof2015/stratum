@@ -9,7 +9,8 @@ remain a separate client integration step.
 
 ## Owner flow
 
-The saved-connections page offers **Publish discovery** or **Use manual setup**.
+The last setup step offers **Enable discovery** or **Use manual setup**. These
+controls are also available later in **Settings → Discovery**.
 Manual setup sends no announcement and asks for no Navidrome administrator
 credentials. Listener addresses remain available independently of publication;
 when the service is otherwise ready, publication failure must not block manual
@@ -30,7 +31,7 @@ Navidrome listeners can read it using their existing authenticated radio API.
 Other clients may display it as a radio station; it is not playable radio audio.
 The owner page explains that consequence before publication.
 
-- **Update or verify discovery** checks the saved station and updates its
+- **Update discovery** checks the saved station and updates its
   advertised values when needed. An already matching entry causes no write.
 - **Remove announcement** verifies ownership, removes that entry, reads the list
   again, and switches to manual setup. Unrelated radio stations are preserved.

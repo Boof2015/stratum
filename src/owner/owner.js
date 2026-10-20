@@ -7,11 +7,19 @@ let discoveryState = { revision: 'initial', status: 'not-published', hasAnnounce
 let discoveryAction = null;
 let storageState = null;
 let pendingStorage = null;
+let dashboardWanted = false;
+let dashboardEpoch = 0;
+let dashboardTimer = null;
+let dashboardAbort = null;
+let currentView = 'overview';
+let currentStep = null;
+let editingConnection = false;
 
-async function request(path, body) {
-  const response = await fetch(`/admin/api/${path}`, body === undefined ? {} : {
+async function request(path, body, signal) {
+  const options = body === undefined ? {} : {
     method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
-  });
+  };
+  const response = await fetch(`/admin/api/${path}`, { ...options, signal, cache: 'no-store' });
   const value = await response.json().catch(() => ({}));
   if (!response.ok) {
     const error = new Error(value.error || 'Sidecar could not complete the request. Try again.');
@@ -25,7 +33,8 @@ function controls() {
   document.querySelectorAll('button, input, select').forEach((control) => { control.disabled = busy; });
   element('add-address').disabled = busy || element('addresses').children.length >= 16;
   document.querySelectorAll('.remove-address').forEach((button) => {
-    button.disabled = busy || element('addresses').children.length === 1;
+    button.disabled = busy;
+    button.hidden = element('addresses').children.length === 1;
   });
 }
 async function operate(action) {
@@ -44,69 +53,132 @@ async function operate(action) {
     }
   } finally { busy = false; controls(); }
 }
+function selectView(view, focus = false) {
+  if (currentView === 'settings' && view !== 'settings') clearDiscoveryForm();
+  if (currentView !== view) { element('message').textContent = ''; element('reload').hidden = true; }
+  currentView = view;
+  for (const name of ['overview', 'settings']) {
+    element(`${name}-panel`).hidden = name !== view;
+    if (name === view) element(`nav-${name}`).setAttribute('aria-current', 'page');
+    else element(`nav-${name}`).removeAttribute('aria-current');
+  }
+  element('title').textContent = view === 'overview' ? 'Overview' : 'Settings';
+  element('description').textContent = '';
+  dashboardWanted = currentStep === 'summary' && view === 'overview';
+  stopDashboard();
+  if (dashboardWanted && !document.hidden) startDashboard();
+  if (focus) element('title').focus();
+}
 function showStep(step) {
+  stopDashboard();
+  dashboardWanted = false;
+  currentStep = step;
   element('owner-form').hidden = true;
   element('ready').hidden = false;
-  for (const name of ['navidrome', 'listeners', 'summary']) element(`${name}-section`).hidden = step !== name;
+  element('logout').hidden = false;
+  element('app').classList.toggle('setup-layout', step !== 'summary');
+  element('page-nav').hidden = step !== 'summary';
+  element('setup-progress').hidden = step === 'summary' || editingConnection;
+  const steps = ['navidrome', 'listeners', 'discovery'];
+  document.querySelectorAll('[data-step]').forEach((item, index) => {
+    const active = item.dataset.step === step;
+    if (active) item.setAttribute('aria-current', 'step');
+    else item.removeAttribute('aria-current');
+    const done = index < steps.indexOf(step);
+    item.classList.toggle('complete', done);
+    item.querySelector('.step-number').textContent = done ? '✓' : String(index + 1);
+  });
+  for (const name of ['navidrome', 'listeners', 'discovery', 'summary']) element(`${name}-section`).hidden = step !== name;
+  element(step === 'discovery' ? 'discovery-section' : 'discovery-settings-slot').append(element('discovery-panel'));
+  element('discovery-back-row').hidden = step !== 'discovery';
+  element('discovery-heading').hidden = step === 'discovery';
   const headings = {
-    navidrome: ['Connect Navidrome', 'Enter the address Sidecar can reach, including any path such as /music.'],
-    listeners: ['How will listeners reach Sidecar?', 'Add the addresses you plan to use in Astra. The first is the primary address.'],
-    summary: ['Connections saved', 'You can return here to change or check these settings.'],
+    navidrome: ['Connect Navidrome', ''],
+    listeners: ['Listener connections', ''],
+    discovery: ['Discovery', ''],
   };
-  element('title').textContent = headings[step][0];
-  element('description').textContent = headings[step][1];
+  if (headings[step]) {
+    element('title').textContent = headings[step][0];
+    element('description').textContent = headings[step][1];
+  }
+  element('cancel-navidrome').hidden = !editingConnection;
+  element('navidrome-save').textContent = editingConnection ? 'Check and save' : 'Check and continue';
+  element('back-navidrome').textContent = editingConnection ? 'Cancel' : 'Back';
+  element('listeners-save').textContent = editingConnection ? 'Save changes' : 'Continue';
   if (step === 'navidrome') element('navidrome-url').value = saved.settings.navidrome_url || '';
   if (step === 'listeners') {
     element('addresses').replaceChildren();
     const listeners = saved.settings.listeners;
     for (const endpoint of listeners.length ? listeners : [{ url: '', trust: 'sidecar_key' }]) addAddress(endpoint);
   }
+  if (editingConnection && step === 'navidrome') element('title').textContent = 'Change Navidrome address';
+  if (editingConnection && step === 'listeners') element('title').textContent = 'Listener connections';
   clearDiscoveryForm();
   cancelStorage();
+  renderDiscovery();
   if (step === 'summary') {
+    editingConnection = false;
     renderStorage();
-    renderDiscovery();
     element('saved-navidrome').textContent = saved.settings.navidrome_url;
     element('saved-addresses').replaceChildren();
     saved.settings.listeners.forEach((endpoint, index) => {
       const row = document.createElement('li');
-      row.textContent = `${index === 0 ? 'Primary: ' : ''}${endpoint.url} — ${endpoint.trust === 'sidecar_key' ? 'Direct to Sidecar' : 'HTTPS reverse proxy'}`;
-      element('saved-addresses').append(row);
+      row.append(document.createTextNode(endpoint.url));
+      const note = document.createElement('span'); note.className = 'hint';
+      note.textContent = `${index === 0 ? 'Primary · ' : ''}${endpoint.trust === 'sidecar_key' ? 'Direct to Sidecar' : 'Reverse proxy'}`;
+      row.append(note); element('saved-addresses').append(row);
     });
+    selectView(currentView);
   }
   controls();
+  element('title').focus();
 }
 function resume(value) {
   saved = value.setup;
   if (value.storage) storageState = value.storage;
   if (value.discovery) discoveryState = value.discovery;
   else if (discoveryState.hasAnnouncement) discoveryState = { ...discoveryState, status: 'update-needed' };
-  showStep(value.stage === 'connections-saved' ? 'summary' : value.stage);
+  let step = value.stage;
+  if (step === 'connections-saved') {
+    const discoveryDone = ['manual', 'published'].includes(discoveryState.status);
+    const needsDiscovery = !discoveryDone && (!discoveryState.hasAnnouncement || currentStep === 'discovery');
+    step = !editingConnection && needsDiscovery ? 'discovery' : 'summary';
+  }
+  showStep(step);
 }
 function addAddress(endpoint = { url: '', trust: 'sidecar_key' }) {
-  const row = document.createElement('fieldset');
-  row.className = 'address-row';
+  const row = document.createElement('fieldset'); row.className = 'address-row';
   const legend = document.createElement('legend');
-  const label = document.createElement('label');
-  label.textContent = 'Listener address';
+  const choiceLabel = document.createElement('span'); choiceLabel.className = 'field-caption'; choiceLabel.textContent = 'Connection';
+  const modes = document.createElement('div'); modes.className = 'connection-choice'; modes.setAttribute('role', 'group'); modes.setAttribute('aria-label', 'Connection type');
+  const select = document.createElement('select'); select.hidden = true; select.setAttribute('aria-label', 'Connection type');
+  const hint = document.createElement('p'); hint.className = 'hint connection-hint';
+  const label = document.createElement('label'); label.textContent = 'Listener address';
   const input = document.createElement('input');
   input.type = 'url'; input.required = true; input.maxLength = 1024; input.value = endpoint.url;
-  input.placeholder = 'https://sidecar.home.lan:7843'; input.autocomplete = 'off'; input.spellcheck = false;
-  label.append(input);
-  const modeLabel = document.createElement('label');
-  modeLabel.textContent = 'Connection';
-  const select = document.createElement('select');
-  for (const [value, text] of [['sidecar_key', 'Direct to Sidecar'], ['https_proxy', 'Through an HTTPS reverse proxy']]) {
-    const option = document.createElement('option'); option.value = value; option.textContent = text; select.append(option);
+  input.autocomplete = 'off'; input.spellcheck = false; label.append(input);
+  const pathHint = document.createElement('span'); pathHint.className = 'hint'; pathHint.textContent = 'Include the path your proxy uses, such as /stratum.'; label.append(pathHint);
+  function updateMode() {
+    const proxy = select.value === 'https_proxy';
+    for (const button of modes.children) button.setAttribute('aria-pressed', String(button.dataset.mode === select.value));
+    hint.textContent = proxy ? 'Your proxy handles the HTTPS connection.' : 'Listeners connect straight to Sidecar.';
+    input.placeholder = proxy ? 'https://music.example.com/stratum' : 'https://sidecar.home.lan:7843';
+    pathHint.hidden = !proxy;
   }
-  select.value = endpoint.trust;
-  modeLabel.append(select);
+  for (const [value, text] of [['sidecar_key', 'Direct to Sidecar'], ['https_proxy', 'Reverse proxy']]) {
+    const option = document.createElement('option'); option.value = value; option.textContent = text; select.append(option);
+    const button = document.createElement('button'); button.type = 'button'; button.textContent = text; button.dataset.mode = value;
+    button.addEventListener('click', () => { select.value = value; updateMode(); }); modes.append(button);
+  }
+  select.value = endpoint.trust; select.addEventListener('change', updateMode); updateMode();
   const remove = document.createElement('button');
-  remove.type = 'button'; remove.className = 'remove-address'; remove.textContent = 'Remove address';
-  remove.addEventListener('click', () => { row.remove(); numberAddresses(); controls(); });
-  row.append(legend, label, modeLabel, remove);
-  element('addresses').append(row);
-  numberAddresses(); controls();
+  remove.type = 'button'; remove.className = 'remove-address quiet'; remove.textContent = 'Remove';
+  remove.addEventListener('click', () => {
+    const previous = row.previousElementSibling || row.nextElementSibling;
+    row.remove(); numberAddresses(); controls(); previous?.querySelector('input').focus();
+  });
+  row.append(legend, choiceLabel, modes, hint, label, select, remove);
+  element('addresses').append(row); numberAddresses(); controls();
 }
 function numberAddresses() {
   [...element('addresses').children].forEach((row, index) => {
@@ -114,9 +186,14 @@ function numberAddresses() {
   });
 }
 async function refresh() {
+  dashboardWanted = false;
+  stopDashboard();
   element('retry').hidden = true;
   element('owner-form').hidden = true;
   element('ready').hidden = true;
+  element('page-nav').hidden = true;
+  element('setup-progress').hidden = true;
+  element('logout').hidden = true;
   clearDiscoveryForm();
   try {
     const status = await request('status');
@@ -126,16 +203,18 @@ async function refresh() {
       catch (error) { if (error.status !== 401) throw error; }
     }
     saved = null;
+    currentStep = null; currentView = 'overview'; editingConnection = false;
+    element('app').classList.add('setup-layout');
     storageState = null;
     cancelStorage();
-    element('title').textContent = needsOwner ? 'Make Sidecar yours' : 'Welcome back';
-    element('description').textContent = needsOwner
-      ? 'Enter the setup code from your server’s terminal or container logs, then choose a password of at least 12 characters.'
-      : 'Sign in with your Sidecar administration password.';
+    element('title').textContent = needsOwner ? 'Set up Sidecar' : 'Sign in';
+    element('description').textContent = '';
+    element('password-help').hidden = !needsOwner;
+    element('password').minLength = needsOwner ? 12 : 1;
     element('code-label').hidden = !needsOwner; element('code').required = needsOwner;
     element('confirm-label').hidden = !needsOwner; element('confirm').required = needsOwner;
     element('password').autocomplete = needsOwner ? 'new-password' : 'current-password';
-    element('submit').textContent = needsOwner ? 'Create owner password' : 'Sign in';
+    element('submit').textContent = needsOwner ? 'Set password' : 'Sign in';
     element('owner-form').hidden = false;
   } catch (error) {
     element('title').textContent = 'Couldn’t open Sidecar';
@@ -163,9 +242,8 @@ element('navidrome-form').addEventListener('submit', (event) => {
       const value = await request('setup/navidrome', { revision: saved.revision, url: element('navidrome-url').value });
       saved = value.setup;
       if (discoveryState.hasAnnouncement) discoveryState = { ...discoveryState, status: 'update-needed' };
-      showStep(saved.settings.listeners.length ? 'summary' : 'listeners');
-      element('message').textContent = 'Navidrome detected. Sign-in has not been checked.';
-    } finally { element('navidrome-save').textContent = 'Check and continue'; }
+      resume({ setup: saved, stage: saved.settings.listeners.length ? 'connections-saved' : 'listeners', discovery: discoveryState });
+    } finally { element('navidrome-save').textContent = editingConnection ? 'Check and save' : 'Check and continue'; }
   });
 });
 element('listeners-form').addEventListener('submit', (event) => {
@@ -178,33 +256,56 @@ element('listeners-form').addEventListener('submit', (event) => {
   });
 });
 element('add-address').addEventListener('click', () => { addAddress(); element('addresses').lastElementChild.querySelector('input').focus(); });
-for (const [id, step] of [['edit-navidrome', 'navidrome'], ['back-navidrome', 'navidrome'], ['edit-listeners', 'listeners']]) {
-  element(id).addEventListener('click', () => { element('message').textContent = ''; element('reload').hidden = true; showStep(step); });
+for (const [id, step] of [['edit-navidrome', 'navidrome'], ['edit-listeners', 'listeners']]) {
+  element(id).addEventListener('click', () => {
+    editingConnection = true; element('message').textContent = ''; element('reload').hidden = true;
+    showStep(step); element('title').focus();
+  });
+}
+for (const id of ['back-navidrome', 'cancel-navidrome']) element(id).addEventListener('click', () => {
+  element('message').textContent = ''; element('reload').hidden = true;
+  showStep(editingConnection ? 'summary' : 'navidrome'); element('title').focus();
+});
+element('back-listeners').addEventListener('click', () => { showStep('listeners'); element('title').focus(); });
+for (const view of ['overview', 'settings']) element(`nav-${view}`).addEventListener('click', () => selectView(view, true));
+element('brand').addEventListener('click', (event) => { event.preventDefault(); if (currentStep === 'summary' && !busy) selectView('overview', true); });
+for (const [id, target] of [['manage-storage', 'storage-settings'], ['health-settings', 'connection-settings'], ['discovery-settings', 'discovery-panel']]) {
+  element(id).addEventListener('click', () => {
+    selectView('settings'); const heading = element(target).querySelector('h2');
+    heading.tabIndex = -1; heading.focus(); heading.scrollIntoView({ block: 'start' });
+  });
 }
 element('check-again').addEventListener('click', () => operate(async () => {
   await request('setup/check', { url: saved.settings.navidrome_url });
-  element('message').textContent = 'Navidrome detected. Sign-in has not been checked.';
+  element('message').textContent = 'Navidrome is reachable.';
 }));
-element('logout').addEventListener('click', () => operate(async () => { await request('logout', {}); saved = null; await refresh(); }));
+element('logout').addEventListener('click', () => operate(async () => {
+  dashboardWanted = false; stopDashboard();
+  await request('logout', {}); saved = null; await refresh();
+}));
 for (const id of ['retry', 'reload']) element(id).addEventListener('click', () => operate(refresh));
 function clearDiscoveryForm() {
   discoveryAction = null;
   element('discovery-form').reset();
   element('discovery-form').hidden = true;
+  element('discovery-actions').hidden = false;
 }
 function renderDiscovery() {
   const labels = {
-    'not-published': 'Choose automatic discovery or manual address setup.',
-    manual: 'Manual address setup selected. No announcement is published.',
-    published: 'Announcement published and verified on Navidrome.',
+    'not-published': 'Discovery is not enabled yet.',
+    manual: 'Manual setup',
+    published: 'Discovery enabled',
     'update-needed': 'The announcement needs updating to match the saved connections.',
     unverified: 'An earlier change needs verification. Retry to check what reached Navidrome.',
     problem: 'Discovery needs attention.',
   };
   element('discovery-status').textContent = labels[discoveryState.status] || labels['not-published'];
+  const needsAttention = !!discoveryState.error || ['update-needed', 'unverified', 'problem'].includes(discoveryState.status);
+  element('overview-discovery-notice').hidden = !needsAttention;
+  element('overview-discovery-message').textContent = needsAttention ? labels[discoveryState.status] || 'Discovery needs attention.' : '';
   element('discovery-error').textContent = discoveryState.error || '';
   element('publish-discovery').hidden = discoveryState.pendingAction === 'remove';
-  element('publish-discovery').textContent = discoveryState.canRecreate ? 'Recreate announcement' : discoveryState.hasAnnouncement ? 'Update or verify discovery' : discoveryState.error ? 'Retry publication' : 'Publish discovery';
+  element('publish-discovery').textContent = discoveryState.canRecreate ? 'Recreate announcement' : discoveryState.hasAnnouncement ? 'Update discovery' : discoveryState.error ? 'Try again' : 'Enable discovery';
   element('manual-discovery').hidden = discoveryState.hasAnnouncement || discoveryState.status === 'manual';
   element('remove-discovery').hidden = !discoveryState.hasAnnouncement;
   element('remove-discovery').textContent = discoveryState.pendingAction === 'remove' ? 'Retry removal' : 'Remove announcement';
@@ -213,7 +314,11 @@ function showDiscoveryForm(action) {
   clearDiscoveryForm(); discoveryAction = action;
   const target = action === 'remove' ? discoveryState.target : saved.settings.navidrome_url;
   element('discovery-target').textContent = `Sign in to Navidrome at ${target}`;
-  element('discovery-submit').textContent = action === 'remove' ? 'Remove announcement' : discoveryState.canRecreate ? 'Recreate announcement' : 'Publish discovery';
+  element('discovery-effect').textContent = action === 'remove'
+    ? 'Removes Sidecar’s entry from Navidrome’s internet radio list.'
+    : 'Adds or updates a Stratum entry in Navidrome’s internet radio list. Other apps may show it as a radio station.';
+  element('discovery-submit').textContent = action === 'remove' ? 'Remove announcement' : discoveryState.canRecreate ? 'Recreate announcement' : 'Enable discovery';
+  element('discovery-actions').hidden = true;
   element('discovery-form').hidden = false;
   element('navidrome-admin').focus();
 }
@@ -244,7 +349,22 @@ element('discovery-form').addEventListener('submit', (event) => {
   });
 });
 function storageBytes(value) {
-  return `${(value / 1e9).toLocaleString(undefined, { maximumFractionDigits: 3 })} GB`;
+  const unit = value >= 1e9 ? 'GB' : 'MB';
+  return `${(value / (unit === 'GB' ? 1e9 : 1e6)).toLocaleString(undefined, { maximumFractionDigits: 2 })} ${unit}`;
+}
+function usageText(id, used, limit) {
+  const node = element(id); node.replaceChildren(document.createTextNode(storageBytes(used)));
+  const capacity = document.createElement('span'); capacity.className = 'capacity'; capacity.textContent = ` / ${storageBytes(limit)}`; node.append(capacity);
+}
+function usageMeter(id, used, limit, reserved = 0) {
+  const meter = element(id);
+  const percent = Math.min(100, Math.max(0, limit > 0 ? used / limit * 100 : 0));
+  meter.querySelector('.meter-fill').style.width = `${percent}%`;
+  const reserve = meter.querySelector('.meter-reserved');
+  if (reserve) reserve.style.width = `${Math.min(100, Math.max(0, limit > 0 ? reserved / limit * 100 : 0))}%`;
+  meter.setAttribute('aria-valuenow', String(percent));
+  meter.setAttribute('aria-valuetext', `${storageBytes(used)} used of ${storageBytes(limit)}${reserve ? `; ${storageBytes(reserved)} reserved` : ''}`);
+  meter.dataset.over = String(used > limit);
 }
 function cancelStorage() {
   pendingStorage = null;
@@ -254,20 +374,32 @@ function renderStorage() {
   element('storage-form').hidden = !storageState;
   element('resources-form').hidden = !storageState?.resources;
   if (!storageState) return;
-  const { settings, cache, working_bytes: working } = storageState;
-  element('storage-usage').textContent = `Cached audio: ${storageBytes(cache.retained_bytes)} / ${storageBytes(settings.limit_bytes)}`;
-  element('storage-working').textContent = `Temporary storage for active streams: ${storageBytes(working)}`;
-  element('storage-problem').textContent = cache.problem
-    ? 'Cache changes are waiting for storage access. Sidecar will retry; playback can continue without retention.' : '';
+  renderStorageUsage(storageState);
+  const { settings } = storageState;
   element('cache-enabled').value = String(settings.enabled);
   element('cache-limit').value = String(settings.limit_bytes / 1e9);
   if (storageState.resources) {
-    const { resources, runtime } = storageState;
+    const { resources } = storageState;
     element('resource-conversions').value = resources.max_conversions === null ? 'automatic' : String(resources.max_conversions);
     element('resource-working').value = String(resources.working_bytes / 1e6);
+  }
+}
+function renderStorageUsage(state) {
+  const { settings, cache, working_bytes: working } = state;
+  for (const id of ['storage-usage', 'overview-cache-usage']) usageText(id, cache.retained_bytes, settings.limit_bytes);
+  for (const id of ['cache-meter', 'overview-cache-meter']) usageMeter(id, cache.retained_bytes, settings.limit_bytes);
+  element('overview-cache-state').textContent = settings.enabled ? 'On' : 'Off';
+  const problem = cache.problem ? 'Cache storage is unavailable. Sidecar will retry.' : '';
+  element('storage-problem').textContent = problem;
+  element('overview-storage-problem').textContent = problem;
+  element('overview-storage-problem').hidden = !problem;
+  if (state.resources) {
+    const { resources, runtime } = state;
     const jobs = runtime.conversions;
     element('resources-status').textContent = `${jobs.running} running · ${jobs.waiting} waiting · limit ${jobs.limit}${resources.max_conversions === null ? ' (Automatic)' : ''}`;
-    element('storage-working').textContent = `Temporary storage: ${storageBytes(working)} used · ${storageBytes(runtime.working.reserved_bytes)} reserved / ${storageBytes(resources.working_bytes)} limit`;
+    for (const id of ['storage-working', 'overview-working-usage']) usageText(id, working, resources.working_bytes);
+    for (const id of ['working-meter', 'overview-working-meter']) usageMeter(id, working, resources.working_bytes, runtime.working.reserved_bytes);
+    for (const id of ['storage-reserved', 'overview-reserved']) element(id).textContent = `${storageBytes(runtime.working.reserved_bytes)} reserved · temporary`;
   }
 }
 function confirmStorage(body) {
@@ -314,7 +446,8 @@ element('cache-confirm').addEventListener('click', () => {
   if (pendingStorage) operate(() => saveStorage({ ...pendingStorage, confirmed: true }));
 });
 element('storage-refresh').addEventListener('click', () => operate(async () => {
-  storageState = await request('storage'); cancelStorage(); renderStorage();
+  // Refresh readings only: drafts and their original save revisions stay intact.
+  renderStorageUsage(await request('storage'));
 }));
 element('resources-form').addEventListener('submit', (event) => {
   event.preventDefault();
@@ -331,8 +464,103 @@ element('resources-form').addEventListener('submit', (event) => {
     try {
       storageState = await request('resources', body);
       cancelStorage();
-      element('message').textContent = 'Resource settings saved. Current playback and jobs are protected.';
+      element('message').textContent = 'Resource settings saved.';
     } finally { renderStorage(); }
   });
 });
+function stopDashboard() {
+  dashboardEpoch++;
+  clearTimeout(dashboardTimer);
+  dashboardAbort?.abort();
+  dashboardAbort = null;
+}
+function renderDashboard(value) {
+  const clients = value.activity.clients;
+  element('live-clients').textContent = String(clients.length);
+  element('live-streams').textContent = String(clients.reduce((n, client) => n + client.streams.length, 0));
+  const rate = value.bytes_per_second;
+  element('live-rate').textContent = rate >= 1e6 ? `${(rate / 1e6).toFixed(2)} MB/s`
+    : rate >= 1000 ? `${(rate / 1000).toFixed(1)} kB/s` : `${rate} B/s`;
+  const jobs = value.storage.runtime.conversions;
+  element('live-jobs').textContent = String(jobs.running);
+  element('live-waiting').textContent = jobs.waiting ? `${jobs.waiting} waiting` : 'None waiting';
+  element('live-health').textContent = value.ready ? 'Running' : 'Setup incomplete';
+  element('live-health').dataset.state = value.ready ? 'good' : 'problem';
+  const health = value.navidrome;
+  element('live-navidrome').textContent = health.status === 'responding' ? 'Online'
+    : health.status === 'problem' ? 'Connection problem' : health.status === 'checking' ? 'Checking…' : 'Not configured';
+  element('live-navidrome').dataset.state = health.status === 'responding' ? 'good' : health.status === 'problem' ? 'problem' : 'checking';
+  element('live-checked').textContent = health.checked_seconds_ago === undefined ? '' : `Checked ${health.checked_seconds_ago}s ago`;
+  element('live-connection-error').hidden = health.status !== 'problem';
+  element('live-connection-error').textContent = health.status === 'problem' ? `${health.message || 'Couldn’t reach Navidrome.'}${health.http_status ? ` (HTTP ${health.http_status})` : ''}` : '';
+  const list = element('live-list');
+  list.replaceChildren();
+  if (!clients.length) {
+    const item = document.createElement('li'); item.className = 'empty-state'; item.textContent = 'No listener sessions.'; list.append(item);
+  }
+  const qualities = { lossless: 'Original (lossless)', 'opus-64': 'Opus 64 kbps', 'opus-128': 'Opus 128 kbps' };
+  for (const client of clients) {
+    const item = document.createElement('li');
+    const name = document.createElement('strong'); name.textContent = `Session ${client.id}`; item.append(name);
+    for (const stream of client.streams) {
+      const line = document.createElement('p'); line.className = 'stream-line';
+      const streamName = document.createElement('span'); streamName.textContent = `Stream ${stream.id}`;
+      const quality = document.createElement('span'); quality.className = 'stream-quality';
+      quality.textContent = qualities[stream.quality] || 'Prepared; no audio sent yet';
+      if (stream.quality) {
+        const sent = document.createElement('span'); sent.className = 'hint'; sent.textContent = `Sent ${stream.sent_seconds_ago}s ago`; quality.append(sent);
+      }
+      line.append(streamName, quality); item.append(line);
+    }
+    if (!client.streams.length) {
+      const line = document.createElement('p'); line.className = 'stream-line'; line.textContent = 'No open stream'; item.append(line);
+    }
+    list.append(item);
+  }
+  renderStorageUsage(value.storage);
+  element('dashboard-status').textContent = 'Live · every 2s';
+  element('dashboard-status').dataset.state = 'live';
+}
+function startDashboard() {
+  stopDashboard();
+  if (!dashboardWanted || document.hidden) return;
+  const epoch = dashboardEpoch;
+  element('dashboard-status').textContent = element('live-clients').textContent === '—'
+    ? 'Loading…' : 'Refreshing…';
+  element('dashboard-status').dataset.state = 'stale';
+  const poll = async () => {
+    if (epoch !== dashboardEpoch || !dashboardWanted || document.hidden) return;
+    if (!busy) {
+      const controller = new AbortController();
+      dashboardAbort = controller;
+      const timeout = setTimeout(() => controller.abort(), 8000);
+      try {
+        const value = await request('dashboard', undefined, controller.signal);
+        if (epoch === dashboardEpoch) renderDashboard(value);
+      } catch (error) {
+        if (epoch !== dashboardEpoch) return;
+        element('dashboard-status').textContent = 'Out of date · retrying…';
+        element('dashboard-status').dataset.state = 'stale';
+        if (error.status === 401 && !busy) {
+          dashboardWanted = false; stopDashboard();
+          await operate(refresh);
+          return;
+        }
+      } finally {
+        clearTimeout(timeout);
+        if (dashboardAbort === controller) dashboardAbort = null;
+      }
+    }
+    if (epoch === dashboardEpoch) dashboardTimer = setTimeout(poll, 2000);
+  };
+  poll();
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden) {
+    stopDashboard();
+    element('dashboard-status').textContent = 'Updates paused';
+  } else if (dashboardWanted) startDashboard();
+});
+window.addEventListener('pagehide', stopDashboard);
+window.addEventListener('pageshow', () => { if (dashboardWanted) startDashboard(); });
 operate(refresh);
