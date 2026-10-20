@@ -1,0 +1,36 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Sidecar</title>
+  <link rel="stylesheet" href="/owner.css">
+  <script src="/owner.js" defer></script>
+</head>
+<body>
+  <main>
+    <p class="eyebrow">ASTRA SIDECAR</p>
+    <h1 id="title">Connecting…</h1>
+    <p id="description">Opening your server’s administration page.</p>
+    <form id="owner-form" hidden>
+      <label id="code-label" hidden>Setup code
+        <input id="code" name="code" autocomplete="off" spellcheck="false" maxlength="64">
+      </label>
+      <label>Password
+        <input id="password" name="password" type="password" autocomplete="current-password" required>
+      </label>
+      <label id="confirm-label" hidden>Confirm password
+        <input id="confirm" name="confirm" type="password" autocomplete="new-password">
+      </label>
+      <button id="submit" type="submit">Sign in</button>
+    </form>
+    <p id="message" role="status" aria-live="polite"></p>
+    <button id="retry" type="button" hidden>Try again</button>
+    <section id="ready" hidden>
+      <p>Your owner password is set. Server connection setup is not available in this preview yet.</p>
+      <button id="logout" type="button">Sign out</button>
+    </section>
+    <noscript>This administration page needs JavaScript. Owner setup is also available through the Sidecar command line.</noscript>
+  </main>
+</body>
+</html>

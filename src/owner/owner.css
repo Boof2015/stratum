@@ -1,0 +1,15 @@
+:root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+* { box-sizing: border-box; }
+body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; }
+main { width: 100%; max-width: 460px; }
+.eyebrow { font-size: .75rem; letter-spacing: .18em; opacity: .65; }
+h1 { font-size: 2rem; font-weight: 600; }
+p { line-height: 1.6; }
+form { margin-block: 28px; }
+label { display: block; margin-block: 20px; font-size: .9rem; }
+input { display: block; width: 100%; margin-top: 8px; padding: 12px; border: 1px solid GrayText; border-radius: 8px; font: inherit; }
+button { padding: 11px 18px; border: 1px solid GrayText; border-radius: 8px; font: inherit; cursor: pointer; }
+button:disabled { opacity: .6; cursor: wait; }
+:focus-visible { outline: 3px solid #29a4d1; outline-offset: 3px; }
+#message { min-height: 1.6em; }
+[hidden] { display: none !important; }
