@@ -8,11 +8,11 @@ The separate `sidecar` binary now provides **persistent owner setup**: HTTPS
 identity, browser/terminal password setup, recovery, and resumable Navidrome and
 listener-address configuration, and optional discovery publication. See
 [owner access](docs/owner-foundation.md), [connection setup](docs/owner-setup.md)
-and [discovery maintenance](docs/owner-discovery.md). It does not yet serve music
-or replace the existing `sidecar-access` proof.
+and [discovery maintenance](docs/owner-discovery.md). It now serves the existing
+authenticated audio engine over HTTPS; see [streaming integration](docs/owner-streaming.md)
+for the development limits. The loopback `sidecar-access` proof remains available.
 
-This repository contains **audio and delivery proofs of concept**, not a deployed
-server or an Astra integration. They generate independently decodable FLAC/Opus
+This repository contains **audio and delivery proofs of concept**, plus a development Sidecar server, not a finished deployment package. They generate independently decodable FLAC/Opus
 segments, trim them onto one sample timeline, acquire source intervals from a
 disposable Navidrome, and test delivery against a real-time consumption clock.
 

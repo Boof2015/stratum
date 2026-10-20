@@ -31,5 +31,4 @@ rpassword = "7"
 subtle = "2"
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 
-[dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

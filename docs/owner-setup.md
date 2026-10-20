@@ -2,9 +2,9 @@
 
 Checkpoint 2 adds a resumable Navidrome/listener setup flow to the `sidecar`
 binary. Start with [owner access and HTTPS enrollment](owner-foundation.md).
-This remains a development preview: saving connections does **not** publish a
-radio announcement or start serving music. [Discovery publication](owner-discovery.md)
-is now a separate optional step; music serving is still a subsequent checkpoint.
+This remains a development preview. Saved connections now enable
+[authenticated HTTPS audio](owner-streaming.md). [Discovery publication](owner-discovery.md)
+is a separate optional step; saving connections does not publish an announcement.
 
 ## Browser flow
 
@@ -29,15 +29,16 @@ After owner sign-in:
 Direct addresses record `sidecar_key`, for verification against Sidecar's
 persistent SPKI identity. Proxy addresses record `https_proxy`, for normal
 HTTPS certificate/hostname verification and explicit trust in the owner's
-proxy. This checkpoint stores that distinction; the streaming/discovery layer
-will enforce it when connected. A failed direct-key check must never silently
+proxy. This records the policy a compatible client must enforce; production
+Astra endpoint selection is still a separate integration step. A failed direct-key check must never silently
 fall back to proxy trust.
 
 Listener addresses are **separate from administration origins**. Saving them
 neither changes the bound port nor reconfigures the administration allowlist,
 certificate, DNS, container network or reverse proxy. The existing admin page
-is still hosted at `/`, not a proxy subpath. Listener paths are saved for later
-streaming/discovery use. Nothing is announced to Navidrome during this flow.
+is still hosted at `/`, not a proxy subpath. A listener base path is stripped by
+the reverse proxy before forwarding to Sidecar (see the streaming guide).
+Nothing is announced to Navidrome during this flow.
 
 ## Terminal/config alternative
 

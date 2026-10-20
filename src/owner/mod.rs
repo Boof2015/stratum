@@ -1,6 +1,7 @@
 //! Persistent owner-access foundation. Listener credentials and the experimental
 //! audio service remain separate; these cookies never authorize music access.
 pub mod discovery;
+mod listener;
 pub mod setup;
 mod store;
 pub use store::{validate_password, Config, Identity, Store};
@@ -38,6 +39,7 @@ struct Inner {
     work: Arc<Semaphore>,
     probes: Semaphore,
     probe: setup::Probe,
+    listener: listener::Listener,
 }
 #[derive(Clone)]
 struct Session {
@@ -90,6 +92,7 @@ impl Service {
     pub fn new(store: Store) -> anyhow::Result<Self> {
         let config = store.config()?;
         Ok(Self(Arc::new(Inner {
+            listener: listener::Listener::new(store.clone())?,
             store,
             config,
             sessions: Mutex::new(HashMap::new()),
@@ -132,6 +135,7 @@ impl Service {
             .layer(DefaultBodyLimit::max(32768))
             .layer(middleware::from_fn_with_state(self.clone(), boundary))
             .with_state(self.clone())
+            .nest("/stratum", self.0.listener.router())
     }
 
     async fn disk<T: Send + 'static>(
@@ -427,14 +431,7 @@ async fn change_discovery(
         })
         .await?;
     if body.action == "manual" {
-        operation.manual().map_err(|error| {
-            Failure::Discovery(
-                error
-                    .downcast_ref::<discovery::Error>()
-                    .copied()
-                    .unwrap_or(discovery::Error::Storage),
-            )
-        })?;
+        service.disk(move |_| operation.manual()).await?;
     } else {
         let action = if body.action == "publish" {
             discovery::Action::Publish
@@ -442,11 +439,17 @@ async fn change_discovery(
             discovery::Action::Remove
         };
         let expiry = session.expires.saturating_duration_since(Instant::now());
-        let result = tokio::select! {
-            _=tokio::time::sleep(expiry)=>Err(discovery::Error::Interrupted),
-            result=operation.run(action,discovery::Credentials {username:body.username,password:body.password},body.recreate,session.cancellation)=>result,
-        };
-        result.map_err(Failure::Discovery)?;
+        let cancellation = session.cancellation.child_token();
+        let _cancel_on_drop = cancellation.clone().drop_guard();
+        let runtime = tokio::runtime::Handle::current();
+        // Publication mixes network work with locked, durable filesystem writes.
+        // Keep those writes (including lock waits) off the audio runtime threads.
+        service.disk(move |_| runtime.block_on(async move {
+            tokio::select! {
+                _=tokio::time::sleep(expiry)=>Err(discovery::Error::Interrupted),
+                result=operation.run(action,discovery::Credentials {username:body.username,password:body.password},body.recreate,cancellation)=>result,
+            }.map_err(anyhow::Error::from)
+        })).await?;
     }
     setup_state(State(service), headers).await
 }
@@ -551,12 +554,27 @@ pub async fn serve(
     listener.set_nonblocking(true)?;
     let tls = axum_server::tls_rustls::RustlsConfig::from_config(service.0.store.tls_config()?);
     let handle = axum_server::Handle::new();
+    let mut server = axum_server::from_tcp_rustls(listener, tls)?
+        .map(|acceptor| {
+            acceptor
+                .handshake_timeout(Duration::from_secs(10))
+                .acceptor(crate::access::transport::BoundedAcceptor::new(
+                    64,
+                    Duration::from_secs(60),
+                ))
+        })
+        .http1_only();
     let stopping = handle.clone();
+    let listener = service.0.listener.clone();
     let stop = tokio::spawn(async move {
         shutdown.cancelled().await;
+        listener.stop().await;
         stopping.graceful_shutdown(Some(Duration::from_secs(5)));
     });
-    let mut server = axum_server::from_tcp_rustls(listener, tls)?.http1_only();
+    let maintenance_stop = CancellationToken::new();
+    let maintenance_token = maintenance_stop.clone();
+    let listener = service.0.listener.clone();
+    let maintenance = tokio::spawn(async move { listener.maintain(maintenance_token).await });
     server
         .http_builder()
         .http1()
@@ -568,7 +586,11 @@ pub async fn serve(
         .handle(handle)
         .serve(service.router().into_make_service())
         .await;
+    service.0.listener.stop().await;
+    maintenance_stop.cancel();
+    let _ = maintenance.await;
     stop.abort();
+    service.0.listener.drain().await;
     result?;
     Ok(())
 }

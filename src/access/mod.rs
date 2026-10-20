@@ -1,7 +1,7 @@
 //! Loopback experimental access and authenticated-audio service.
 //! The original 64-byte probe remains separate from the encoded audio routes.
 pub mod audio;
-mod transport;
+pub(crate) mod transport;
 
 use axum::{
     body::{to_bytes, Body, Bytes},
@@ -144,7 +144,7 @@ struct Inner {
     attempts: Mutex<VecDeque<Instant>>,
     requests: Arc<Semaphore>,
     stopped: CancellationToken,
-    audio: audio::Store,
+    audio: Arc<audio::Store>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -229,25 +229,60 @@ impl Service {
                 "upstream must be loopback HTTP, without credentials, query or fragment"
             )
         })?;
+        Self::build(
+            upstream,
+            config.session_seconds,
+            Arc::new(audio::Store::new()?),
+        )
+    }
+
+    /// The persistent HTTPS service supplies its validated, owner-configured URL.
+    /// This does not relax the loopback-only proof constructor or listener.
+    pub(crate) fn persistent(upstream: Url, audio: Arc<audio::Store>) -> anyhow::Result<Self> {
+        anyhow::ensure!(
+            matches!(upstream.scheme(), "http" | "https")
+                && upstream.host_str().is_some()
+                && upstream.username().is_empty()
+                && upstream.password().is_none()
+                && upstream.query().is_none()
+                && upstream.fragment().is_none(),
+            "invalid configured upstream"
+        );
+        Self::build(upstream, default_ttl(), audio)
+    }
+
+    fn build(upstream: Url, seconds: u64, audio: Arc<audio::Store>) -> anyhow::Result<Self> {
         let client = Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(2))
             .timeout(Duration::from_secs(3))
             .pool_max_idle_per_host(2)
-            .user_agent("Stratum-Access-Proof/0.1")
+            .user_agent("Astra-Sidecar/0.1")
             .build()
             .map_err(|_| anyhow::anyhow!("could not initialize upstream HTTP client"))?;
         Ok(Self(Arc::new(Inner {
             upstream,
             client,
-            ttl: Duration::from_secs(config.session_seconds),
+            ttl: Duration::from_secs(seconds),
             sessions: Mutex::new(HashMap::new()),
             attempts: Mutex::new(VecDeque::new()),
             requests: Arc::new(Semaphore::new(8)),
             stopped: CancellationToken::new(),
-            audio: audio::Store::new()?,
+            audio,
         })))
+    }
+
+    pub(crate) fn capabilities() -> Value {
+        json!({
+            "protocol": "stratum-access-proof-1", "playback": false,
+            "authentication": "subsonic-token", "probeBytes": PREFIX_BYTES,
+            "sessionRenewal": "fresh-credentials-same-user",
+            "audioExperiment": "stratum-authenticated-audio-1",
+            "audioSource": "complete-private-copy",
+            "maxSourceBytes": audio::MAX_SOURCE_BYTES,
+            "maxSegmentSeconds": audio::MAX_SEGMENT_SECONDS
+        })
     }
 
     pub fn router(&self) -> Router {
@@ -256,17 +291,7 @@ impl Service {
                 Router::new()
                     .route(
                         "/access/v1/capabilities",
-                        get(|| async {
-                            Json(json!({
-                                "protocol": "stratum-access-proof-1", "playback": false,
-                                "authentication": "subsonic-token", "probeBytes": PREFIX_BYTES,
-                                "sessionRenewal": "fresh-credentials-same-user",
-                                "audioExperiment": "stratum-authenticated-audio-1",
-                                "audioSource": "complete-private-copy",
-                                "maxSourceBytes": audio::MAX_SOURCE_BYTES,
-                                "maxSegmentSeconds": audio::MAX_SEGMENT_SECONDS
-                            }))
-                        }),
+                        get(|| async { Json(Self::capabilities()) }),
                     )
                     .route("/access/v1/sessions", post(create_session))
                     .route(
@@ -280,7 +305,7 @@ impl Service {
             .with_state(self.clone())
     }
 
-    fn reap(&self) {
+    pub(crate) fn reap(&self) {
         self.0.sessions.lock().unwrap().retain(|_, session| {
             if session.active() {
                 true
@@ -290,7 +315,7 @@ impl Service {
             }
         });
     }
-    fn clear(&self) {
+    pub(crate) fn clear(&self) {
         self.0.stopped.cancel();
         let mut sessions = self.0.sessions.lock().unwrap();
         for session in sessions.values() {
@@ -377,7 +402,7 @@ impl Service {
             ("t", credential.token.clone()),
             ("s", credential.salt.clone()),
             ("v", "1.16.1".into()),
-            ("c", "stratum-access-proof".into()),
+            ("c", "AstraSidecar".into()),
             ("f", "json".into()),
         ];
         form.extend_from_slice(params);

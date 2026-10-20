@@ -212,6 +212,20 @@ impl Store {
         Ok(config)
     }
 
+    /// A coherent listener snapshot, read on a blocking thread. A saved connection
+    /// revision binds sessions even if the owner changes A -> B -> A between reads.
+    pub(super) fn listener_configuration(&self) -> Result<Option<(String, String)>> {
+        let _lock = self.lock("state.lock")?;
+        let configured = self.read_state()?.owner.is_some();
+        let setup = self.config()?.setup;
+        let settings = setup.settings.normalized()?;
+        Ok(if configured && !settings.listeners.is_empty() {
+            settings.navidrome_url.map(|url| (setup.revision, url))
+        } else {
+            None
+        })
+    }
+
     /// All setup writers use the same lock/validation. The revision also stops
     /// late probes or another browser tab from replacing newer owner choices.
     pub fn save_setup(

@@ -12,14 +12,14 @@ import urllib.request
 from navidrome import HTTP, require, run
 
 
-def request(base, path, method="GET", body=None, token=None):
+def request(base, path, method="GET", body=None, token=None, opener=None):
     data = None if body is None else json.dumps(body).encode()
     headers = {"Content-Type": "application/json"}
     if token:
         headers["Authorization"] = "Bearer " + token
     req = urllib.request.Request(base + path, data=data, method=method, headers=headers)
     try:
-        response = HTTP.open(req, timeout=12)
+        response = (opener or HTTP).open(req, timeout=12)
     except urllib.error.HTTPError as error:
         response = error
     with response:
@@ -29,7 +29,8 @@ def request(base, path, method="GET", body=None, token=None):
 
 
 class AudioProbe:
-    def __init__(self, base, tokens, tracks, sources, out, check):
+    def __init__(self, base, tokens, tracks, sources, out, check, opener=None):
+        self.opener = opener
         self.base, self.tokens, self.tracks = base, dict(tokens), tracks
         self.sources, self.out, self.check = sources, out / "audio", check
         self.out.mkdir()
@@ -38,7 +39,7 @@ class AudioProbe:
         for user in ("alice", "bob"):
             self.reopen(user, self.tokens[user])
         self.check("encoded handle cannot cross users", self.segment("bob", handle=self.handles["alice"])[0] == 404)
-        self.check("denied track cannot be opened for encoding", request(base, "/audio/v1/playbacks/" + tracks["alice"], "POST", token=tokens["bob"])[0] == 404)
+        self.check("denied track cannot be opened for encoding", self.request(base, "/audio/v1/playbacks/" + tracks["alice"], "POST", token=tokens["bob"])[0] == 404)
         for user in ("alice", "bob"):
             # Both fixtures are 48 kHz stereo PCM WAV. Independent real-engine
             # integration tests cover native 44.1 and 96 kHz as well.
@@ -80,13 +81,16 @@ class AudioProbe:
             self.check("same-size upstream mutation cannot change open playback PCM", before == after and old_metadata["source_sha256"] == original_hash)
             fresh = self.open("alice")
             self.check("fresh playback acquires changed original", fresh["source"]["sha256"] == hashlib.sha256(mutated).hexdigest() and fresh["source"]["sha256"] != original_hash)
-            request(base, "/audio/v1/playback/" + fresh["playback"], "DELETE", token=tokens["alice"])
+            self.request(base, "/audio/v1/playback/" + fresh["playback"], "DELETE", token=tokens["alice"])
         finally:
             source.write_bytes(original)
         self.unpack(self.segment("alice"))  # Rewarm the exact interval used by revocation checks.
 
+    def request(self, *args, **kwargs):
+        return request(*args, **kwargs, opener=self.opener)
+
     def open(self, user):
-        status, _, body = request(self.base, "/audio/v1/playbacks/" + self.tracks[user], "POST", token=self.tokens[user])
+        status, _, body = self.request(self.base, "/audio/v1/playbacks/" + self.tracks[user], "POST", token=self.tokens[user])
         require(status == 201, f"audio source preparation failed (HTTP {status}): {body[:100]!r}")
         return json.loads(body)
 
@@ -102,7 +106,7 @@ class AudioProbe:
                                        "firstSegmentQuality": "opus-128"})
 
     def segment(self, user, handle=None, start=192000, frames=96000, quality="opus-128"):
-        return request(self.base, "/audio/v1/playback/" + (handle or self.handles[user]) + "/segment", "POST",
+        return self.request(self.base, "/audio/v1/playback/" + (handle or self.handles[user]) + "/segment", "POST",
                        {"start": start, "frames": frames, "quality": quality}, self.tokens[user])
 
     def unpack(self, response):

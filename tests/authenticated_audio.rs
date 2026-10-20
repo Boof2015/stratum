@@ -22,7 +22,7 @@ use std::{
 };
 use stratum_poc::{
     media::{self, Segment, SegmentMetadata},
-    proof,
+    owner, proof,
 };
 use tempfile::TempDir;
 use tokio::{net::TcpListener, sync::Notify};
@@ -146,6 +146,16 @@ async fn upstream(State(state): State<Arc<Upstream>>, request: Request) -> Respo
         _ => ([(header::CONTENT_TYPE, "audio/flac")], data).into_response(),
     }
 }
+// Ensure a startup assertion cannot leave the new persistent service running.
+struct StartupChild(Option<Child>);
+impl Drop for StartupChild {
+    fn drop(&mut self) {
+        if let Some(child) = &mut self.0 {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
 struct Harness {
     dir: TempDir,
     fixture: PathBuf,
@@ -154,6 +164,7 @@ struct Harness {
     process: Child,
     task: tokio::task::JoinHandle<()>,
     http: reqwest::Client,
+    owner: Option<owner::Store>,
 }
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -174,6 +185,12 @@ impl Harness {
         Self::configured(rate, 600).await
     }
     async fn configured(rate: u64, ttl: u64) -> Self {
+        Self::launch(rate, ttl, false).await
+    }
+    async fn installed(rate: u64) -> Self {
+        Self::launch(rate, 600, true).await
+    }
+    async fn launch(rate: u64, ttl: u64, installed: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let fixture = dir.path().join("fixture.flac");
         proof::fixture_at_rate(&fixture, 6 * rate + 317, 2, 24, rate).unwrap();
@@ -182,7 +199,11 @@ impl Harness {
             ..Default::default()
         });
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let upstream_url = format!("http://{}", listener.local_addr().unwrap());
+        let upstream_url = format!(
+            "http://{}:{}/music",
+            if installed { "localhost" } else { "127.0.0.1" },
+            listener.local_addr().unwrap().port()
+        );
         let app = Router::new().fallback(upstream).with_state(state.clone());
         let task = tokio::spawn(async {
             axum::serve(listener, app).await.unwrap();
@@ -204,42 +225,112 @@ impl Harness {
         let shim = shim_dir.join("ffmpeg");
         fs::write(&shim, "#!/bin/sh\nif [ -f \"$STRATUM_TEST_HOLD\" ]; then\n  echo $$ > \"$STRATUM_TEST_PID\"\n  exec /bin/sleep 30\nfi\nexec \"$STRATUM_TEST_FFMPEG\" \"$@\"\n").unwrap();
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
-        let process = Command::new(env!("CARGO_BIN_EXE_sidecar-access"))
-            .arg("--config")
-            .arg(config)
-            .env("TMPDIR", dir.path())
-            .env(
-                "PATH",
-                format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
+        let mut http = reqwest::Client::builder()
+            .no_proxy()
+            .timeout(Duration::from_secs(15));
+        let mut command;
+        let owner = if installed {
+            let store = owner::Store::initialize(
+                &dir.path().join("owner"),
+                &owner::Config {
+                    listen: "127.0.0.1:0".parse().unwrap(),
+                    ..Default::default()
+                },
             )
-            .env("STRATUM_TEST_FFMPEG", real_ffmpeg)
-            .env("STRATUM_TEST_HOLD", dir.path().join("hold-worker"))
-            .env("STRATUM_TEST_PID", dir.path().join("worker-pid"))
-            .stdin(Stdio::null())
-            .stdout(log.try_clone().unwrap())
-            .stderr(log)
-            .spawn()
             .unwrap();
+            store
+                .set_password("disposable owner password", false)
+                .unwrap();
+            store
+                .save_setup(
+                    &serde_json::from_value(json!({
+                        "navidrome_url":upstream_url,
+                        "listeners":[{"url":"https://localhost:7843","trust":"sidecar_key"}]
+                    }))
+                    .unwrap(),
+                    "initial",
+                    None,
+                )
+                .unwrap();
+            let private: Value =
+                serde_json::from_slice(&fs::read(dir.path().join("owner/private.json")).unwrap())
+                    .unwrap();
+            http = http.add_root_certificate(
+                reqwest::Certificate::from_pem(
+                    private["certificate_pem"].as_str().unwrap().as_bytes(),
+                )
+                .unwrap(),
+            );
+            command = Command::new(env!("CARGO_BIN_EXE_sidecar"));
+            command
+                .args(["serve", "--data-dir"])
+                .arg(dir.path().join("owner"));
+            Some(store)
+        } else {
+            command = Command::new(env!("CARGO_BIN_EXE_sidecar-access"));
+            command.arg("--config").arg(config);
+            None
+        };
+        let mut child = StartupChild(Some(
+            command
+                .env("TMPDIR", dir.path())
+                .env(
+                    "PATH",
+                    format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
+                )
+                .env("STRATUM_TEST_FFMPEG", real_ffmpeg)
+                .env("STRATUM_TEST_HOLD", dir.path().join("hold-worker"))
+                .env("STRATUM_TEST_PID", dir.path().join("worker-pid"))
+                .stdin(Stdio::null())
+                .stdout(log.try_clone().unwrap())
+                .stderr(log)
+                .spawn()
+                .unwrap(),
+        ));
         let deadline = Instant::now() + Duration::from_secs(5);
         let base = loop {
-            if let Ok(value) =
-                serde_json::from_slice::<Value>(&fs::read(dir.path().join("service.log")).unwrap())
-            {
+            let log = fs::read_to_string(dir.path().join("service.log")).unwrap();
+            if installed && log.contains("fingerprint is") {
+                if let Some(address) = log
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Sidecar HTTPS listener: "))
+                {
+                    break format!("https://{address}/stratum");
+                }
+            } else if let Ok(value) = serde_json::from_str::<Value>(&log) {
                 if let Some(url) = value["listen"].as_str() {
                     break url.to_owned();
                 }
             }
+            assert!(
+                child.0.as_mut().unwrap().try_wait().unwrap().is_none(),
+                "service exited during startup"
+            );
             assert!(Instant::now() < deadline, "service did not start");
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
+        let http = http.build().unwrap();
+        loop {
+            if http
+                .get(format!("{base}/access/v1/capabilities"))
+                .send()
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "service did not accept requests");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
         Self {
             dir,
             fixture,
             state,
             base,
-            process,
+            process: child.0.take().unwrap(),
             task,
-            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+            http,
+            owner,
         }
     }
     async fn login(&self, user: &str) -> String {
@@ -341,8 +432,12 @@ impl Harness {
     }
 }
 
-async fn audio_contract(rate: u64) {
-    let test = Harness::new(rate).await;
+async fn audio_contract(rate: u64, installed: bool) {
+    let test = if installed {
+        Harness::installed(rate).await
+    } else {
+        Harness::new(rate).await
+    };
     let token = test.login("alice").await;
     let opened = test.handle(&token).await;
     let handle = opened["playback"].as_str().unwrap();
@@ -413,20 +508,27 @@ async fn audio_contract(rate: u64) {
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audio_44100() {
-    audio_contract(44100).await;
+    audio_contract(44100, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audio_48000() {
-    audio_contract(48000).await;
+    audio_contract(48000, false).await;
 }
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn audio_96000() {
-    audio_contract(96000).await;
+    audio_contract(96000, false).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cached_audio_is_private_reauthorized_and_recovers_after_outage() {
-    let test = Harness::new(48000).await;
+    permission_contract(false).await;
+}
+async fn permission_contract(installed: bool) {
+    let test = if installed {
+        Harness::installed(48000).await
+    } else {
+        Harness::new(48000).await
+    };
     let alice = test.login("alice").await;
     let bob = test.login("bob").await;
     assert_eq!(test.open("invalid", "a").await.status(), 401);
@@ -711,4 +813,102 @@ async fn renewal_retains_current_and_next_audio_handles_without_refetching_sourc
         .await;
     assert_eq!(following.0["presentation"]["start"], 48000);
     assert_eq!(h.state.full_reads.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_https_audio_preserves_exact_samples_and_quality_alignment() {
+    audio_contract(48000, true).await;
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_https_audio_preserves_scoped_access_and_revocation() {
+    permission_contract(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_reconfiguration_cancels_inflight_source_and_shutdown_reaps_encoder() {
+    let mut test = Harness::installed(48000).await;
+    let token = test.login("alice").await;
+    let capabilities: Value = test
+        .http
+        .get(format!("{}/access/v1/capabilities", test.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let owner = test.owner.as_ref().unwrap();
+    assert_eq!(
+        capabilities["spkiSha256"],
+        owner.identity().unwrap().spki_sha256
+    );
+    assert_eq!(capabilities["playback"], true);
+    test.state.hold_full.store(true, Ordering::SeqCst);
+    let pending = test
+        .http
+        .post(format!("{}/audio/v1/playbacks/a", test.base))
+        .bearer_auth(&token)
+        .send();
+    tokio::pin!(pending);
+    tokio::select! { _=&mut pending=>panic!("source was not held"), result=tokio::time::timeout(Duration::from_secs(3),test.state.reached.notified())=>{result.unwrap();} }
+    // Simulate CLI configure while the web service is running. Even an address
+    // edit on the same upstream is a new connection revision and revokes sessions.
+    let setup = owner.config().unwrap().setup;
+    owner
+        .save_setup(&setup.settings, &setup.revision, None)
+        .unwrap();
+    let response = tokio::time::timeout(Duration::from_secs(3), &mut pending)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(response.status().as_u16(), 401 | 503));
+    test.state.release.notify_one();
+    test.state.hold_full.store(false, Ordering::SeqCst);
+    test.wait_clean().await;
+    assert_eq!(test.open(&token, "a").await.status(), 401);
+    let fresh = test.login("alice").await;
+    let opened = test.handle(&fresh).await;
+    let handle = opened["playback"].as_str().unwrap();
+    fs::write(test.dir.path().join("hold-worker"), b"hold").unwrap();
+    let pending = test
+        .http
+        .post(format!("{}/audio/v1/playback/{handle}/segment", test.base))
+        .bearer_auth(&fresh)
+        .json(&json!({"start":0,"frames":48000,"quality":"opus-64"}))
+        .send();
+    tokio::pin!(pending);
+    let wait_pid = async {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(text) = fs::read_to_string(test.dir.path().join("worker-pid")) {
+                if let Ok(pid) = text.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "encoder did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let pid = tokio::select! { _=&mut pending=>panic!("encoder was not held"), pid=wait_pid=>pid };
+    unsafe {
+        libc::kill(test.process.id() as i32, libc::SIGTERM);
+    }
+    let _ = tokio::time::timeout(Duration::from_secs(6), &mut pending)
+        .await
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        if let Some(status) = test.process.try_wait().unwrap() {
+            assert!(status.success());
+            break;
+        }
+        assert!(Instant::now() < deadline, "shutdown timed out");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_ne!(
+        unsafe { libc::kill(pid, 0) },
+        0,
+        "encoder outlived shutdown"
+    );
+    test.wait_clean().await;
 }

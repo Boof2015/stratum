@@ -7,7 +7,7 @@ use std::{
 use stratum_poc::owner::{self, Config, Store};
 use tokio_util::sync::CancellationToken;
 
-const HELP: &str = "Astra Sidecar — owner setup preview
+const HELP: &str = "Astra Sidecar — development server
 
 sidecar init --data-dir DIR [--listen IP:PORT] [--admin-origin https://HOST:PORT ...]
 sidecar serve --data-dir DIR
@@ -29,11 +29,15 @@ from automation; passwords are never accepted in command-line arguments.
 
 configure imports connection settings after owner setup; check-navidrome detects
 the API without signing in. Publishing/removing discovery asks for temporary
-Navidrome administrator authorization. Music serving and the full dashboard
-are not wired into this entry point yet.";
+Navidrome administrator authorization. Configured servers serve experimental
+authenticated audio over HTTPS. Retained caching and the full dashboard follow.";
 
 #[tokio::main(worker_threads = 2)]
 async fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--audio-worker") {
+        stratum_poc::access::audio::worker_main();
+        return;
+    }
     if let Err(error) = run().await {
         eprintln!("Sidecar: {error}");
         std::process::exit(1);

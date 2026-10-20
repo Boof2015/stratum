@@ -17,17 +17,17 @@ pub(super) const MAX_SEGMENT_SECONDS: u64 = 4;
 const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 const WORKER_LIMIT: Duration = Duration::from_secs(8);
 
-pub(super) struct Store {
+pub(crate) struct Store {
     root: Arc<TempDir>,
     sources: Arc<Semaphore>,
     workers: Arc<Semaphore>,
     executable: PathBuf,
 }
 impl Store {
-    pub(super) async fn drain(&self) {
+    pub(crate) async fn drain(&self) {
         let _permits = self.workers.clone().acquire_many_owned(2).await;
     }
-    pub(super) fn new() -> anyhow::Result<Self> {
+    pub(crate) fn new() -> anyhow::Result<Self> {
         Ok(Self {
             root: Arc::new(
                 tempfile::Builder::new()
@@ -585,7 +585,9 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        Arc::get_mut(&mut service.0).unwrap().audio.executable = script;
+        Arc::get_mut(&mut Arc::get_mut(&mut service.0).unwrap().audio)
+            .unwrap()
+            .executable = script;
         let playback = Arc::new(Playback {
             directory: tempfile::tempdir_in(service.0.audio.root.path()).unwrap(),
             _root: service.0.audio.root.clone(),

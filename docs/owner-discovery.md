@@ -2,9 +2,10 @@
 
 Checkpoint 3 adds optional discovery publication to the owner setup preview.
 Finish [owner enrollment](owner-foundation.md) and [connection setup](owner-setup.md)
-first. The `sidecar` entry point still does **not** serve music; publishing an
-announcement does not make the streaming deployment complete. No Astra client
-integration changes are included in this checkpoint.
+first. The `sidecar` entry point now serves [authenticated HTTPS audio](owner-streaming.md)
+at the published capabilities path. This is still a development deployment with
+explicit source/resource limits. Production Astra discovery and enable controls
+remain a separate client integration step.
 
 ## Owner flow
 
