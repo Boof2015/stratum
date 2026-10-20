@@ -13,3 +13,13 @@ button:disabled { opacity: .6; cursor: wait; }
 :focus-visible { outline: 3px solid #29a4d1; outline-offset: 3px; }
 #message { min-height: 1.6em; }
 [hidden] { display: none !important; }
+main { max-width: 600px; }
+h2 { font-size: 1rem; margin-top: 30px; }
+.hint, .preview { font-size: .9rem; opacity: .8; }
+.address { overflow-wrap: anywhere; }
+.address li { margin-block: 10px; }
+select { display: block; width: 100%; margin-top: 8px; padding: 12px; border: 1px solid GrayText; border-radius: 8px; font: inherit; }
+fieldset { min-width: 0; margin-block: 20px; border: 1px solid GrayText; border-radius: 10px; padding: 8px 18px 18px; }
+legend { padding-inline: 6px; font-size: .9rem; }
+.actions { display: flex; flex-wrap: wrap; gap: 12px; margin-block: 20px; }
+footer { margin-top: 36px; padding-top: 20px; border-top: 1px solid GrayText; }

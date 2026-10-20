@@ -7,7 +7,7 @@ use std::{
 use stratum_poc::owner::{self, Config, Store};
 use tokio_util::sync::CancellationToken;
 
-const HELP: &str = "Astra Sidecar — owner-access foundation
+const HELP: &str = "Astra Sidecar — owner setup preview
 
 sidecar init --data-dir DIR [--listen IP:PORT] [--admin-origin https://HOST:PORT ...]
 sidecar serve --data-dir DIR
@@ -16,14 +16,17 @@ sidecar reset-password --data-dir DIR [--password-stdin]
 sidecar setup-code --data-dir DIR
 sidecar renew-certificate --data-dir DIR
 sidecar status --data-dir DIR
+sidecar configure --data-dir DIR --settings FILE
+sidecar check-navidrome --data-dir DIR [--url URL]
 
 init creates persistent configuration and HTTPS identity. serve never prompts;
 before owner setup it prints a one-time code valid for 30 minutes. Password
 commands prompt without echo by default. --password-stdin is for protected input
 from automation; passwords are never accepted in command-line arguments.
 
-This checkpoint provides owner access only. Navidrome setup, music serving and
-the full dashboard are not wired into this entry point yet.";
+configure imports connection settings after owner setup; check-navidrome detects
+the API without signing in. Discovery publication, music serving and the full
+dashboard are not wired into this entry point yet.";
 
 #[tokio::main(worker_threads = 2)]
 async fn main() {
@@ -52,7 +55,9 @@ async fn run() -> Result<()> {
             "reset-password",
             "setup-code",
             "renew-certificate",
-            "status"
+            "status",
+            "configure",
+            "check-navidrome"
         ]
         .contains(&command),
         "Unknown command. Use --help."
@@ -61,6 +66,8 @@ async fn run() -> Result<()> {
     let mut config = Config::default();
     let mut origins = Vec::new();
     let mut password_stdin = false;
+    let mut settings_file = None;
+    let mut probe_url = None;
     while let Some(flag) = args.next() {
         match flag.to_str() {
             Some("--data-dir") if directory.is_none() => {
@@ -87,6 +94,18 @@ async fn run() -> Result<()> {
                 if command == "set-password" || command == "reset-password" =>
             {
                 password_stdin = true
+            }
+            Some("--settings") if command == "configure" && settings_file.is_none() => {
+                settings_file = Some(PathBuf::from(
+                    args.next().context("--settings needs a file.")?,
+                ));
+            }
+            Some("--url") if command == "check-navidrome" && probe_url.is_none() => {
+                probe_url = Some(
+                    args.next()
+                        .and_then(|v| v.into_string().ok())
+                        .context("--url needs an address.")?,
+                );
             }
             _ => bail!("Unknown or unsupported option. Use --help."),
         }
@@ -117,6 +136,31 @@ async fn run() -> Result<()> {
         "Could not open Sidecar. Check the data directory; run init for a new installation.",
     )?;
     match command {
+        "configure" => {
+            let path = settings_file
+                .context("Specify --settings with a connection-settings JSON file.")?;
+            let mut bytes = Vec::new();
+            std::fs::File::open(path)?
+                .take(32769)
+                .read_to_end(&mut bytes)?;
+            ensure!(bytes.len() <= 32768, "Settings file is too large.");
+            let settings: owner::setup::Settings = serde_json::from_slice(&bytes)
+                .context("Invalid connection settings. See docs/owner-setup.md for the format.")?;
+            let current = store.config()?.setup;
+            let saved = store.save_setup(&settings, &current.revision, None)?;
+            println!("Connection settings saved ({}). Addresses have not been checked. Run check-navidrome to detect the server; this does not sign in.", saved.stage());
+        }
+        "check-navidrome" => {
+            ensure!(
+                store.owner_generation()?.is_some(),
+                "Set the owner password before checking Navidrome."
+            );
+            let url = probe_url
+                .or(store.config()?.setup.settings.navidrome_url)
+                .context("Save a Navidrome address first, or specify --url.")?;
+            let detection = owner::setup::Probe::new()?.check(&url).await?;
+            println!("{}", serde_json::to_string_pretty(&detection)?);
+        }
         "set-password" | "reset-password" => {
             let password = read_password(password_stdin)?;
             store.set_password(&password, command == "reset-password")?;

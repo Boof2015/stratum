@@ -265,7 +265,10 @@ fn actual_cli_and_https_preserve_identity_and_revoke_owner_sessions() {
         json!({}),
     );
     assert_eq!(response.status, 200);
-    assert!(response.body.contains("owner-ready"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&response.body).unwrap()["stage"],
+        "navidrome"
+    );
     assert!(
         command(
             &dir,
@@ -366,4 +369,87 @@ fn cli_setup_is_noninteractive_when_requested_and_rejects_accidental_replacement
     assert!(!fs::read_to_string(dir.join("private.json"))
         .unwrap()
         .contains(PASSWORD));
+}
+
+#[test]
+fn cli_configure_and_browser_share_persistent_setup() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("data");
+    let settings_file = temp.path().join("settings.json");
+    let settings = json!({"navidrome_url":"http://navidrome:4533/music/","listeners":[
+        {"url":"https://home:7843/","trust":"sidecar_key"},
+        {"url":"https://public.example/stratum/","trust":"https_proxy"}
+    ]});
+    fs::write(&settings_file, settings.to_string()).unwrap();
+    assert!(
+        command(
+            &dir,
+            &[
+                "init",
+                "--listen",
+                "127.0.0.1:0",
+                "--admin-origin",
+                "https://localhost:7843"
+            ],
+            None
+        )
+        .0
+    );
+    let args = ["configure", "--settings", settings_file.to_str().unwrap()];
+    assert!(!command(&dir, &args, None).0);
+    assert!(command(&dir, &["set-password", "--password-stdin"], Some(PASSWORD)).0);
+    let configured = command(&dir, &args, None);
+    assert!(configured.0);
+    assert!(configured.1.contains("not been checked"));
+    let (mut server, addr, _) = start(&dir, &temp.path().join("setup.log"));
+    let tls = roots(&dir);
+    let cookie = cookie(&request(
+        addr,
+        tls.clone(),
+        "POST",
+        "/admin/api/login",
+        None,
+        json!({"password":PASSWORD}),
+    ));
+    let value: Value = serde_json::from_str(
+        &request(
+            addr,
+            tls.clone(),
+            "GET",
+            "/admin/api/setup",
+            Some(&cookie),
+            json!({}),
+        )
+        .body,
+    )
+    .unwrap();
+    assert_eq!(value["stage"], "connections-saved");
+    assert_eq!(
+        value["setup"]["settings"]["navidrome_url"],
+        "http://navidrome:4533/music"
+    );
+    assert_eq!(
+        value["setup"]["settings"]["listeners"][1]["trust"],
+        "https_proxy"
+    );
+    // Live command-line update is visible without restart and invalidates old web revisions.
+    fs::write(
+        &settings_file,
+        json!({"navidrome_url":"http://other:4533","listeners":[]}).to_string(),
+    )
+    .unwrap();
+    assert!(command(&dir, &args, None).0);
+    assert_eq!(
+        request(
+            addr,
+            tls,
+            "POST",
+            "/admin/api/setup/listeners",
+            Some(&cookie),
+            json!({"revision":value["setup"]["revision"],"listeners":settings["listeners"]})
+        )
+        .status,
+        409
+    );
+    stop(&mut server);
 }

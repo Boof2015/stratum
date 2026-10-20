@@ -109,7 +109,7 @@ async fn enrollment_needs_the_local_code_and_sets_a_protected_cookie() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     let body = json(response).await;
-    assert_eq!(body["stage"], "owner-ready");
+    assert_eq!(body["stage"], "navidrome");
     assert!(body["identity"]["spkiSha256"].as_str().unwrap().len() == 64);
     for secret in ["password", "keyPem", "bootstrap", &code] {
         assert!(!body.to_string().contains(secret));
@@ -453,4 +453,255 @@ async fn public_shell_has_no_secrets_and_enforces_resource_policy() {
     assert!(!String::from_utf8(body.to_vec()).unwrap().contains(&code));
     let response = call(&service, "GET", "/admin/api/status", None, json!({})).await;
     assert_eq!(json(response).await, json!({"ownerConfigured":false}));
+}
+
+struct ProbeServer {
+    url: String,
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+    task: tokio::task::JoinHandle<()>,
+}
+impl Drop for ProbeServer {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
+}
+async fn probe_server(delayed: bool, navidrome: bool) -> ProbeServer {
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    let (seen, proceed) = (entered.clone(), release.clone());
+    let app = Router::new().route("/music/rest/ping.view", post(move || {
+        let seen = seen.clone(); let proceed = proceed.clone();
+        async move {
+            seen.notify_one();
+            if delayed { proceed.notified().await; }
+            Json(json!({"subsonic-response":{"type":if navidrome { "navidrome" } else { "other" },"status":"failed","error":{"code":10}}}))
+        }
+    }));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/music", listener.local_addr().unwrap());
+    let task = tokio::spawn(async move {
+        axum::serve(listener, app).await.unwrap();
+    });
+    ProbeServer {
+        url,
+        entered,
+        release,
+        task,
+    }
+}
+
+#[tokio::test]
+async fn setup_requires_owner_and_successful_probe_and_resumes_after_restart() {
+    let (directory, store, service) = fixture();
+    let server = probe_server(false, true).await;
+    let body = json!({"revision":"initial","url":server.url});
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/setup/navidrome",
+            None,
+            body.clone()
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let cookie = enrolled(&store, &service).await;
+    let wrong = probe_server(false, false).await;
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/setup/navidrome",
+            Some(&cookie),
+            json!({"revision":"initial","url":wrong.url})
+        )
+        .await
+        .status(),
+        StatusCode::BAD_GATEWAY
+    );
+    assert_eq!(store.config().unwrap().setup.stage(), "navidrome");
+    let response = call(
+        &service,
+        "POST",
+        "/admin/api/setup/navidrome",
+        Some(&cookie),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    let value = json(response).await;
+    assert_eq!(value["stage"], "listeners");
+    assert_eq!(value["detection"]["authenticated"], false);
+    let revision = value["setup"]["revision"].as_str().unwrap();
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/setup/navidrome",
+            Some(&cookie),
+            body
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let invalid =
+        json!({"revision":revision,"listeners":[{"url":"http://plain","trust":"sidecar_key"}]});
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/setup/listeners",
+            Some(&cookie),
+            invalid
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(store.config().unwrap().setup.revision, revision);
+    let valid = json!({"revision":revision,"listeners":[{"url":"https://home:7843/","trust":"sidecar_key"},{"url":"https://public.example/stratum/","trust":"https_proxy"}]});
+    let response = call(
+        &service,
+        "POST",
+        "/admin/api/setup/listeners",
+        Some(&cookie),
+        valid,
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json(response).await["stage"], "connections-saved");
+    let restarted = Service::new(Store::open(directory.path()).unwrap()).unwrap();
+    let cookie = session_cookie(
+        &call(
+            &restarted,
+            "POST",
+            "/admin/api/login",
+            None,
+            json!({"password":PASSWORD}),
+        )
+        .await,
+    );
+    let value = json(
+        call(
+            &restarted,
+            "GET",
+            "/admin/api/setup",
+            Some(&cookie),
+            json!({}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(
+        value["setup"]["settings"]["listeners"][1]["url"],
+        "https://public.example/stratum"
+    );
+    assert_eq!(
+        value["setup"]["settings"]["listeners"][1]["trust"],
+        "https_proxy"
+    );
+    assert_eq!(value["stage"], "connections-saved");
+}
+
+#[tokio::test]
+async fn late_probe_cannot_replace_newer_settings_or_survive_logout_or_reset() {
+    for change in ["settings", "logout", "password"] {
+        let (_dir, store, service) = fixture();
+        let cookie = enrolled(&store, &service).await;
+        let server = probe_server(true, true).await;
+        let s = service.clone();
+        let c = cookie.clone();
+        let url = server.url.clone();
+        let request = tokio::spawn(async move {
+            call(
+                &s,
+                "POST",
+                "/admin/api/setup/navidrome",
+                Some(&c),
+                json!({"revision":"initial","url":url}),
+            )
+            .await
+        });
+        tokio::time::timeout(Duration::from_secs(3), server.entered.notified())
+            .await
+            .unwrap();
+        match change {
+            "settings" => {
+                store
+                    .save_setup(
+                        &setup::Settings {
+                            navidrome_url: Some("http://newer:4533".into()),
+                            listeners: vec![],
+                        },
+                        "initial",
+                        None,
+                    )
+                    .unwrap();
+            }
+            "logout" => {
+                call(
+                    &service,
+                    "POST",
+                    "/admin/api/logout",
+                    Some(&cookie),
+                    json!({}),
+                )
+                .await;
+            }
+            "password" => {
+                store
+                    .set_password("new test-only owner password", true)
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        server.release.notify_one();
+        let response = tokio::time::timeout(Duration::from_secs(3), request)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            if change == "settings" {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::UNAUTHORIZED
+            },
+            "{change}"
+        );
+        assert_ne!(
+            store.config().unwrap().setup.settings.navidrome_url,
+            Some(server.url.clone())
+        );
+    }
+}
+
+#[tokio::test]
+async fn probe_concurrency_is_bounded_and_listener_changes_need_saved_navidrome() {
+    let (_dir, store, service) = fixture();
+    let cookie = enrolled(&store, &service).await;
+    let response = call(
+        &service,
+        "POST",
+        "/admin/api/setup/listeners",
+        Some(&cookie),
+        json!({"revision":"initial","listeners":[]}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let permits = service.0.probes.acquire_many(2).await.unwrap();
+    let response = call(
+        &service,
+        "POST",
+        "/admin/api/setup/check",
+        Some(&cookie),
+        json!({"url":"http://127.0.0.1:1"}),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+    drop(permits);
 }

@@ -1,5 +1,6 @@
 //! Persistent owner-access foundation. Listener credentials and the experimental
 //! audio service remain separate; these cookies never authorize music access.
+pub mod setup;
 mod store;
 pub use store::{validate_password, Config, Identity, Store};
 
@@ -34,6 +35,8 @@ struct Inner {
     sessions: Mutex<HashMap<String, Session>>,
     attempts: Mutex<VecDeque<Instant>>,
     work: Arc<Semaphore>,
+    probes: Semaphore,
+    probe: setup::Probe,
 }
 #[derive(Clone)]
 struct Session {
@@ -49,6 +52,9 @@ enum Failure {
     Origin,
     Busy,
     Internal,
+    Conflict,
+    Setup(&'static str),
+    Probe(setup::ProbeFailure),
 }
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
@@ -59,8 +65,15 @@ impl IntoResponse for Failure {
             Self::Origin => (StatusCode::FORBIDDEN, "Open Sidecar at a configured administration address."),
             Self::Busy => (StatusCode::TOO_MANY_REQUESTS, "Too many requests. Wait a minute and try again."),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "Sidecar couldn't read or save its owner settings. Check the service's data directory."),
+            Self::Conflict => (StatusCode::CONFLICT, "Setup changed elsewhere. Reload the saved settings before trying again."),
+            Self::Setup(message) => (StatusCode::BAD_REQUEST, message),
+            Self::Probe(error) => (StatusCode::BAD_GATEWAY, error.message()),
         };
-        (status, Json(json!({"error":message}))).into_response()
+        let mut body = json!({"error":message});
+        if let Self::Probe(setup::ProbeFailure::Http(code)) = self {
+            body["httpStatus"] = json!(code);
+        }
+        (status, Json(body)).into_response()
     }
 }
 
@@ -73,6 +86,8 @@ impl Service {
             sessions: Mutex::new(HashMap::new()),
             attempts: Mutex::new(VecDeque::new()),
             work: Arc::new(Semaphore::new(2)),
+            probes: Semaphore::new(2),
+            probe: setup::Probe::new()?,
         })))
     }
     pub fn router(&self) -> Router {
@@ -100,8 +115,11 @@ impl Service {
             .route("/admin/api/claim", post(claim))
             .route("/admin/api/login", post(login))
             .route("/admin/api/logout", post(logout))
-            .route("/admin/api/setup", get(setup))
-            .layer(DefaultBodyLimit::max(4096))
+            .route("/admin/api/setup", get(setup_state))
+            .route("/admin/api/setup/navidrome", post(save_navidrome))
+            .route("/admin/api/setup/listeners", post(save_listeners))
+            .route("/admin/api/setup/check", post(check_navidrome))
+            .layer(DefaultBodyLimit::max(32768))
             .layer(middleware::from_fn_with_state(self.clone(), boundary))
             .with_state(self.clone())
     }
@@ -125,7 +143,13 @@ impl Service {
         })
         .await
         .map_err(|_| Failure::Internal)?
-        .map_err(|_| Failure::Internal)
+        .map_err(
+            |error| match error.downcast_ref::<store::SetupWriteError>() {
+                Some(store::SetupWriteError::Conflict) => Failure::Conflict,
+                Some(store::SetupWriteError::OwnerChanged) => Failure::Authentication,
+                None => Failure::Internal,
+            },
+        )
     }
     fn admit_login(&self) -> Result<(), Failure> {
         let mut attempts = self.0.attempts.lock().unwrap();
@@ -175,7 +199,7 @@ impl Service {
         )
             .into_response())
     }
-    async fn authorize(&self, headers: &HeaderMap) -> Result<(), Failure> {
+    async fn authorize(&self, headers: &HeaderMap) -> Result<String, Failure> {
         let key = cookie_key(headers).ok_or(Failure::Authentication)?;
         let session = self
             .0
@@ -190,7 +214,24 @@ impl Service {
             self.0.sessions.lock().unwrap().remove(&key);
             return Err(Failure::Authentication);
         }
-        Ok(())
+        // Logout may happen while the disk check is pending.
+        if !self.0.sessions.lock().unwrap().contains_key(&key) {
+            return Err(Failure::Authentication);
+        }
+        Ok(session.generation)
+    }
+
+    async fn probe(&self, url: &str) -> Result<setup::Detection, Failure> {
+        let _permit = self.0.probes.try_acquire().map_err(|_| Failure::Busy)?;
+        self.0.probe.check(url).await.map_err(Failure::Probe)
+    }
+
+    async fn setup_at(&self, revision: &str) -> Result<setup::SetupState, Failure> {
+        let current = self.disk(|store| Ok(store.config()?.setup)).await?;
+        if current.revision != revision {
+            return Err(Failure::Conflict);
+        }
+        Ok(current)
     }
 }
 
@@ -295,13 +336,91 @@ async fn logout(State(service): State<Service>, headers: HeaderMap) -> Response 
     )
         .into_response()
 }
-async fn setup(
+async fn setup_state(
     State(service): State<Service>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Failure> {
     service.authorize(&headers).await?;
-    let identity = service.disk(|store| store.identity()).await?;
-    Ok(Json(json!({"stage":"owner-ready", "identity":identity})))
+    let (identity, setup) = service
+        .disk(|store| Ok((store.identity()?, store.config()?.setup)))
+        .await?;
+    Ok(Json(
+        json!({"stage":setup.stage(), "identity":identity, "setup":setup}),
+    ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NavidromeSave {
+    revision: String,
+    url: String,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListenersSave {
+    revision: String,
+    listeners: Vec<setup::Endpoint>,
+}
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NavidromeCheck {
+    url: String,
+}
+
+async fn save_navidrome(
+    State(service): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<NavidromeSave>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, Failure> {
+    service.authorize(&headers).await?;
+    let Json(body) = body.map_err(|_| Failure::Input)?;
+    let mut current = service.setup_at(&body.revision).await?;
+    let detection = service.probe(&body.url).await?;
+    let generation = service.authorize(&headers).await?;
+    current.settings.navidrome_url = Some(detection.url.clone());
+    let saved = service
+        .disk(move |store| store.save_setup(&current.settings, &body.revision, Some(&generation)))
+        .await?;
+    Ok(Json(
+        json!({"stage":saved.stage(), "setup":saved, "detection":detection}),
+    ))
+}
+
+async fn save_listeners(
+    State(service): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<ListenersSave>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, Failure> {
+    let generation = service.authorize(&headers).await?;
+    let Json(body) = body.map_err(|_| Failure::Input)?;
+    let mut current = service.setup_at(&body.revision).await?;
+    if current.settings.navidrome_url.is_none() {
+        return Err(Failure::Setup("Save the Navidrome address first."));
+    }
+    if body.listeners.is_empty() {
+        return Err(Failure::Setup(
+            "Add at least one address listeners will use.",
+        ));
+    }
+    current.settings.listeners = body.listeners;
+    current.settings = current.settings.normalized().map_err(|_| Failure::Setup(
+        "Use up to 16 different HTTPS listener addresses, without credentials, query parameters or fragments."))?;
+    let saved = service
+        .disk(move |store| store.save_setup(&current.settings, &body.revision, Some(&generation)))
+        .await?;
+    Ok(Json(json!({"stage":saved.stage(), "setup":saved})))
+}
+
+async fn check_navidrome(
+    State(service): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<NavidromeCheck>, JsonRejection>,
+) -> Result<Json<setup::Detection>, Failure> {
+    service.authorize(&headers).await?;
+    let Json(body) = body.map_err(|_| Failure::Input)?;
+    let detection = service.probe(&body.url).await?;
+    service.authorize(&headers).await?;
+    Ok(Json(detection))
 }
 fn cookie_key(headers: &HeaderMap) -> Option<String> {
     let mut token = None;

@@ -21,6 +21,25 @@ use subtle::ConstantTimeEq;
 const FILE_LIMIT: u64 = 64 * 1024;
 const BOOTSTRAP_SECONDS: u64 = 30 * 60;
 
+use super::setup::{Settings, SetupState};
+
+#[derive(Debug, PartialEq, Eq)]
+pub enum SetupWriteError {
+    Conflict,
+    OwnerChanged,
+}
+impl std::fmt::Display for SetupWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Conflict => {
+                "Setup changed elsewhere. Reload the saved settings before trying again."
+            }
+            Self::OwnerChanged => "Owner sign-in changed. Sign in again before saving setup.",
+        })
+    }
+}
+impl std::error::Error for SetupWriteError {}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -28,6 +47,8 @@ pub struct Config {
     pub listen: SocketAddr,
     /// Exact browser origins, not upstream or listener discovery addresses.
     pub admin_origins: Vec<String>,
+    #[serde(default)]
+    pub setup: SetupState,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -38,6 +59,7 @@ impl Default for Config {
                 "https://localhost:7843".into(),
                 "https://127.0.0.1:7843".into(),
             ],
+            setup: SetupState::default(),
         }
     }
 }
@@ -64,6 +86,7 @@ impl Config {
                 "Administration origins must be HTTPS origins without a path, credentials, query or fragment."
             );
         }
+        self.setup.validate()?;
         Ok(())
     }
     pub(crate) fn accepts_host(&self, host: &str) -> bool {
@@ -187,6 +210,33 @@ impl Store {
         let config: Config = self.read("config.json")?;
         config.validate()?;
         Ok(config)
+    }
+
+    /// All setup writers use the same lock/validation. The revision also stops
+    /// late probes or another browser tab from replacing newer owner choices.
+    pub fn save_setup(
+        &self,
+        settings: &Settings,
+        expected_revision: &str,
+        owner_generation: Option<&str>,
+    ) -> Result<SetupState> {
+        let settings = settings.normalized()?;
+        let _lock = self.lock("state.lock")?;
+        let state = self.read_state()?;
+        let owner = state.owner.ok_or(SetupWriteError::OwnerChanged)?;
+        if owner_generation.is_some_and(|generation| generation != owner.generation) {
+            return Err(SetupWriteError::OwnerChanged.into());
+        }
+        let mut config = self.config()?;
+        if config.setup.revision != expected_revision {
+            return Err(SetupWriteError::Conflict.into());
+        }
+        config.setup = SetupState {
+            revision: random_hex(32)?,
+            settings,
+        };
+        self.write("config.json", &config)?;
+        Ok(config.setup)
     }
 
     pub fn identity(&self) -> Result<Identity> {

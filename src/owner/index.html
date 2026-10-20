@@ -26,11 +26,45 @@
     </form>
     <p id="message" role="status" aria-live="polite"></p>
     <button id="retry" type="button" hidden>Try again</button>
+    <button id="reload" type="button" hidden>Reload saved settings</button>
     <section id="ready" hidden>
-      <p>Your owner password is set. Server connection setup is not available in this preview yet.</p>
-      <button id="logout" type="button">Sign out</button>
+      <section id="navidrome-section" hidden>
+        <form id="navidrome-form">
+          <label>Navidrome address
+            <input id="navidrome-url" type="url" required maxlength="1024" placeholder="http://127.0.0.1:4533" spellcheck="false" autocomplete="off">
+          </label>
+          <p class="hint">Inside a container, localhost means that container. Use Navidrome’s container name or an address reachable from Sidecar.</p>
+          <p class="hint">This checks for Navidrome without sending credentials. Listeners will use their own Navidrome sign-in.</p>
+          <button id="navidrome-save" type="submit">Check and continue</button>
+        </form>
+      </section>
+      <section id="listeners-section" hidden>
+        <form id="listeners-form">
+          <div id="addresses"></div>
+          <button id="add-address" type="button">Add another address</button>
+          <p class="hint">Direct connections use Sidecar’s identity key. With a reverse proxy, clients verify its HTTPS certificate and trust it to forward the connection to Sidecar.</p>
+          <p class="hint">Keep any path your proxy uses, such as /stratum. Saving an address doesn’t check whether listeners can reach it.</p>
+          <div class="actions">
+            <button id="back-navidrome" type="button">Back</button>
+            <button type="submit">Save connections</button>
+          </div>
+        </form>
+      </section>
+      <section id="summary-section" hidden>
+        <h2>Navidrome</h2>
+        <p id="saved-navidrome" class="address"></p>
+        <div class="actions">
+          <button id="edit-navidrome" type="button">Change address</button>
+          <button id="check-again" type="button">Check again</button>
+        </div>
+        <h2>Listener addresses</h2>
+        <ul id="saved-addresses" class="address"></ul>
+        <button id="edit-listeners" type="button">Change addresses</button>
+        <p class="preview">Setup preview: these settings are saved. Publishing discovery and serving music will be added in the next development checkpoints.</p>
+      </section>
+      <footer><button id="logout" type="button">Sign out</button></footer>
     </section>
-    <noscript>This administration page needs JavaScript. Owner setup is also available through the Sidecar command line.</noscript>
+    <noscript>This administration page needs JavaScript. Setup is also available through the Sidecar command line.</noscript>
   </main>
 </body>
 </html>

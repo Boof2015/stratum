@@ -239,3 +239,80 @@ fn rejects_bad_origins_passwords_and_forged_hash_cost() {
     store.write("private.json", &state).unwrap();
     assert!(store.login(PASSWORD).is_err());
 }
+
+#[test]
+fn setup_is_backwards_compatible_resumable_and_shared_between_writers() {
+    let (dir, store) = fixture();
+    let mut raw: serde_json::Value =
+        serde_json::from_slice(&fs::read(dir.path().join("config.json")).unwrap()).unwrap();
+    raw.as_object_mut().unwrap().remove("setup");
+    fs::write(
+        dir.path().join("config.json"),
+        serde_json::to_vec(&raw).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        Store::open(dir.path())
+            .unwrap()
+            .config()
+            .unwrap()
+            .setup
+            .stage(),
+        "navidrome"
+    );
+    let settings = Settings {
+        navidrome_url: Some("http://navi:4533/music/".into()),
+        listeners: vec![],
+    };
+    assert!(store.save_setup(&settings, "initial", None).is_err());
+    store.set_password(PASSWORD, false).unwrap();
+    let generation = store.owner_generation().unwrap().unwrap();
+    let first = store
+        .save_setup(&settings, "initial", Some(&generation))
+        .unwrap();
+    assert_eq!(first.stage(), "listeners");
+    let reopened = Store::open(dir.path()).unwrap();
+    assert_eq!(reopened.config().unwrap().setup.revision, first.revision);
+    assert_eq!(
+        reopened
+            .config()
+            .unwrap()
+            .setup
+            .settings
+            .navidrome_url
+            .as_deref(),
+        Some("http://navi:4533/music")
+    );
+    let mut full = first.settings.clone();
+    full.listeners.push(super::super::setup::Endpoint {
+        url: "https://sidecar.lan:7843".into(),
+        trust: super::super::setup::EndpointTrust::SidecarKey,
+    });
+    let next = reopened.save_setup(&full, &first.revision, None).unwrap();
+    assert_eq!(next.stage(), "connections-saved");
+    assert_eq!(
+        store
+            .save_setup(&settings, &first.revision, Some(&generation))
+            .err()
+            .unwrap()
+            .downcast_ref::<SetupWriteError>(),
+        Some(&SetupWriteError::Conflict)
+    );
+    // A -> B -> A still invalidates the first revision.
+    let last = store
+        .save_setup(&first.settings, &next.revision, None)
+        .unwrap();
+    assert_ne!(last.revision, first.revision);
+    store
+        .set_password("a replacement test password", true)
+        .unwrap();
+    assert_eq!(
+        store
+            .save_setup(&full, &last.revision, Some(&generation))
+            .err()
+            .unwrap()
+            .downcast_ref::<SetupWriteError>(),
+        Some(&SetupWriteError::OwnerChanged)
+    );
+    assert_eq!(store.config().unwrap().setup.revision, last.revision);
+}

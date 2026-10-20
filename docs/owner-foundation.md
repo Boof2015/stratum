@@ -3,9 +3,9 @@
 This is the first owner-setup checkpoint, separate from `sidecar-access` and the
 audio engine. It supplies persistent configuration and HTTPS identity, terminal
 or browser password enrollment, owner sessions, and local password recovery.
-It is **not a complete streaming deployment**. Navidrome configuration, discovery
-publication, the full dashboard, retained cache and Docker/systemd packaging come
-in subsequent checkpoints. Astra's current streaming integration is unchanged.
+It is **not a complete streaming deployment**. [Connection setup](owner-setup.md)
+is now available as checkpoint 2. Discovery publication, the full dashboard,
+retained cache and Docker/systemd packaging come in subsequent checkpoints. Astra's current streaming integration is unchanged.
 
 ## Start an isolated installation
 
@@ -78,7 +78,8 @@ volume. It does not change Navidrome credentials or listener accounts.
 
 ## Persistence and identity
 
-- `config.json`: versioned listen address and exact administration origins.
+- `config.json`: versioned listen address, exact administration origins and
+  connection setup (see the [setup guide](owner-setup.md)).
   Editing it takes effect after restart. Unknown fields/versions are rejected.
 - `private.json`: installation ID, certificate/private key, Argon2id password
   record and enrollment state. Do not edit or publish it. Back up both files.
@@ -142,5 +143,5 @@ resets the password from a separate process, then restarts and signs in again.
 Children have deadlines and are killed/reaped on failure. These checks launch no
 browser/Electron window, touch no existing server, and play no audio.
 
-The web page is a minimal functional enrollment/sign-in shell. Full dashboard
-visual design and live browser verification remain subsequent work.
+The web page now includes the [connection setup flow](owner-setup.md). Full
+dashboard visual design remains subsequent work.

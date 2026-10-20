@@ -15,7 +15,7 @@ sha2 = "0.10"
 tempfile = "3"
 
 axum = { version = "0.8", default-features = false, features = ["http1", "json", "tokio"] }
-reqwest = { version = "0.12", default-features = false, features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-native-roots"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "signal", "sync", "time", "io-util", "test-util", "process", "fs"] }
 tokio-util = "0.7"
 getrandom = "0.3"
