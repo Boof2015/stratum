@@ -60,7 +60,32 @@
         <h2>Listener addresses</h2>
         <ul id="saved-addresses" class="address"></ul>
         <button id="edit-listeners" type="button">Change addresses</button>
-        <p class="preview">Setup preview: these settings are saved. Publishing discovery and serving music will be added in the next development checkpoints.</p>
+        <section aria-labelledby="discovery-heading">
+          <h2 id="discovery-heading">Discovery</h2>
+          <p id="discovery-status"></p>
+          <p id="discovery-error" role="status"></p>
+          <p class="hint">Publishing adds a Stratum entry to Navidrome’s internet radio list so compatible clients can find Sidecar. Other clients may show it as a radio station. Manual setup needs no announcement.</p>
+          <div class="actions">
+            <button id="publish-discovery" type="button">Publish discovery</button>
+            <button id="manual-discovery" type="button">Use manual setup</button>
+            <button id="remove-discovery" type="button" hidden>Remove announcement</button>
+          </div>
+          <form id="discovery-form" hidden>
+            <p id="discovery-target" class="address"></p>
+            <label>Navidrome administrator username
+              <input id="navidrome-admin" autocomplete="off" required maxlength="256" spellcheck="false">
+            </label>
+            <label>Navidrome administrator password
+              <input id="navidrome-password" type="password" autocomplete="off" required maxlength="1024">
+            </label>
+            <p class="hint">Used for this operation only. Sidecar does not save this sign-in. It is separate from your Sidecar owner password.</p>
+            <div class="actions">
+              <button id="discovery-submit" type="submit">Publish discovery</button>
+              <button id="discovery-cancel" type="button">Cancel</button>
+            </div>
+          </form>
+        </section>
+        <p class="preview">Setup preview: discovery can be published, but this Sidecar entry point does not serve music yet.</p>
       </section>
       <footer><button id="logout" type="button">Sign out</button></footer>
     </section>

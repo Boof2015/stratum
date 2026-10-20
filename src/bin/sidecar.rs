@@ -18,6 +18,9 @@ sidecar renew-certificate --data-dir DIR
 sidecar status --data-dir DIR
 sidecar configure --data-dir DIR --settings FILE
 sidecar check-navidrome --data-dir DIR [--url URL]
+sidecar manual-discovery --data-dir DIR
+sidecar publish-discovery --data-dir DIR --username NAME [--password-stdin] [--recreate]
+sidecar remove-discovery --data-dir DIR --username NAME [--password-stdin]
 
 init creates persistent configuration and HTTPS identity. serve never prompts;
 before owner setup it prints a one-time code valid for 30 minutes. Password
@@ -25,8 +28,9 @@ commands prompt without echo by default. --password-stdin is for protected input
 from automation; passwords are never accepted in command-line arguments.
 
 configure imports connection settings after owner setup; check-navidrome detects
-the API without signing in. Discovery publication, music serving and the full
-dashboard are not wired into this entry point yet.";
+the API without signing in. Publishing/removing discovery asks for temporary
+Navidrome administrator authorization. Music serving and the full dashboard
+are not wired into this entry point yet.";
 
 #[tokio::main(worker_threads = 2)]
 async fn main() {
@@ -57,7 +61,10 @@ async fn run() -> Result<()> {
             "renew-certificate",
             "status",
             "configure",
-            "check-navidrome"
+            "check-navidrome",
+            "manual-discovery",
+            "publish-discovery",
+            "remove-discovery"
         ]
         .contains(&command),
         "Unknown command. Use --help."
@@ -68,6 +75,8 @@ async fn run() -> Result<()> {
     let mut password_stdin = false;
     let mut settings_file = None;
     let mut probe_url = None;
+    let mut username = None;
+    let mut recreate = false;
     while let Some(flag) = args.next() {
         match flag.to_str() {
             Some("--data-dir") if directory.is_none() => {
@@ -91,7 +100,10 @@ async fn run() -> Result<()> {
                 );
             }
             Some("--password-stdin")
-                if command == "set-password" || command == "reset-password" =>
+                if matches!(
+                    command,
+                    "set-password" | "reset-password" | "publish-discovery" | "remove-discovery"
+                ) =>
             {
                 password_stdin = true
             }
@@ -106,6 +118,19 @@ async fn run() -> Result<()> {
                         .and_then(|v| v.into_string().ok())
                         .context("--url needs an address.")?,
                 );
+            }
+            Some("--username")
+                if matches!(command, "publish-discovery" | "remove-discovery")
+                    && username.is_none() =>
+            {
+                username = Some(
+                    args.next()
+                        .and_then(|v| v.into_string().ok())
+                        .context("--username needs a Navidrome administrator name.")?,
+                );
+            }
+            Some("--recreate") if command == "publish-discovery" => {
+                recreate = true;
             }
             _ => bail!("Unknown or unsupported option. Use --help."),
         }
@@ -136,6 +161,35 @@ async fn run() -> Result<()> {
         "Could not open Sidecar. Check the data directory; run init for a new installation.",
     )?;
     match command {
+        "manual-discovery" | "publish-discovery" | "remove-discovery" => {
+            let config = store.config()?;
+            let discovery = store.discovery()?;
+            let credentials = if command != "manual-discovery" {
+                Some(owner::discovery::Credentials {
+                    username: username
+                        .context("Specify --username for the Navidrome administrator.")?,
+                    password: read_navidrome_password(password_stdin)?,
+                })
+            } else {
+                None
+            };
+            let operation =
+                store.begin_discovery(&config.setup.revision, &discovery.revision, None)?;
+            if let Some(credentials) = credentials {
+                let action = if command == "publish-discovery" {
+                    owner::discovery::Action::Publish
+                } else {
+                    owner::discovery::Action::Remove
+                };
+                operation
+                    .run(action, credentials, recreate, CancellationToken::new())
+                    .await?;
+                println!("Discovery change verified on Navidrome. Administrator credentials were not saved.");
+            } else {
+                operation.manual()?;
+                println!("Manual discovery selected. No announcement was published.");
+            }
+        }
         "configure" => {
             let path = settings_file
                 .context("Specify --settings with a connection-settings JSON file.")?;
@@ -179,6 +233,7 @@ async fn run() -> Result<()> {
                 "identity": store.identity()?,
                 "ownerConfigured": store.owner_generation()?.is_some(),
                 "config": store.config()?,
+                "discovery": store.discovery()?.view(&store.config()?.setup, &store.identity()?),
             }))?
         ),
         "serve" => {
@@ -250,4 +305,28 @@ fn read_password(from_stdin: bool) -> Result<String> {
     };
     owner::validate_password(&password)?;
     Ok(password)
+}
+
+fn read_navidrome_password(from_stdin: bool) -> Result<String> {
+    if from_stdin {
+        let mut bytes = Vec::new();
+        std::io::stdin().take(1027).read_to_end(&mut bytes)?;
+        ensure!(bytes.len() <= 1026, "Password input is too long.");
+        let mut value = String::from_utf8(bytes).context("Password must be UTF-8.")?;
+        if value.ends_with('\n') {
+            value.pop();
+            if value.ends_with('\r') {
+                value.pop();
+            }
+        }
+        Ok(value)
+    } else {
+        ensure!(
+            std::io::stdin().is_terminal(),
+            "Use a terminal or --password-stdin with protected input."
+        );
+        Ok(rpassword::prompt_password(
+            "Navidrome administrator password (not saved): ",
+        )?)
+    }
 }

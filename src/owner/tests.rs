@@ -705,3 +705,42 @@ async fn probe_concurrency_is_bounded_and_listener_changes_need_saved_navidrome(
     assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
     drop(permits);
 }
+
+#[tokio::test]
+async fn discovery_routes_require_owner_and_reject_stale_manual_choices() {
+    let (_dir, store, service) = fixture();
+    let setup = store.config().unwrap().setup;
+    let body =
+        json!({"action":"manual","setup_revision":setup.revision,"discovery_revision":"initial"});
+    assert_eq!(
+        call(&service, "POST", "/admin/api/discovery", None, body.clone())
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let cookie = enrolled(&store, &service).await;
+    let response = call(
+        &service,
+        "POST",
+        "/admin/api/discovery",
+        Some(&cookie),
+        body.clone(),
+    )
+    .await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(json(response).await["discovery"]["status"], "manual");
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/discovery",
+            Some(&cookie),
+            body
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    let response=call(&service,"POST","/admin/api/discovery",Some(&cookie),json!({"action":"publish","setup_revision":setup.revision,"discovery_revision":store.discovery().unwrap().revision,"username":"admin","password":""})).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+}

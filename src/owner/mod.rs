@@ -1,5 +1,6 @@
 //! Persistent owner-access foundation. Listener credentials and the experimental
 //! audio service remain separate; these cookies never authorize music access.
+pub mod discovery;
 pub mod setup;
 mod store;
 pub use store::{validate_password, Config, Identity, Store};
@@ -42,6 +43,7 @@ struct Inner {
 struct Session {
     generation: String,
     expires: Instant,
+    cancellation: CancellationToken,
 }
 
 #[derive(Clone, Copy)]
@@ -55,6 +57,7 @@ enum Failure {
     Conflict,
     Setup(&'static str),
     Probe(setup::ProbeFailure),
+    Discovery(discovery::Error),
 }
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
@@ -68,6 +71,12 @@ impl IntoResponse for Failure {
             Self::Conflict => (StatusCode::CONFLICT, "Setup changed elsewhere. Reload the saved settings before trying again."),
             Self::Setup(message) => (StatusCode::BAD_REQUEST, message),
             Self::Probe(error) => (StatusCode::BAD_GATEWAY, error.message()),
+            Self::Discovery(error) => (match error {
+                discovery::Error::Busy => StatusCode::CONFLICT,
+                discovery::Error::Conflict => StatusCode::CONFLICT,
+                discovery::Error::Interrupted => StatusCode::UNAUTHORIZED,
+                _ => StatusCode::BAD_REQUEST,
+            }, error.message()),
         };
         let mut body = json!({"error":message});
         if let Self::Probe(setup::ProbeFailure::Http(code)) = self {
@@ -119,6 +128,7 @@ impl Service {
             .route("/admin/api/setup/navidrome", post(save_navidrome))
             .route("/admin/api/setup/listeners", post(save_listeners))
             .route("/admin/api/setup/check", post(check_navidrome))
+            .route("/admin/api/discovery", post(change_discovery))
             .layer(DefaultBodyLimit::max(32768))
             .layer(middleware::from_fn_with_state(self.clone(), boundary))
             .with_state(self.clone())
@@ -147,7 +157,11 @@ impl Service {
             |error| match error.downcast_ref::<store::SetupWriteError>() {
                 Some(store::SetupWriteError::Conflict) => Failure::Conflict,
                 Some(store::SetupWriteError::OwnerChanged) => Failure::Authentication,
-                None => Failure::Internal,
+                None => error
+                    .downcast_ref::<discovery::Error>()
+                    .copied()
+                    .map(Failure::Discovery)
+                    .unwrap_or(Failure::Internal),
             },
         )
     }
@@ -179,13 +193,16 @@ impl Service {
                 .min_by_key(|(_, s)| s.expires)
                 .map(|(key, _)| key.clone())
                 .unwrap();
-            sessions.remove(&oldest);
+            if let Some(session) = sessions.remove(&oldest) {
+                session.cancellation.cancel();
+            }
         }
         sessions.insert(
             store::digest(token.as_bytes()),
             Session {
                 generation,
                 expires: now + Duration::from_secs(SESSION_SECONDS),
+                cancellation: CancellationToken::new(),
             },
         );
         Ok((
@@ -211,7 +228,9 @@ impl Service {
             .ok_or(Failure::Authentication)?;
         let generation = self.disk(|store| store.owner_generation()).await?;
         if session.expires <= Instant::now() || generation.as_deref() != Some(&session.generation) {
-            self.0.sessions.lock().unwrap().remove(&key);
+            if let Some(session) = self.0.sessions.lock().unwrap().remove(&key) {
+                session.cancellation.cancel();
+            }
             return Err(Failure::Authentication);
         }
         // Logout may happen while the disk check is pending.
@@ -264,7 +283,12 @@ async fn boundary(State(service): State<Service>, request: Request, next: Next) 
     } else if mutation && !json_ok {
         Failure::Input.into_response()
     } else {
-        match tokio::time::timeout(Duration::from_secs(10), next.run(request)).await {
+        let timeout = if request.uri().path() == "/admin/api/discovery" {
+            40
+        } else {
+            10
+        };
+        match tokio::time::timeout(Duration::from_secs(timeout), next.run(request)).await {
             Ok(response) => response,
             Err(_) => StatusCode::REQUEST_TIMEOUT.into_response(),
         }
@@ -325,7 +349,9 @@ async fn login(
 }
 async fn logout(State(service): State<Service>, headers: HeaderMap) -> Response {
     if let Some(key) = cookie_key(&headers) {
-        service.0.sessions.lock().unwrap().remove(&key);
+        if let Some(session) = service.0.sessions.lock().unwrap().remove(&key) {
+            session.cancellation.cancel();
+        }
     }
     (
         [(
@@ -341,12 +367,88 @@ async fn setup_state(
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, Failure> {
     service.authorize(&headers).await?;
-    let (identity, setup) = service
-        .disk(|store| Ok((store.identity()?, store.config()?.setup)))
+    let (identity, setup, discovery) = service
+        .disk(|store| Ok((store.identity()?, store.config()?.setup, store.discovery()?)))
         .await?;
     Ok(Json(
-        json!({"stage":setup.stage(), "identity":identity, "setup":setup}),
+        json!({"stage":setup.stage(), "identity":identity, "discovery":discovery.view(&setup,&identity), "setup":setup}),
     ))
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DiscoveryChange {
+    setup_revision: String,
+    discovery_revision: String,
+    action: String,
+    #[serde(default)]
+    username: String,
+    #[serde(default)]
+    password: String,
+    #[serde(default)]
+    recreate: bool,
+}
+async fn change_discovery(
+    State(service): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<DiscoveryChange>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, Failure> {
+    let generation = service.authorize(&headers).await?;
+    let Json(body) = body.map_err(|_| Failure::Input)?;
+    if !matches!(body.action.as_str(), "manual" | "publish" | "remove") {
+        return Err(Failure::Input);
+    }
+    if body.action != "manual" {
+        service.admit_login()?;
+        if !(discovery::Credentials {
+            username: body.username.clone(),
+            password: body.password.clone(),
+        })
+        .valid()
+        {
+            return Err(Failure::Input);
+        }
+    } else if !body.username.is_empty() || !body.password.is_empty() {
+        return Err(Failure::Input);
+    }
+    let session = service
+        .0
+        .sessions
+        .lock()
+        .unwrap()
+        .get(&cookie_key(&headers).ok_or(Failure::Authentication)?)
+        .cloned()
+        .ok_or(Failure::Authentication)?;
+    let setup_revision = body.setup_revision.clone();
+    let discovery_revision = body.discovery_revision.clone();
+    let operation = service
+        .disk(move |store| {
+            store.begin_discovery(&setup_revision, &discovery_revision, Some(&generation))
+        })
+        .await?;
+    if body.action == "manual" {
+        operation.manual().map_err(|error| {
+            Failure::Discovery(
+                error
+                    .downcast_ref::<discovery::Error>()
+                    .copied()
+                    .unwrap_or(discovery::Error::Storage),
+            )
+        })?;
+    } else {
+        let action = if body.action == "publish" {
+            discovery::Action::Publish
+        } else {
+            discovery::Action::Remove
+        };
+        let expiry = session.expires.saturating_duration_since(Instant::now());
+        let result = tokio::select! {
+            _=tokio::time::sleep(expiry)=>Err(discovery::Error::Interrupted),
+            result=operation.run(action,discovery::Credentials {username:body.username,password:body.password},body.recreate,session.cancellation)=>result,
+        };
+        result.map_err(Failure::Discovery)?;
+    }
+    setup_state(State(service), headers).await
 }
 
 #[derive(Deserialize)]

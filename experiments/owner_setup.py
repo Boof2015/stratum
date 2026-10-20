@@ -16,7 +16,8 @@ import time
 import urllib.error
 import urllib.request
 
-from access_proof import child, port, wait_ready
+from access_proof import child, port, wait_ready, request as nav_request, payload as nav_payload
+from navidrome import Navidrome
 from navidrome import require
 
 
@@ -47,6 +48,10 @@ def main(args):
                     "ND_ENABLEEXTERNALSERVICES":"false", "ND_ENABLEINSIGHTSCOLLECTOR":"false",
                     "ND_ENABLEGRAVATAR":"false", "ND_ENABLEARTWORKPRECACHE":"false",
                     "ND_SCANNER_SCHEDULE":"0", "ND_FFMPEGPATH":shutil.which("ffmpeg") or "ffmpeg"})
+        # This fixture exercises many admin operations in seconds. Do not change
+        # a real server's authentication policy.
+        if args.publication:
+            env["ND_AUTHREQUESTLIMIT"] = "100"
         cli("init", "--listen", f"127.0.0.1:{owner_port}", "--admin-origin", origin)
         cli("set-password", "--password-stdin", input=password)
         private = json.loads((data / "private.json").read_text())
@@ -55,21 +60,27 @@ def main(args):
         opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), urllib.request.HTTPSHandler(context=context))
         cookie = None
 
-        def api(path, body=None):
+        def api(path, body=None, expected=200):
             headers = {"Origin":origin, "Content-Type":"application/json"}
             if cookie:
                 headers["Cookie"] = cookie
             req = urllib.request.Request(origin + "/admin/api/" + path,
                                          data=None if body is None else json.dumps(body).encode(), headers=headers)
-            with opener.open(req, timeout=8) as response:
-                return json.loads(response.read(32768)), response.headers
+            try:
+                response = opener.open(req, timeout=35)
+            except urllib.error.HTTPError as error:
+                response = error
+            with response:
+                value = json.loads(response.read(32768))
+                require(response.status == expected, f"Owner API returned {response.status}, expected {expected}: {value.get('error', '')}")
+                return value, response.headers
 
-        with child([str(args.navidrome.resolve())], state, "navidrome", env, lifetime=55) as nav:
+        with child([str(args.navidrome.resolve())], state, "navidrome", env, lifetime=90) as nav:
             wait_ready(f"http://127.0.0.1:{nav_port}", "/ping", nav)
             detection = json.loads(cli("check-navidrome", "--url", base))
             require(detection["url"] == base and detection["authenticated"] is False, "CLI detection failed")
             print("PASS real Navidrome detected at a path prefix, without a listener account")
-            with child([binary, "serve", "--data-dir", str(data)], state, "sidecar", lifetime=40) as sidecar:
+            with child([binary, "serve", "--data-dir", str(data)], state, "sidecar", lifetime=70) as sidecar:
                 deadline = time.monotonic() + 8
                 while True:
                     require(sidecar.poll() is None, "Sidecar stopped")
@@ -96,6 +107,65 @@ def main(args):
                 require(bad.returncode != 0, "wrong prefix accepted")
                 require(json.loads(cli("status"))["config"]["setup"] == saved["setup"], "failed check changed saved settings")
                 print("PASS a wrong path fails without changing saved settings")
+                if args.publication:
+                    admin_password = secrets.token_urlsafe(24)
+                    auth = nav_payload(nav_request(base, "/auth/createAdmin", "POST", {"username":"owner", "password":admin_password}))
+                    native_headers = {"x-nd-authorization":"Bearer " + auth["token"]}
+                    listener_password = secrets.token_urlsafe(24)
+                    nav_payload(nav_request(base, "/api/user", "POST", {"userName":"listener", "name":"Listener", "password":listener_password, "isAdmin":False}, native_headers))
+                    admin = Navidrome(base, "owner", admin_password)
+                    reader = Navidrome(base, "listener", listener_password)
+                    admin.request("createInternetRadioStation", name="Ordinary radio", streamUrl="https://radio.example/live", homepageUrl="https://radio.example/")
+
+                    def radios():
+                        return reader.request("getInternetRadioStations").get("internetRadioStations", {}).get("internetRadioStation", [])
+
+                    def publication(action, username="owner", secret=None, expected=200, recreate=False):
+                        current, _ = api("setup")
+                        return api("discovery", {"action":action, "setup_revision":current["setup"]["revision"],
+                            "discovery_revision":current["discovery"]["revision"], "username":username,
+                            "password":admin_password if secret is None else secret, "recreate":recreate}, expected)[0]
+
+                    publication("publish", "listener", listener_password, expected=400)
+                    require(len(radios()) == 1, "ordinary account changed radio list")
+                    current, _ = api("setup")
+                    api("discovery", {"action":"manual", "setup_revision":current["setup"]["revision"], "discovery_revision":current["discovery"]["revision"]})
+                    print("PASS ordinary account cannot publish; manual setup remains available")
+                    publication("publish", secret="wrong-password", expected=400)
+                    require(len(radios()) == 1, "wrong password changed radio list")
+                    result = publication("publish")
+                    require(result["discovery"]["status"] == "published", "publication not verified")
+                    station = next(row for row in radios() if row["name"].startswith("Stratum — "))
+                    from urllib.parse import unquote
+                    metadata = json.loads(unquote(station["homePageUrl"].split("#stratum-v1=", 1)[1]))
+                    require(metadata["endpoints"] == listeners, "trust/address metadata changed")
+                    require(metadata["spkiSha256"] == json.loads(cli("status"))["identity"]["spkiSha256"], "identity mismatch")
+                    print("PASS real administrator publishes exact direct/proxy metadata for ordinary listeners")
+                    publication("publish")
+                    require(len(radios()) == 2, "repeated publish created a duplicate")
+                    listeners[0]["url"] = "https://changed.home.lan:7843"
+                    current, _ = api("setup")
+                    api("setup/listeners", {"revision":current["setup"]["revision"], "listeners":listeners})
+                    publication("publish")
+                    updated = next(row for row in radios() if row["id"] == station["id"])
+                    require(updated["streamUrl"].startswith(listeners[0]["url"]), "did not update same station")
+                    print("PASS repeated publication is idempotent and changes update the saved station")
+                    admin.request("deleteInternetRadioStation", id=station["id"])
+                    publication("publish", expected=400)
+                    require(len(radios()) == 1, "missing announcement was recreated without explicit choice")
+                    publication("publish", recreate=True)
+                    print("PASS externally removed announcement requires explicit recreation")
+                    cli("remove-discovery", "--username", "owner", "--password-stdin", input=admin_password)
+                    require(len(radios()) == 1 and radios()[0]["name"] == "Ordinary radio", "removal damaged unrelated station")
+                    cli("publish-discovery", "--username", "owner", "--password-stdin", input=admin_password)
+                    require(len(radios()) == 2, "CLI publication failed")
+                    publication("remove")
+                    require(len(radios()) == 1, "web removal failed")
+                    print("PASS CLI and web share verified publication/removal state")
+                    for filename in ["config.json", "private.json", "discovery.json"]:
+                        contents = (data / filename).read_text()
+                        require(all(secret not in contents for secret in [admin_password, listener_password, auth["token"], auth["subsonicToken"]]), "Navidrome credential saved")
+                    print("PASS no Navidrome administrator credentials retained in Sidecar state")
                 print("Navidrome version: " + str(detection["server_version"]))
         print("PASS disposable services stopped; temporary state removed on exit")
 
@@ -104,4 +174,5 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--navidrome", type=Path, required=True)
     parser.add_argument("--sidecar", type=Path, required=True)
+    parser.add_argument("--publication", action="store_true", help="also exercise announcement maintenance with disposable accounts")
     main(parser.parse_args())

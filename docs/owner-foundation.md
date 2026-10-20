@@ -4,8 +4,9 @@ This is the first owner-setup checkpoint, separate from `sidecar-access` and the
 audio engine. It supplies persistent configuration and HTTPS identity, terminal
 or browser password enrollment, owner sessions, and local password recovery.
 It is **not a complete streaming deployment**. [Connection setup](owner-setup.md)
-is now available as checkpoint 2. Discovery publication, the full dashboard,
-retained cache and Docker/systemd packaging come in subsequent checkpoints. Astra's current streaming integration is unchanged.
+is available as checkpoint 2 and [discovery publication](owner-discovery.md) as
+checkpoint 3. The full dashboard, retained cache and Docker/systemd packaging
+come in subsequent checkpoints. Astra's current streaming integration is unchanged.
 
 ## Start an isolated installation
 

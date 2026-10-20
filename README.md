@@ -6,9 +6,10 @@ Astra Sidecar, will work alongside Navidrome; Astra will be a client.
 
 The separate `sidecar` binary now provides **persistent owner setup**: HTTPS
 identity, browser/terminal password setup, recovery, and resumable Navidrome and
-listener-address configuration. See [owner access](docs/owner-foundation.md) and
-[connection setup and checkpoint limits](docs/owner-setup.md). It does not yet
-publish discovery, serve music or replace the existing `sidecar-access` proof.
+listener-address configuration, and optional discovery publication. See
+[owner access](docs/owner-foundation.md), [connection setup](docs/owner-setup.md)
+and [discovery maintenance](docs/owner-discovery.md). It does not yet serve music
+or replace the existing `sidecar-access` proof.
 
 This repository contains **audio and delivery proofs of concept**, not a deployed
 server or an Astra integration. They generate independently decodable FLAC/Opus

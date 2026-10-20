@@ -221,6 +221,7 @@ impl Store {
         owner_generation: Option<&str>,
     ) -> Result<SetupState> {
         let settings = settings.normalized()?;
+        let _operation = self.discovery_lock()?;
         let _lock = self.lock("state.lock")?;
         let state = self.read_state()?;
         let owner = state.owner.ok_or(SetupWriteError::OwnerChanged)?;
@@ -237,6 +238,63 @@ impl Store {
         };
         self.write("config.json", &config)?;
         Ok(config.setup)
+    }
+
+    pub fn discovery(&self) -> Result<super::discovery::Discovery> {
+        match fs::symlink_metadata(self.directory.join("discovery.json")) {
+            Ok(_) => {
+                let value: super::discovery::Discovery = self.read("discovery.json")?;
+                value.validate()?;
+                Ok(value)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(super::discovery::Discovery::default())
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn discovery_lock(&self) -> Result<File> {
+        let file = self.lock_file("discovery.lock")?;
+        file.try_lock_exclusive()
+            .map_err(|_| super::discovery::Error::Busy)?;
+        Ok(file)
+    }
+
+    pub fn begin_discovery(
+        &self,
+        setup_revision: &str,
+        discovery_revision: &str,
+        generation: Option<&str>,
+    ) -> Result<super::discovery::Operation> {
+        let operation = self.discovery_lock()?;
+        let _state = self.lock("state.lock")?;
+        let owner = self
+            .owner_generation()?
+            .ok_or(SetupWriteError::OwnerChanged)?;
+        if generation.is_some_and(|generation| generation != owner) {
+            return Err(SetupWriteError::OwnerChanged.into());
+        }
+        let setup = self.config()?.setup;
+        let state = self.discovery()?;
+        ensure!(
+            setup.revision == setup_revision && state.revision == discovery_revision,
+            super::discovery::Error::Conflict
+        );
+        Ok(super::discovery::Operation {
+            store: self.clone(),
+            _lock: operation,
+            setup,
+            state,
+            identity: self.identity()?,
+            generation: owner,
+        })
+    }
+
+    pub(crate) fn write_discovery(&self, value: &super::discovery::Discovery) -> Result<()> {
+        value.validate()?;
+        let _state = self.lock("state.lock")?;
+        self.write("discovery.json", value)
     }
 
     pub fn identity(&self) -> Result<Identity> {

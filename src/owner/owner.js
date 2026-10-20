@@ -3,6 +3,8 @@ const element = (id) => document.getElementById(id);
 let needsOwner = false;
 let busy = false;
 let saved = null;
+let discoveryState = { revision: 'initial', status: 'not-published', hasAnnouncement: false };
+let discoveryAction = null;
 
 async function request(path, body) {
   const response = await fetch(`/admin/api/${path}`, body === undefined ? {} : {
@@ -57,7 +59,9 @@ function showStep(step) {
     const listeners = saved.settings.listeners;
     for (const endpoint of listeners.length ? listeners : [{ url: '', trust: 'sidecar_key' }]) addAddress(endpoint);
   }
+  clearDiscoveryForm();
   if (step === 'summary') {
+    renderDiscovery();
     element('saved-navidrome').textContent = saved.settings.navidrome_url;
     element('saved-addresses').replaceChildren();
     saved.settings.listeners.forEach((endpoint, index) => {
@@ -70,6 +74,8 @@ function showStep(step) {
 }
 function resume(value) {
   saved = value.setup;
+  if (value.discovery) discoveryState = value.discovery;
+  else if (discoveryState.hasAnnouncement) discoveryState = { ...discoveryState, status: 'update-needed' };
   showStep(value.stage === 'connections-saved' ? 'summary' : value.stage);
 }
 function addAddress(endpoint = { url: '', trust: 'sidecar_key' }) {
@@ -106,6 +112,7 @@ async function refresh() {
   element('retry').hidden = true;
   element('owner-form').hidden = true;
   element('ready').hidden = true;
+  clearDiscoveryForm();
   try {
     const status = await request('status');
     needsOwner = !status.ownerConfigured;
@@ -148,6 +155,7 @@ element('navidrome-form').addEventListener('submit', (event) => {
     try {
       const value = await request('setup/navidrome', { revision: saved.revision, url: element('navidrome-url').value });
       saved = value.setup;
+      if (discoveryState.hasAnnouncement) discoveryState = { ...discoveryState, status: 'update-needed' };
       showStep(saved.settings.listeners.length ? 'summary' : 'listeners');
       element('message').textContent = 'Navidrome detected. Sign-in has not been checked.';
     } finally { element('navidrome-save').textContent = 'Check and continue'; }
@@ -172,4 +180,60 @@ element('check-again').addEventListener('click', () => operate(async () => {
 }));
 element('logout').addEventListener('click', () => operate(async () => { await request('logout', {}); saved = null; await refresh(); }));
 for (const id of ['retry', 'reload']) element(id).addEventListener('click', () => operate(refresh));
+function clearDiscoveryForm() {
+  discoveryAction = null;
+  element('discovery-form').reset();
+  element('discovery-form').hidden = true;
+}
+function renderDiscovery() {
+  const labels = {
+    'not-published': 'Choose automatic discovery or manual address setup.',
+    manual: 'Manual address setup selected. No announcement is published.',
+    published: 'Announcement published and verified on Navidrome.',
+    'update-needed': 'The announcement needs updating to match the saved connections.',
+    unverified: 'An earlier change needs verification. Retry to check what reached Navidrome.',
+    problem: 'Discovery needs attention.',
+  };
+  element('discovery-status').textContent = labels[discoveryState.status] || labels['not-published'];
+  element('discovery-error').textContent = discoveryState.error || '';
+  element('publish-discovery').hidden = discoveryState.pendingAction === 'remove';
+  element('publish-discovery').textContent = discoveryState.canRecreate ? 'Recreate announcement' : discoveryState.hasAnnouncement ? 'Update or verify discovery' : discoveryState.error ? 'Retry publication' : 'Publish discovery';
+  element('manual-discovery').hidden = discoveryState.hasAnnouncement || discoveryState.status === 'manual';
+  element('remove-discovery').hidden = !discoveryState.hasAnnouncement;
+  element('remove-discovery').textContent = discoveryState.pendingAction === 'remove' ? 'Retry removal' : 'Remove announcement';
+}
+function showDiscoveryForm(action) {
+  clearDiscoveryForm(); discoveryAction = action;
+  const target = action === 'remove' ? discoveryState.target : saved.settings.navidrome_url;
+  element('discovery-target').textContent = `Sign in to Navidrome at ${target}`;
+  element('discovery-submit').textContent = action === 'remove' ? 'Remove announcement' : discoveryState.canRecreate ? 'Recreate announcement' : 'Publish discovery';
+  element('discovery-form').hidden = false;
+  element('navidrome-admin').focus();
+}
+for (const [id, action] of [['publish-discovery', 'publish'], ['remove-discovery', 'remove']]) {
+  element(id).addEventListener('click', () => showDiscoveryForm(action));
+}
+element('discovery-cancel').addEventListener('click', clearDiscoveryForm);
+element('manual-discovery').addEventListener('click', () => operate(async () => {
+  resume(await request('discovery', { action: 'manual', setup_revision: saved.revision, discovery_revision: discoveryState.revision }));
+}));
+element('discovery-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  operate(async () => {
+    const body = { action: discoveryAction, setup_revision: saved.revision, discovery_revision: discoveryState.revision,
+      username: element('navidrome-admin').value, password: element('navidrome-password').value,
+      recreate: discoveryAction === 'publish' && !!discoveryState.canRecreate };
+    // Clear DOM values as soon as the request begins, including failed requests.
+    element('discovery-form').reset();
+    try { resume(await request('discovery', body)); }
+    catch (error) {
+      // The server may have saved an interrupted/failed operation. Reload its
+      // public state so Retry can reconcile it with fresh credentials.
+      if (error.status !== 401) {
+        try { resume(await request('setup')); } catch { /* Keep the original error. */ }
+      }
+      throw error;
+    } finally { body.password = ''; body.username = ''; }
+  });
+});
 operate(refresh);

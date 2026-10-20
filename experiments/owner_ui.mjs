@@ -20,6 +20,8 @@ let errorNext = null;
 let held = null;
 let delayNext = false;
 let saves = 0;
+let discovery = { revision: 'initial', status: 'not-published', hasAnnouncement: false };
+let publicationRequests = 0;
 const stage = () => !saved.settings.navidrome_url ? 'navidrome' : saved.settings.listeners.length ? 'connections-saved' : 'listeners';
 const server = createServer(async (request, response) => {
   const send = (status, value) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(value)); };
@@ -38,9 +40,16 @@ const server = createServer(async (request, response) => {
     if (path === 'login') { signedIn = true; return send(200, {}); }
     if (path === 'logout') { signedIn = false; return send(200, {}); }
     if (!signedIn) return send(401, { error: 'Sign in again.' });
-    if (path === 'setup') return send(200, { stage: stage(), setup: saved });
+    if (path === 'setup') return send(200, { stage: stage(), setup: saved, discovery });
+    if (path === 'discovery') publicationRequests++;
     if (errorNext) { const error = errorNext; errorNext = null; return send(error.status, { error: error.message }); }
     if (delayNext) { delayNext = false; await new Promise((resolve) => { held = resolve; }); }
+    if (path === 'discovery') {
+      if (body.setup_revision !== saved.revision || body.discovery_revision !== discovery.revision) return send(409, { error: 'Reload saved settings.' });
+      discovery = { revision: String(publicationRequests), status: body.action === 'publish' ? 'published' : 'manual',
+        hasAnnouncement: body.action === 'publish', target: saved.settings.navidrome_url };
+      return send(200, { stage: stage(), setup: saved, discovery });
+    }
     if (path === 'setup/check') return send(200, { authenticated: false });
     if (body.revision !== saved.revision) return send(409, { error: 'Setup changed elsewhere. Reload the saved settings before trying again.' });
     const settings = structuredClone(saved.settings);
@@ -140,6 +149,34 @@ try {
   assert.deepEqual(saved.settings.listeners, [{url:'https://home.lan:7843',trust:'sidecar_key'}, {url:'https://public.example/stratum',trust:'https_proxy'}]);
   assert.equal(await evaluate('document.getElementById("summary-section").hidden'), false);
   console.log('PASS primary and additional trust modes save and render');
+  await click('manual-discovery'); await idle();
+  assert.equal(discovery.status, 'manual');
+  assert.equal(await evaluate('document.getElementById("discovery-form").hidden'), true);
+  console.log('PASS manual selection needs no administrator credentials');
+  await click('publish-discovery');
+  await fill('#navidrome-admin', 'admin'); await fill('#navidrome-password', 'fake-nav-password');
+  errorNext = { status: 400, message: 'Navidrome refused this sign-in.' };
+  await submit('discovery-form'); await idle();
+  assert.equal(discovery.status, 'manual');
+  assert.equal(await evaluate('document.getElementById("navidrome-password").value'), '');
+  assert.match(await evaluate('document.getElementById("message").textContent'), /refused/);
+  console.log('PASS failed publication clears credentials and keeps manual configuration');
+  await click('publish-discovery');
+  await fill('#navidrome-admin', 'admin'); await fill('#navidrome-password', 'fake-nav-password');
+  delayNext = true;
+  await submit('discovery-form'); await until('busy');
+  assert.equal(await evaluate('document.getElementById("navidrome-password").value'), '');
+  const publicationDeadline = Date.now() + 5000;
+  while (!held) { if (Date.now() > publicationDeadline) throw new Error('Publication did not reach fixture'); await pause(10); }
+  held(); held = null; await idle();
+  assert.equal(discovery.status, 'published');
+  await shot('discovery-published');
+  await click('remove-discovery');
+  await fill('#navidrome-admin', 'admin'); await fill('#navidrome-password', 'fake-nav-password');
+  await submit('discovery-form'); await idle();
+  assert.equal(discovery.status, 'manual');
+  assert.equal(discovery.hasAnnouncement, false);
+  console.log('PASS explicit publish/remove refreshes status and discards form credentials');
   await shot('connections-saved');
   await click('edit-listeners');
   await fill('#addresses input', 'https://stale.lan:7843');

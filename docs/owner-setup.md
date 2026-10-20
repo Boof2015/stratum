@@ -3,7 +3,8 @@
 Checkpoint 2 adds a resumable Navidrome/listener setup flow to the `sidecar`
 binary. Start with [owner access and HTTPS enrollment](owner-foundation.md).
 This remains a development preview: saving connections does **not** publish a
-radio announcement or start serving music. Those are subsequent checkpoints.
+radio announcement or start serving music. [Discovery publication](owner-discovery.md)
+is now a separate optional step; music serving is still a subsequent checkpoint.
 
 ## Browser flow
 
@@ -97,8 +98,8 @@ choice. Resetting the owner password and restarting preserve saved connections.
   query strings, fragments, wildcard listen addresses and zero ports are rejected.
   Trailing slashes are normalized while prefixes, order and trust choices remain.
 
-Later publication must use temporary Navidrome administrator authorization and
-bind announcements to the currently saved settings/identity. Music requests
+[Publication](owner-discovery.md) uses temporary Navidrome administrator
+authorization and binds announcements to the saved settings/identity. Music requests
 must still use the listener's own Navidrome permissions. Detection and owner
 cookies grant neither privilege.
 

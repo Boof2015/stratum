@@ -199,7 +199,7 @@ impl Probe {
             client: Self::builder().build()?,
         })
     }
-    fn builder() -> reqwest::ClientBuilder {
+    pub(super) fn builder() -> reqwest::ClientBuilder {
         Client::builder()
             .no_proxy()
             .redirect(reqwest::redirect::Policy::none())
