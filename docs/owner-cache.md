@@ -89,15 +89,16 @@ Least recently used order survives restart approximately through file
 modification times. Entry bytes, including their small integrity headers,
 count against the limit; filesystem allocation/metadata overhead is not included.
 On low space, retention first evicts entries and then skips new writes if it
-cannot leave a 512 MiB free-space reserve on its volume. This is a conservative
-retention guard, **not** the final working-storage/admission policy.
+cannot leave a 512 MiB free-space reserve on its volume, plus active working
+reservations when they share that volume. The
+[resource controls](owner-resources.md) describe working admission and recovery.
 
 ## Remaining limits and verification
 
 The source/worker bounds in [HTTPS streaming](owner-streaming.md) still apply.
-Working storage can be on a different volume from retained storage. Hard-crash
-cleanup of temporary source directories, configurable working limits, resource
-scheduling and the final low-disk policy remain future work.
+Working storage can be on a different volume from retained storage. Checkpoint
+4c adds [working limits, scheduling and hard-crash cleanup](owner-resources.md);
+these controls do not eliminate complete-source acquisition.
 
 The Rust suite checks eviction, large configured limits without reservation,
 corruption, symlinks, interrupted clears, late jobs, low-space behavior,

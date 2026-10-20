@@ -53,6 +53,8 @@ impl Listener {
             audio: Arc::new(access::audio::Store::persistent(
                 &store.cache_directory(),
                 &store.config()?.storage,
+                &store.working_directory(),
+                &store.config()?.resources,
             )?),
             requests: Semaphore::new(8),
             storage_jobs: Arc::new(Semaphore::new(2)),
@@ -75,11 +77,12 @@ impl Listener {
         // That prevents cancelled requests piling up background filesystem work.
         let audio = self.0.audio.clone();
         let (mut current, snapshot) = tokio::task::spawn_blocking(move || {
-            let snapshot = store.listener_configuration().map(|(key, storage)| {
+            let snapshot = store.listener_configuration().map(|configuration| {
                 // Cache problems must not cancel otherwise healthy audio. It
                 // bypasses retention until the persisted settings can be applied.
-                let _ = audio.retained().unwrap().apply(&storage);
-                key
+                let _ = audio.retained().unwrap().apply(&configuration.storage);
+                audio.apply_resources(&configuration.resources);
+                configuration.key
             });
             (current, snapshot)
         })
@@ -117,7 +120,7 @@ impl Listener {
         let store = self.0.store.clone();
         tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
             let _permit = permit;
-            Ok(json!({"settings":store.config()?.storage, "cache": audio.retained().unwrap().stats(), "working_bytes":audio.working_bytes()?}))
+            Ok(json!({"settings":store.config()?.storage, "cache": audio.retained().unwrap().stats(), "working_bytes":audio.working_bytes()?,"resources":store.config()?.resources,"runtime":audio.resource_stats()}))
         }).await?
     }
 

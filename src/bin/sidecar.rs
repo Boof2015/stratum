@@ -19,6 +19,7 @@ sidecar status --data-dir DIR
 sidecar configure --data-dir DIR --settings FILE
 sidecar configure-cache --data-dir DIR [--limit-gb N] [--enable | --disable --confirm]
 sidecar clear-cache --data-dir DIR --confirm
+sidecar configure-resources --data-dir DIR [--conversions automatic|1|2|3|4] [--working-mb N]
 sidecar check-navidrome --data-dir DIR [--url URL]
 sidecar manual-discovery --data-dir DIR
 sidecar publish-discovery --data-dir DIR --username NAME [--password-stdin] [--recreate]
@@ -69,6 +70,7 @@ async fn run() -> Result<()> {
             "status",
             "configure",
             "configure-cache",
+            "configure-resources",
             "clear-cache",
             "check-navidrome",
             "manual-discovery",
@@ -89,6 +91,8 @@ async fn run() -> Result<()> {
     let mut cache_limit = None;
     let mut cache_enabled = None;
     let mut confirmed = false;
+    let mut conversions: Option<Option<usize>> = None;
+    let mut working_mb: Option<u64> = None;
     while let Some(flag) = args.next() {
         match flag.to_str() {
             Some("--data-dir") if directory.is_none() => {
@@ -139,6 +143,26 @@ async fn run() -> Result<()> {
                     args.next()
                         .and_then(|v| v.into_string().ok())
                         .context("--username needs a Navidrome administrator name.")?,
+                );
+            }
+            Some("--conversions") if command == "configure-resources" && conversions.is_none() => {
+                let value = args
+                    .next()
+                    .and_then(|v| v.into_string().ok())
+                    .context("--conversions needs automatic or 1–4.")?;
+                conversions = Some(if value == "automatic" {
+                    None
+                } else {
+                    Some(value.parse().context("Use automatic or 1–4 conversions.")?)
+                });
+            }
+            Some("--working-mb") if command == "configure-resources" && working_mb.is_none() => {
+                working_mb = Some(
+                    args.next()
+                        .and_then(|v| v.into_string().ok())
+                        .context("--working-mb needs a whole number of MB.")?
+                        .parse()
+                        .context("Use a whole number of MB.")?,
                 );
             }
             Some("--limit-gb") if command == "configure-cache" && cache_limit.is_none() => {
@@ -235,6 +259,29 @@ async fn run() -> Result<()> {
             let current = store.config()?.setup;
             let saved = store.save_setup(&settings, &current.revision, None)?;
             println!("Connection settings saved ({}). Addresses have not been checked. Run check-navidrome to detect the server; this does not sign in.", saved.stage());
+        }
+        "configure-resources" => {
+            ensure!(
+                conversions.is_some() || working_mb.is_some(),
+                "Choose --conversions or --working-mb."
+            );
+            let current = store.config()?.resources;
+            let saved = store.save_resources(
+                &stratum_poc::resources::Change {
+                    revision: current.revision,
+                    max_conversions: conversions.unwrap_or(current.max_conversions),
+                    working_bytes: working_mb
+                        .map(|n| {
+                            n.checked_mul(stratum_poc::resources::MB)
+                                .context("Working-storage limit is too large.")
+                        })
+                        .transpose()?
+                        .unwrap_or(current.working_bytes),
+                },
+                None,
+            )?;
+            println!("{}", serde_json::to_string_pretty(&saved)?);
+            println!("Resource settings saved. Running jobs and active files are protected; new work uses the updated limits.");
         }
         "configure-cache" | "clear-cache" => {
             ensure!(

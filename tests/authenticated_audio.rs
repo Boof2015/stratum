@@ -234,6 +234,10 @@ impl Harness {
                 &dir.path().join("owner"),
                 &owner::Config {
                     listen: "127.0.0.1:0".parse().unwrap(),
+                    resources: stratum_poc::resources::Settings {
+                        max_conversions: Some(2),
+                        ..Default::default()
+                    },
                     ..Default::default()
                 },
             )
@@ -412,6 +416,20 @@ impl Harness {
         (value, pcm)
     }
     fn source_dirs(&self) -> usize {
+        if let Some(owner) = &self.owner {
+            return fs::read_dir(owner.working_directory())
+                .unwrap()
+                .filter_map(Result::ok)
+                .filter(|e| e.file_type().unwrap().is_dir())
+                .map(|e| {
+                    fs::read_dir(e.path())
+                        .unwrap()
+                        .filter_map(Result::ok)
+                        .filter(|child| child.file_type().unwrap().is_dir())
+                        .count()
+                })
+                .sum();
+        }
         fs::read_dir(self.dir.path())
             .unwrap()
             .filter_map(Result::ok)
@@ -442,8 +460,10 @@ impl Harness {
             .is_success());
     }
     async fn restart_installed(&mut self) {
-        unsafe {
-            libc::kill(self.process.id() as i32, libc::SIGTERM);
+        if self.process.try_wait().unwrap().is_none() {
+            unsafe {
+                libc::kill(self.process.id() as i32, libc::SIGTERM);
+            }
         }
         let deadline = Instant::now() + Duration::from_secs(6);
         while self.process.try_wait().unwrap().is_none() {
@@ -519,6 +539,138 @@ impl Harness {
             200
         );
     }
+    async fn resource_change(&self, conversions: usize, working_mb: u64) {
+        let store = self.owner.as_ref().unwrap();
+        let current = store.config().unwrap().resources;
+        store
+            .save_resources(
+                &stratum_poc::resources::Change {
+                    revision: current.revision,
+                    max_conversions: Some(conversions),
+                    working_bytes: working_mb * 1_000_000,
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(
+            self.http
+                .get(format!("{}/access/v1/capabilities", self.base))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_working_limit_protects_current_streams_and_releases_closed_files() {
+    let test = Harness::installed(96000).await;
+    test.resource_change(1, 128).await;
+    let alice = test.login("alice").await;
+    let bob = test.login("bob").await;
+    let a = test.handle(&alice).await;
+    let next = test.handle(&alice).await;
+    let b = test.open(&bob, "b").await.json::<Value>().await.unwrap();
+    // Three small sources plus their worker headroom fit; a fourth does not.
+    let refused = test.open(&bob, "b").await;
+    assert_eq!(refused.status(), 503);
+    assert_eq!(refused.headers()[header::RETRY_AFTER], "1");
+    assert_eq!(
+        refused.json::<Value>().await.unwrap()["error"],
+        "working_storage_unavailable"
+    );
+    test.decoded(
+        &alice,
+        a["playback"].as_str().unwrap(),
+        0,
+        4 * 96000,
+        "lossless",
+    )
+    .await;
+    test.close_playback(&alice, next["playback"].as_str().unwrap())
+        .await;
+    let more = test.open(&bob, "b").await;
+    assert_eq!(more.status(), 201);
+    test.decoded(
+        &bob,
+        b["playback"].as_str().unwrap(),
+        0,
+        4 * 96000,
+        "opus-64",
+    )
+    .await;
+    test.resource_change(2, 512).await;
+    test.decoded(
+        &alice,
+        a["playback"].as_str().unwrap(),
+        96000,
+        96000,
+        "opus-128",
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_hard_crash_stops_encoder_descendants_and_recovers_owned_working_files() {
+    let mut test = Harness::installed(48000).await;
+    let token = test.login("alice").await;
+    let opened = test.handle(&token).await;
+    let handle = opened["playback"].as_str().unwrap();
+    let old_root = fs::read_dir(test.owner.as_ref().unwrap().working_directory())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().unwrap().is_dir())
+        .unwrap()
+        .path();
+    fs::write(test.dir.path().join("hold-worker"), b"hold").unwrap();
+    let pending = test
+        .http
+        .post(format!("{}/audio/v1/playback/{handle}/segment", test.base))
+        .bearer_auth(&token)
+        .json(&json!({"start":0,"frames":48000,"quality":"opus-64"}))
+        .send();
+    tokio::pin!(pending);
+    let wait_pid = async {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if let Ok(value) = fs::read_to_string(test.dir.path().join("worker-pid")) {
+                if let Ok(pid) = value.trim().parse::<i32>() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    let pid = tokio::select! {_=&mut pending=>panic!("encoder was not held"),pid=wait_pid=>pid};
+    test.process.kill().unwrap(); // SIGKILL: no service destructors or graceful shutdown
+    let _ = pending.await;
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while unsafe { libc::kill(pid, 0) } == 0 {
+        assert!(
+            Instant::now() < deadline,
+            "encoder survived its parent's hard crash"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        old_root.exists(),
+        "hard kill should leave working files to recover"
+    );
+    test.restart_installed().await;
+    assert!(!old_root.exists());
+    let token = test.login("alice").await;
+    let fresh = test.handle(&token).await;
+    test.decoded(
+        &token,
+        fresh["playback"].as_str().unwrap(),
+        0,
+        48000,
+        "lossless",
+    )
+    .await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -541,6 +693,20 @@ async fn installed_retention_survives_restart_and_rechecks_each_listeners_access
     let (warm, actual) = test.decoded(&bob, handle, 37, 48001, "opus-64").await;
     assert_eq!(warm["retained_cache_hit"], true);
     assert_eq!(actual, expected);
+    // Scheduling intent must not change the encoded interval's cache identity.
+    let prefetch = test
+        .http
+        .post(format!("{}/audio/v1/playback/{handle}/segment", test.base))
+        .bearer_auth(&bob)
+        .json(&json!({"start":37,"frames":48001,"quality":"opus-64","priority":"prefetch"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(prefetch.status(), 200);
+    let bytes = prefetch.bytes().await.unwrap();
+    let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let metadata: Value = serde_json::from_slice(&bytes[4..4 + length]).unwrap();
+    assert_eq!(metadata["retained_cache_hit"], true);
     assert!(!test.dir.path().join("worker-pid").exists());
     fs::remove_file(test.dir.path().join("hold-worker")).unwrap();
     assert_eq!(

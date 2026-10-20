@@ -28,6 +28,8 @@ After owner sign-in:
 
 The summary also has [Storage controls](owner-cache.md): retained cache usage,
 its limit, clear/disable confirmations, and separate temporary working usage.
+[Resource controls](owner-resources.md) set simultaneous conversions and the
+temporary working-storage budget.
 
 Direct addresses record `sidecar_key`, for verification against Sidecar's
 persistent SPKI identity. Proxy addresses record `https_proxy`, for normal

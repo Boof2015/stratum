@@ -229,7 +229,9 @@ async fn settings_changes_revoke_sessions_without_forwarding_them_to_the_new_ups
         401
     );
     let current = login(&listener).await;
-    // Reconstructing the service (restart) shares identity, never live sessions.
+    // A real restart stops the old process before acquiring its working directory.
+    listener.stop().await;
+    drop(listener);
     let restarted = Listener::new(store).unwrap();
     assert_eq!(
         call(
@@ -243,7 +245,7 @@ async fn settings_changes_revoke_sessions_without_forwarding_them_to_the_new_ups
         .status(),
         401
     );
-    listener.stop().await;
+    restarted.stop().await;
 }
 
 #[tokio::test]

@@ -161,6 +161,7 @@ enum Failure {
     TooLarge,
     Playback,
     Encoding,
+    Storage,
 }
 impl IntoResponse for Failure {
     fn into_response(self) -> Response {
@@ -177,11 +178,21 @@ impl IntoResponse for Failure {
             ),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
             Self::Unsupported => (StatusCode::UNSUPPORTED_MEDIA_TYPE, "unsupported_source"),
+            Self::Storage => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "working_storage_unavailable",
+            ),
             Self::TooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "source_limit_exceeded"),
             Self::Playback => (StatusCode::NOT_FOUND, "playback_unavailable"),
             Self::Encoding => (StatusCode::UNPROCESSABLE_ENTITY, "audio_preparation_failed"),
         };
-        (status, Json(json!({"error": code}))).into_response()
+        let mut response = (status, Json(json!({"error": code}))).into_response();
+        if matches!(self, Self::Busy | Self::Storage) {
+            response
+                .headers_mut()
+                .insert(header::RETRY_AFTER, "1".parse().unwrap());
+        }
+        response
     }
 }
 

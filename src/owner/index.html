@@ -111,9 +111,26 @@
               <button id="cache-confirm" type="button">Clear cached audio</button>
             </div>
           </div>
-          <button id="storage-refresh" type="button">Refresh storage use</button>
+          <h2>Resources</h2>
+          <p id="resources-status"></p>
+          <form id="resources-form" hidden>
+            <label>Simultaneous conversions
+              <select id="resource-conversions">
+                <option value="automatic">Automatic</option>
+                <option value="1">1</option><option value="2">2</option>
+                <option value="3">3</option><option value="4">4</option>
+              </select>
+            </label>
+            <p class="hint">Automatic chooses a conservative limit for this machine. Cached audio does not use a conversion slot.</p>
+            <label>Temporary working-storage limit (MB)
+              <input id="resource-working" type="number" min="128" step="1" required>
+            </label>
+            <p class="hint">Separate from the retained cache. Lowering a limit lets current jobs finish and keeps their files until they are no longer needed. New work waits or retries when capacity is full.</p>
+            <button type="submit">Save resource settings</button>
+          </form>
+          <button id="storage-refresh" type="button">Refresh resource and storage use</button>
         </section>
-        <p class="preview">Development preview: authenticated audio is available with these connections. Retained segments are available. Resource controls and the live dashboard are still being built.</p>
+        <p class="preview">Development preview: authenticated audio is available with these connections. Storage and resource controls are available. The live dashboard and deployment packaging are still being built.</p>
       </section>
       <footer><button id="logout" type="button">Sign out</button></footer>
     </section>

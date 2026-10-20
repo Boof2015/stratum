@@ -5,6 +5,25 @@ use anyhow::{ensure, Context};
 use std::{fs, process::Command};
 
 pub fn worker_main() {
+    // The service keeps this stdin pipe open. EOF after a hard parent crash
+    // must kill FFmpeg descendants too, before a new service reclaims staging.
+    #[cfg(unix)]
+    std::thread::spawn(|| {
+        use std::io::Read;
+        let mut byte = [0u8; 1];
+        loop {
+            match std::io::stdin().read(&mut byte) {
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                _ => break,
+            }
+        }
+        unsafe {
+            if libc::getpgrp() == libc::getpid() {
+                libc::kill(-libc::getpgrp(), libc::SIGKILL);
+            }
+        }
+        std::process::exit(1);
+    });
     // The worker and its FFmpeg children inherit a per-file write ceiling. Parent
     // supervision adds a deadline, bounded concurrency and process-group teardown.
     #[cfg(unix)]
@@ -42,6 +61,7 @@ fn work() -> Result<Vec<u8>, WorkerFailure> {
         .nth(2)
         .map(PathBuf::from)
         .ok_or(WorkerFailure::Internal)?;
+    let _lease = crate::resources::working::worker_lease(&directory)?;
     let job: Job =
         serde_json::from_slice(&fs::read(directory.join("job.json")).map_err(anyhow::Error::from)?)
             .map_err(anyhow::Error::from)?;

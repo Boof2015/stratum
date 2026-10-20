@@ -135,6 +135,10 @@ impl Service {
             .route("/admin/api/setup/check", post(check_navidrome))
             .route("/admin/api/discovery", post(change_discovery))
             .route(
+                "/admin/api/resources",
+                get(storage_state).post(change_resources),
+            )
+            .route(
                 "/admin/api/storage",
                 get(storage_state).post(change_storage),
             )
@@ -426,6 +430,30 @@ async fn change_storage(
     })?;
     service
         .disk(move |store| store.save_storage(&body, Some(&generation)))
+        .await?;
+    storage_state(State(service), headers).await
+}
+
+async fn change_resources(
+    State(service): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<crate::resources::Change>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, Failure> {
+    let generation = service.authorize(&headers).await?;
+    let Json(body) = body.map_err(|_| Failure::Input)?;
+    crate::resources::Settings {
+        max_conversions: body.max_conversions,
+        working_bytes: body.working_bytes,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|_| {
+        Failure::Setup(
+            "Choose Automatic or 1–4 conversions, and a working-storage limit of at least 128 MB.",
+        )
+    })?;
+    service
+        .disk(move |store| store.save_resources(&body, Some(&generation)))
         .await?;
     storage_state(State(service), headers).await
 }

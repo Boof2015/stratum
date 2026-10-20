@@ -24,6 +24,9 @@ let discovery = { revision: 'initial', status: 'not-published', hasAnnouncement:
 let publicationRequests = 0;
 let storage = { settings: { revision: 'initial', enabled: true, limit_bytes: 5e9, clear_epoch: 'initial' },
   cache: { retained_bytes: 123e6, entries: 32, problem: false }, working_bytes: 64e6 };
+storage.resources = {revision:'initial',max_conversions:null,working_bytes:512e6};
+storage.runtime = {detected_cpus:4,conversions:{limit:2,running:0,waiting:0},working:{reserved_bytes:96e6,limit_bytes:512e6,free_reserve_bytes:512*1024*1024}};
+let resourceRequests = 0;
 let storageRequests = 0;
 const stage = () => !saved.settings.navidrome_url ? 'navidrome' : saved.settings.listeners.length ? 'connections-saved' : 'listeners';
 const server = createServer(async (request, response) => {
@@ -47,6 +50,14 @@ const server = createServer(async (request, response) => {
     if (path === 'discovery') publicationRequests++;
     if (errorNext) { const error = errorNext; errorNext = null; return send(error.status, { error: error.message }); }
     if (delayNext) { delayNext = false; await new Promise((resolve) => { held = resolve; }); }
+    if (path === 'resources') {
+      if (body.revision !== storage.resources.revision) return send(409,{error:'Reload saved settings.'});
+      resourceRequests++;
+      storage.resources = {...body,revision:String(resourceRequests)};
+      storage.runtime.conversions.limit = body.max_conversions ?? 2;
+      storage.runtime.working.limit_bytes = body.working_bytes;
+      return send(200,storage);
+    }
     if (path === 'storage') {
       if (request.method === 'GET') return send(200, storage);
       storageRequests++;
@@ -237,6 +248,32 @@ try {
   assert.equal(await evaluate('document.getElementById("cache-limit").value'), '1000');
   console.log('PASS edited drafts cancel stale confirmations and concurrent changes require reload');
   await shot('cache-controls');
+  assert.equal(await evaluate('document.getElementById("resource-conversions").value'),'automatic');
+  assert.match(await evaluate('document.getElementById("resources-status").textContent'),/limit 2 \(Automatic\)/);
+  const cacheRevision = storage.settings.revision;
+  await fill('#resource-conversions','1'); await fill('#resource-working','128');
+  await submit('resources-form'); await idle();
+  assert.equal(storage.resources.max_conversions,1);
+  assert.equal(storage.resources.working_bytes,128e6);
+  assert.equal(storage.settings.revision,cacheRevision);
+  assert.match(await evaluate('document.getElementById("storage-working").textContent'),/reserved/);
+  console.log('PASS resource changes save separately and show working reservations');
+  errorNext={status:503,message:'Could not save resource settings.'};
+  await fill('#resource-conversions','4'); await fill('#resource-working','512');
+  await submit('resources-form'); await idle();
+  assert.equal(await evaluate('document.getElementById("resource-conversions").value'),'1');
+  assert.equal(await evaluate('document.getElementById("resource-working").value'),'128');
+  console.log('PASS failed resource save restores both saved choices');
+  storage.resources.revision='changed-by-cli';
+  await fill('#resource-conversions','automatic');await submit('resources-form');await idle();
+  assert.equal(await evaluate('document.getElementById("reload").hidden'),false);
+  await click('reload');await idle();
+  await fill('#resource-conversions','automatic');await submit('resources-form');await idle();
+  assert.equal(storage.resources.max_conversions,null);
+  assert.equal(storage.runtime.conversions.limit,2);
+  console.log('PASS stale resource updates require reload and Automatic can be restored');
+  await shot('resource-controls');
+
   await click('edit-listeners');
   await fill('#addresses input', 'https://stale.lan:7843');
   saved.revision = 'other-tab';

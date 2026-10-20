@@ -3,9 +3,10 @@
 Checkpoint 4a connects the existing authenticated audio engine to the persistent
 `sidecar` binary. Owner enrollment, saved connections and discovery publication
 now lead to an actual HTTPS audio endpoint. Checkpoint 4b adds
-[retained encoded segments and owner cache controls](owner-cache.md).
-This is a development server: configurable resource limits, deployment packaging
-and the production Astra discovery/enable flow are still subsequent work.
+[retained encoded segments and owner cache controls](owner-cache.md), and 4c
+adds [conversion limits and working-storage recovery](owner-resources.md).
+This is a development server: the live dashboard, deployment packaging and the
+production Astra discovery/enable flow are still subsequent work.
 
 Build `sidecar` with the repository's Rust toolchain. Audio requires `ffmpeg` and
 `ffprobe` on PATH, with FFmpeg's `libopus` encoder. The service/worker implementation
@@ -87,12 +88,13 @@ settings does not create another independent encoder/source allowance.
 
 ## Current limits
 
-These are carried forward from the proofs to bound this integration. They are
-**not the final owner-facing defaults or storage policy**:
+These development bounds carry forward the proofs, with configurable resources
+added in checkpoint 4c. They are not a production capacity guarantee:
 
 - One complete private original per playback, up to 64 MiB and 30 minutes.
   Supported sources: mono/stereo 16/24-bit FLAC/WAV, 44.1/48/96 kHz.
-- Four staged playbacks globally, two per listener session; two encoder workers.
+- Four staged playbacks globally, two per listener session. Conversion concurrency
+  is Automatic or a custom 1–4; the loopback proof retains two workers.
   Up to four source-seconds per segment, 4 MiB encoded payload, eight-second worker
   deadline. Serving still starts after complete source acquisition/validation.
 - Ten-minute sessions, at most 32; renewal uses freshly validated same-account
@@ -105,8 +107,8 @@ These are carried forward from the proofs to bound this integration. They are
   interval retained per playback. A separate retained cache reuses encoded
   intervals between plays; see its [controls and recovery rules](owner-cache.md).
   New playback acquisition still fetches and validates the complete original.
-  Graceful working-file cleanup is tested; hard-crash working-file recovery and
-  the final working-storage/low-disk policy remain future work.
+  Working files live under the installation, with a separate budget, free-space
+  guard and crash recovery; see [resource controls](owner-resources.md).
 
 ## Verification
 

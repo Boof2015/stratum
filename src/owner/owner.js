@@ -252,6 +252,7 @@ function cancelStorage() {
 }
 function renderStorage() {
   element('storage-form').hidden = !storageState;
+  element('resources-form').hidden = !storageState?.resources;
   if (!storageState) return;
   const { settings, cache, working_bytes: working } = storageState;
   element('storage-usage').textContent = `Cached audio: ${storageBytes(cache.retained_bytes)} / ${storageBytes(settings.limit_bytes)}`;
@@ -260,6 +261,14 @@ function renderStorage() {
     ? 'Cache changes are waiting for storage access. Sidecar will retry; playback can continue without retention.' : '';
   element('cache-enabled').value = String(settings.enabled);
   element('cache-limit').value = String(settings.limit_bytes / 1e9);
+  if (storageState.resources) {
+    const { resources, runtime } = storageState;
+    element('resource-conversions').value = resources.max_conversions === null ? 'automatic' : String(resources.max_conversions);
+    element('resource-working').value = String(resources.working_bytes / 1e6);
+    const jobs = runtime.conversions;
+    element('resources-status').textContent = `${jobs.running} running · ${jobs.waiting} waiting · limit ${jobs.limit}${resources.max_conversions === null ? ' (Automatic)' : ''}`;
+    element('storage-working').textContent = `Temporary storage: ${storageBytes(working)} used · ${storageBytes(runtime.working.reserved_bytes)} reserved / ${storageBytes(resources.working_bytes)} limit`;
+  }
 }
 function confirmStorage(body) {
   pendingStorage = body;
@@ -307,4 +316,23 @@ element('cache-confirm').addEventListener('click', () => {
 element('storage-refresh').addEventListener('click', () => operate(async () => {
   storageState = await request('storage'); cancelStorage(); renderStorage();
 }));
+element('resources-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (busy || !storageState?.resources) return;
+  const working = Number(element('resource-working').value) * 1e6;
+  if (!Number.isSafeInteger(working) || working < 128e6) {
+    element('message').textContent = 'Use a working-storage limit of at least 128 MB, within the supported numeric range.';
+    return;
+  }
+  const mode = element('resource-conversions').value;
+  const body = { revision: storageState.resources.revision,
+    max_conversions: mode === 'automatic' ? null : Number(mode), working_bytes: working };
+  operate(async () => {
+    try {
+      storageState = await request('resources', body);
+      cancelStorage();
+      element('message').textContent = 'Resource settings saved. Current playback and jobs are protected.';
+    } finally { renderStorage(); }
+  });
+});
 operate(refresh);

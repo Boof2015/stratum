@@ -8,7 +8,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Mutex,
+    },
     time::SystemTime,
 };
 
@@ -101,6 +104,7 @@ struct State {
 pub struct Cache {
     directory: PathBuf,
     state: Mutex<State>,
+    working_reserve: AtomicU64,
 }
 
 impl Cache {
@@ -157,6 +161,7 @@ impl Cache {
         let cache = Self {
             directory: directory.to_owned(),
             state: Mutex::new(state),
+            working_reserve: AtomicU64::new(0),
         };
         // A journaled clear/disable survives a crash before deletion finishes.
         let recorded = read_regular(&directory.join(".epoch"), 128).ok();
@@ -201,6 +206,17 @@ impl Cache {
             entries: state.entries.len(),
             problem: state.problem,
         }
+    }
+    pub(crate) fn directory(&self) -> PathBuf {
+        self.directory.clone()
+    }
+    pub(crate) fn set_working_reserve(&self, bytes: u64) {
+        self.working_reserve.store(bytes, Ordering::SeqCst);
+    }
+    pub(crate) fn reclaim_bytes(&self, bytes: u64) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        let target = state.bytes.saturating_sub(bytes);
+        self.evict_to(&mut state, target)
     }
     pub fn lookup(&self, id: &str) -> Result<Lookup> {
         ensure!(key(id), "Invalid cache key.");
@@ -275,12 +291,13 @@ impl Cache {
         // Full disks must not turn successful audio preparation into a failure.
         // Reclaim retained audio first; the active playback owns separate files.
         let available = available_space()?;
-        if available < FREE_RESERVE + size {
+        let reserve = FREE_RESERVE.saturating_add(self.working_reserve.load(Ordering::SeqCst));
+        if available < reserve.saturating_add(size) {
             let target = available
                 .saturating_add(state.bytes)
-                .saturating_sub(FREE_RESERVE + size);
+                .saturating_sub(reserve.saturating_add(size));
             self.evict_to(&mut state, target)?;
-            if available_space()? < FREE_RESERVE + size {
+            if available_space()? < reserve.saturating_add(size) {
                 return Ok(false);
             }
         }
@@ -357,7 +374,7 @@ fn checksum(id: &str, bytes: &[u8]) -> [u8; 32] {
     hash.update(bytes);
     hash.finalize().into()
 }
-fn prepare_directory(path: &Path) -> Result<()> {
+pub(crate) fn prepare_directory(path: &Path) -> Result<()> {
     if !path.try_exists()? {
         let mut builder = fs::DirBuilder::new();
         #[cfg(unix)]

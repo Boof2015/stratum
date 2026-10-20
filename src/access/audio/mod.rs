@@ -1,11 +1,17 @@
 //! Experimental authenticated segments from a complete, private source copy.
 //! This intentionally measures a staging baseline, not a progressive-source policy.
 use super::*;
+use crate::resources::{
+    self,
+    scheduler::{Priority, Scheduler},
+    working::{Reservation, Working},
+};
 use crate::{
     media::{Quality, SegmentMetadata, SourceInfo},
     timeline::Interval,
 };
 use serde::Serialize;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{path::PathBuf, process::Stdio};
 use tempfile::TempDir;
 use tokio::{io::AsyncWriteExt, sync::OwnedSemaphorePermit};
@@ -20,14 +26,17 @@ const WORKER_LIMIT: Duration = Duration::from_secs(8);
 pub(crate) struct Store {
     root: Arc<TempDir>,
     sources: Arc<Semaphore>,
-    workers: Arc<Semaphore>,
+    workers: Scheduler,
+    working: Option<Arc<Working>>,
+    resource_settings: Mutex<resources::Settings>,
+    detected_cpus: AtomicUsize,
     executable: PathBuf,
     retained: Option<Arc<crate::cache::Cache>>,
     cache_jobs: Arc<Semaphore>,
 }
 impl Store {
     pub(crate) async fn drain(&self) {
-        let _permits = self.workers.clone().acquire_many_owned(2).await;
+        self.workers.drain().await;
     }
     pub(crate) fn new() -> anyhow::Result<Self> {
         Ok(Self {
@@ -37,7 +46,10 @@ impl Store {
                     .tempdir()?,
             ),
             sources: Arc::new(Semaphore::new(4)),
-            workers: Arc::new(Semaphore::new(2)),
+            workers: Scheduler::new(2, false),
+            working: None,
+            resource_settings: Mutex::new(resources::Settings::default()),
+            detected_cpus: AtomicUsize::new(4),
             executable: std::env::current_exe()?,
             retained: None,
             cache_jobs: Arc::new(Semaphore::new(2)),
@@ -46,10 +58,55 @@ impl Store {
     pub(crate) fn persistent(
         directory: &std::path::Path,
         settings: &crate::cache::Settings,
+        working_directory: &std::path::Path,
+        resources: &resources::Settings,
     ) -> anyhow::Result<Self> {
         let mut store = Self::new()?;
-        store.retained = Some(Arc::new(crate::cache::Cache::open(directory, settings)?));
+        let cache = Arc::new(crate::cache::Cache::open(directory, settings)?);
+        let working = Working::open(working_directory, cache.clone(), resources)?;
+        store.root = working.root.clone();
+        store.retained = Some(cache);
+        store.working = Some(working);
+        let cpus = resources::available_cpus();
+        store.workers = Scheduler::new(resources.conversions(cpus), true);
+        store.detected_cpus.store(cpus, Ordering::Relaxed);
+        *store.resource_settings.lock().unwrap() = resources.clone();
         Ok(store)
+    }
+    pub(crate) fn apply_resources(&self, settings: &resources::Settings) {
+        let mut previous = self.resource_settings.lock().unwrap();
+        if *previous == *settings {
+            return;
+        }
+        let cpus = resources::available_cpus();
+        self.detected_cpus.store(cpus, Ordering::Relaxed);
+        self.workers.set_limit(settings.conversions(cpus));
+        if let Some(working) = &self.working {
+            working.set_limit(settings.working_bytes);
+        }
+        *previous = settings.clone();
+    }
+    pub(crate) fn resource_stats(&self) -> Value {
+        json!({"conversions":self.workers.stats(),"detected_cpus":self.detected_cpus.load(Ordering::Relaxed),
+               "working":self.working.as_ref().map(|work|work.stats())})
+    }
+    async fn reserve(&self, size: u64) -> Result<Option<Reservation>, Failure> {
+        let Some(working) = self.working.clone() else {
+            return Ok(None);
+        };
+        let permit = self
+            .cache_jobs
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| Failure::Busy)?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            working.reserve(size)
+        })
+        .await
+        .map_err(|_| Failure::Internal)?
+        .map(Some)
+        .map_err(|_| Failure::Storage)
     }
     pub(crate) fn retained(&self) -> Option<Arc<crate::cache::Cache>> {
         self.retained.clone()
@@ -106,6 +163,7 @@ pub(super) struct Playback {
     directory: TempDir,
     // Keep the parent alive until cancellation cleanup has reaped its worker.
     _root: Arc<TempDir>,
+    _reservation: Option<Reservation>,
     _global_slot: OwnedSemaphorePermit,
     _session_slot: OwnedSemaphorePermit,
     track: String,
@@ -138,6 +196,8 @@ struct SegmentRequest {
     start: u64,
     frames: u64,
     quality: Quality,
+    #[serde(default, skip_serializing)]
+    priority: Priority,
 }
 
 pub(super) fn routes() -> Router<Service> {
@@ -286,6 +346,11 @@ async fn open(
     if !valid_id(&track) {
         return Err(Failure::Input);
     }
+    let priority = match headers.get("x-stratum-priority").map(|v| v.to_str()) {
+        None | Some(Ok("playback")) => Priority::Playback,
+        Some(Ok("prefetch")) => Priority::Prefetch,
+        _ => return Err(Failure::Input),
+    };
     let (token, session) = service.session(&headers)?;
     let work = async {
         let global = service
@@ -304,7 +369,9 @@ async fn open(
         if size > MAX_SOURCE_BYTES {
             return Err(Failure::TooLarge);
         }
+        let reservation = service.0.audio.reserve(size).await?;
         let playback = Arc::new(Playback {
+            _reservation: reservation,
             directory: tempfile::tempdir_in(service.0.audio.root.path())
                 .map_err(|_| Failure::Internal)?,
             _root: service.0.audio.root.clone(),
@@ -323,7 +390,7 @@ async fn open(
         let started = Instant::now();
         original(&service, &session, &playback).await?;
         let acquisition_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let bytes = worker(&service, playback.clone(), Job { segment: None }).await?;
+        let bytes = worker(&service, playback.clone(), Job { segment: None }, priority).await?;
         let prepared: Prepared = serde_json::from_slice(&bytes).map_err(|_| Failure::Encoding)?;
         let info = &prepared.source;
         if info.bytes != size {
@@ -473,6 +540,7 @@ async fn segment(
                 Job {
                     segment: Some(interval),
                 },
+                interval.priority,
             )
             .await?;
             let payload = tokio::fs::read(playback.directory.path().join("payload"))
@@ -586,7 +654,12 @@ fn mark_hit(bytes: &[u8]) -> Result<Vec<u8>, Failure> {
 
 /// A detached supervisor owns cleanup. Dropping its caller signals cancellation;
 /// it does not abandon a blocking encoder or release resource permits too early.
-async fn worker(service: &Service, playback: Arc<Playback>, job: Job) -> Result<Vec<u8>, Failure> {
+async fn worker(
+    service: &Service,
+    playback: Arc<Playback>,
+    job: Job,
+    priority: Priority,
+) -> Result<Vec<u8>, Failure> {
     let busy = playback
         .worker_busy
         .clone()
@@ -596,9 +669,9 @@ async fn worker(service: &Service, playback: Arc<Playback>, job: Job) -> Result<
         .0
         .audio
         .workers
-        .clone()
-        .try_acquire_owned()
-        .map_err(|_| Failure::Busy)?;
+        .acquire(priority)
+        .await
+        .ok_or(Failure::Busy)?;
     let stop = CancellationToken::new();
     let dropped = stop.clone().drop_guard();
     let executable = service.0.audio.executable.clone();
@@ -629,13 +702,16 @@ async fn supervise(
         serde_json::to_vec(&job).map_err(|_| Failure::Internal)?,
     )
     .map_err(|_| Failure::Internal)?;
-    let stdout = tempfile::tempfile().map_err(|_| Failure::Internal)?;
-    let stderr = tempfile::tempfile().map_err(|_| Failure::Internal)?;
+    let stdout = tempfile::tempfile_in(directory).map_err(|_| Failure::Internal)?;
+    let stderr = tempfile::tempfile_in(directory).map_err(|_| Failure::Internal)?;
     let mut command = tokio::process::Command::new(executable);
     command
         .arg("--audio-worker")
         .arg(directory)
-        .stdin(Stdio::null())
+        .stdin(Stdio::piped())
+        .env("TMPDIR", directory)
+        .env("TMP", directory)
+        .env("TEMP", directory)
         .stdout(stdout.try_clone().map_err(|_| Failure::Internal)?)
         .stderr(stderr.try_clone().map_err(|_| Failure::Internal)?)
         .kill_on_drop(true)
@@ -650,6 +726,8 @@ async fn supervise(
         return Err(Failure::Unsupported);
     }
     let mut child = command.spawn().map_err(|_| Failure::Encoding)?;
+    // Child::wait closes its own stdin field; keep the liveness pipe separately.
+    let _parent_alive = child.stdin.take();
     let id = child.id().ok_or(Failure::Encoding)?;
     let mut group = ProcessGroup(id);
     let deadline = tokio::time::sleep(WORKER_LIMIT);
@@ -759,6 +837,7 @@ mod tests {
         let playback = Arc::new(Playback {
             directory: tempfile::tempdir_in(service.0.audio.root.path()).unwrap(),
             _root: service.0.audio.root.clone(),
+            _reservation: None,
             _global_slot: service.0.audio.sources.clone().try_acquire_owned().unwrap(),
             _session_slot: Arc::new(Semaphore::new(2)).try_acquire_owned().unwrap(),
             track: "test".into(),
@@ -770,10 +849,15 @@ mod tests {
         });
         let run_service = service.clone();
         let run_playback = playback.clone();
-        let request =
-            tokio::spawn(
-                async move { worker(&run_service, run_playback, Job { segment: None }).await },
-            );
+        let request = tokio::spawn(async move {
+            worker(
+                &run_service,
+                run_playback,
+                Job { segment: None },
+                Priority::Playback,
+            )
+            .await
+        });
         let deadline = Instant::now() + Duration::from_secs(3);
         let pid = loop {
             if let Ok(text) = std::fs::read_to_string(playback.directory.path().join("child-pid")) {
@@ -794,7 +878,7 @@ mod tests {
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        assert_eq!(service.0.audio.workers.available_permits(), 2);
+        assert_eq!(service.0.audio.workers.stats().running, 0);
         drop(playback);
         assert_eq!(service.0.audio.sources.available_permits(), 4);
     }

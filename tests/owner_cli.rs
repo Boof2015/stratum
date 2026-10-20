@@ -537,3 +537,87 @@ fn cache_cli_confirms_destructive_changes_and_shares_the_live_settings() {
     assert_eq!(state["cache"]["retained_bytes"], 0);
     stop(&mut server);
 }
+
+#[test]
+fn resource_cli_validates_and_updates_the_running_service() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("data");
+    assert!(
+        command(
+            &dir,
+            &[
+                "init",
+                "--listen",
+                "127.0.0.1:0",
+                "--admin-origin",
+                "https://localhost:7843"
+            ],
+            None
+        )
+        .0
+    );
+    assert!(!command(&dir, &["configure-resources", "--conversions", "1"], None).0);
+    assert!(command(&dir, &["set-password", "--password-stdin"], Some(PASSWORD)).0);
+    for args in [
+        vec!["configure-resources"],
+        vec!["configure-resources", "--conversions", "0"],
+        vec!["configure-resources", "--conversions", "5"],
+        vec!["configure-resources", "--working-mb", "127"],
+    ] {
+        assert!(!command(&dir, &args, None).0);
+    }
+    assert!(
+        command(
+            &dir,
+            &[
+                "configure-resources",
+                "--conversions",
+                "1",
+                "--working-mb",
+                "128"
+            ],
+            None
+        )
+        .0
+    );
+    let (mut server, addr, _) = start(&dir, &temp.path().join("resources.log"));
+    let tls = roots(&dir);
+    let cookie = cookie(&request(
+        addr,
+        tls.clone(),
+        "POST",
+        "/admin/api/login",
+        None,
+        json!({"password":PASSWORD}),
+    ));
+    let response = request(
+        addr,
+        tls.clone(),
+        "GET",
+        "/admin/api/resources",
+        Some(&cookie),
+        json!({}),
+    );
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(value["runtime"]["conversions"]["limit"], 1);
+    assert_eq!(value["runtime"]["working"]["limit_bytes"], 128_000_000);
+    assert!(
+        command(
+            &dir,
+            &["configure-resources", "--conversions", "automatic"],
+            None
+        )
+        .0
+    );
+    let response = request(
+        addr,
+        tls,
+        "GET",
+        "/admin/api/resources",
+        Some(&cookie),
+        json!({}),
+    );
+    let value: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(value["resources"]["max_conversions"], Value::Null);
+    stop(&mut server);
+}

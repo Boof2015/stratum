@@ -63,6 +63,97 @@ async fn enrolled(store: &Store, service: &Service) -> String {
 }
 
 #[tokio::test]
+async fn resource_controls_share_revisions_without_resetting_connections_or_cache() {
+    let (_dir, store, service) = fixture();
+    assert_eq!(
+        call(&service, "GET", "/admin/api/resources", None, json!({}))
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let cookie = enrolled(&store, &service).await;
+    let before = store.config().unwrap();
+    let state = json(
+        call(
+            &service,
+            "GET",
+            "/admin/api/resources",
+            Some(&cookie),
+            json!({}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(state["resources"]["working_bytes"], 512_000_000u64);
+    assert_eq!(state["resources"]["max_conversions"], Value::Null);
+    let mut body = json!({"revision":"initial","max_conversions":1,"working_bytes":128_000_000});
+    let saved = json(
+        call(
+            &service,
+            "POST",
+            "/admin/api/resources",
+            Some(&cookie),
+            body.clone(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(saved["runtime"]["conversions"]["limit"], 1);
+    assert_eq!(saved["runtime"]["working"]["limit_bytes"], 128_000_000);
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/resources",
+            Some(&cookie),
+            body.clone()
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    body["revision"] = saved["resources"]["revision"].clone();
+    for field in ["max_conversions", "working_bytes"] {
+        let mut invalid = body.clone();
+        invalid[field] = json!(0);
+        assert_eq!(
+            call(
+                &service,
+                "POST",
+                "/admin/api/resources",
+                Some(&cookie),
+                invalid
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+    }
+    body["max_conversions"] = Value::Null;
+    let automatic = json(
+        call(
+            &service,
+            "POST",
+            "/admin/api/resources",
+            Some(&cookie),
+            body,
+        )
+        .await,
+    )
+    .await;
+    assert!((1..=4).contains(
+        &automatic["runtime"]["conversions"]["limit"]
+            .as_u64()
+            .unwrap()
+    ));
+    assert_eq!(
+        store.config().unwrap().setup.revision,
+        before.setup.revision
+    );
+    assert_eq!(store.config().unwrap().storage, before.storage);
+}
+
+#[tokio::test]
 async fn storage_changes_require_owner_confirmation_and_current_revision() {
     let (_dir, store, service) = fixture();
     for method in ["GET", "POST"] {
@@ -212,10 +303,15 @@ fn pre_cache_config_gets_defaults_and_stale_owner_cannot_change_storage() {
     let path = directory.path().join("config.json");
     let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     config.as_object_mut().unwrap().remove("storage");
+    config.as_object_mut().unwrap().remove("resources");
     std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
     assert_eq!(
         store.config().unwrap().storage,
         crate::cache::Settings::default()
+    );
+    assert_eq!(
+        store.config().unwrap().resources,
+        crate::resources::Settings::default()
     );
     store.set_password(PASSWORD, false).unwrap();
     let generation = store.owner_generation().unwrap().unwrap();
@@ -459,19 +555,6 @@ async fn logout_restart_expiry_and_duplicate_cookies_reject_sessions() {
         .status(),
         StatusCode::UNAUTHORIZED
     );
-    let restarted = Service::new(store.clone()).unwrap();
-    assert_eq!(
-        call(
-            &restarted,
-            "GET",
-            "/admin/api/setup",
-            Some(&cookie),
-            json!({})
-        )
-        .await
-        .status(),
-        StatusCode::UNAUTHORIZED
-    );
     assert_eq!(
         call(
             &service,
@@ -511,6 +594,29 @@ async fn logout_restart_expiry_and_duplicate_cookies_reject_sessions() {
     assert_eq!(
         call(
             &service,
+            "GET",
+            "/admin/api/setup",
+            Some(&cookie),
+            json!({})
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+    let response = call(
+        &service,
+        "POST",
+        "/admin/api/login",
+        None,
+        json!({"password":PASSWORD}),
+    )
+    .await;
+    let cookie = session_cookie(&response);
+    drop(service);
+    let restarted = Service::new(store.clone()).unwrap();
+    assert_eq!(
+        call(
+            &restarted,
             "GET",
             "/admin/api/setup",
             Some(&cookie),
@@ -752,6 +858,7 @@ async fn setup_requires_owner_and_successful_probe_and_resumes_after_restart() {
     .await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(json(response).await["stage"], "connections-saved");
+    drop(service);
     let restarted = Service::new(Store::open(directory.path()).unwrap()).unwrap();
     let cookie = session_cookie(
         &call(

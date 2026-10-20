@@ -42,6 +42,12 @@ impl std::fmt::Display for SetupWriteError {
 }
 impl std::error::Error for SetupWriteError {}
 
+pub(super) struct ListenerConfiguration {
+    pub key: Option<(String, String)>,
+    pub storage: crate::cache::Settings,
+    pub resources: crate::resources::Settings,
+}
+
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Config {
@@ -53,6 +59,8 @@ pub struct Config {
     pub setup: SetupState,
     #[serde(default)]
     pub storage: crate::cache::Settings,
+    #[serde(default)]
+    pub resources: crate::resources::Settings,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -65,6 +73,7 @@ impl Default for Config {
             ],
             setup: SetupState::default(),
             storage: crate::cache::Settings::default(),
+            resources: crate::resources::Settings::default(),
         }
     }
 }
@@ -93,6 +102,7 @@ impl Config {
         }
         self.setup.validate()?;
         self.storage.validate()?;
+        self.resources.validate()?;
         Ok(())
     }
     pub(crate) fn accepts_host(&self, host: &str) -> bool {
@@ -220,26 +230,56 @@ impl Store {
 
     /// A coherent listener snapshot, read on a blocking thread. A saved connection
     /// revision binds sessions even if the owner changes A -> B -> A between reads.
-    pub(super) fn listener_configuration(
-        &self,
-    ) -> Result<(Option<(String, String)>, crate::cache::Settings)> {
+    pub(super) fn listener_configuration(&self) -> Result<ListenerConfiguration> {
         let _lock = self.lock("state.lock")?;
         let configured = self.read_state()?.owner.is_some();
         let config = self.config()?;
         let setup = config.setup;
         let settings = setup.settings.normalized()?;
-        Ok((
-            if configured && !settings.listeners.is_empty() {
+        Ok(ListenerConfiguration {
+            key: if configured && !settings.listeners.is_empty() {
                 settings.navidrome_url.map(|url| (setup.revision, url))
             } else {
                 None
             },
-            config.storage,
-        ))
+            storage: config.storage,
+            resources: config.resources,
+        })
     }
 
     pub fn cache_directory(&self) -> PathBuf {
         self.directory.join("retained")
+    }
+
+    pub fn working_directory(&self) -> PathBuf {
+        self.directory.join("working")
+    }
+    pub fn save_resources(
+        &self,
+        change: &crate::resources::Change,
+        generation: Option<&str>,
+    ) -> Result<crate::resources::Settings> {
+        let _lock = self.lock("state.lock")?;
+        let owner = self
+            .read_state()?
+            .owner
+            .ok_or(SetupWriteError::OwnerChanged)?;
+        if generation.is_some_and(|value| value != owner.generation) {
+            return Err(SetupWriteError::OwnerChanged.into());
+        }
+        let mut config = self.config()?;
+        if config.resources.revision != change.revision {
+            return Err(SetupWriteError::Conflict.into());
+        }
+        let settings = crate::resources::Settings {
+            revision: random_hex(32)?,
+            max_conversions: change.max_conversions,
+            working_bytes: change.working_bytes,
+        };
+        settings.validate()?;
+        config.resources = settings.clone();
+        self.write("config.json", &config)?;
+        Ok(settings)
     }
 
     pub fn save_storage(
