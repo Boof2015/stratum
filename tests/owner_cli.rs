@@ -453,3 +453,87 @@ fn cli_configure_and_browser_share_persistent_setup() {
     );
     stop(&mut server);
 }
+
+#[test]
+fn cache_cli_confirms_destructive_changes_and_shares_the_live_settings() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("data");
+    assert!(
+        command(
+            &dir,
+            &[
+                "init",
+                "--listen",
+                "127.0.0.1:0",
+                "--admin-origin",
+                "https://localhost:7843"
+            ],
+            None
+        )
+        .0
+    );
+    assert!(!command(&dir, &["configure-cache", "--limit-gb", "100"], None).0);
+    assert!(command(&dir, &["set-password", "--password-stdin"], Some(PASSWORD)).0);
+    for args in [
+        vec!["configure-cache", "--limit-gb", "0"],
+        vec!["configure-cache", "--limit-gb", "1.5"],
+        vec!["configure-cache", "--enable", "--disable"],
+        vec!["configure-cache"],
+    ] {
+        assert!(!command(&dir, &args, None).0);
+    }
+    assert!(command(&dir, &["configure-cache", "--limit-gb", "1000"], None).0);
+    let store = stratum_poc::owner::Store::open(&dir).unwrap();
+    let before = store.config().unwrap().storage;
+    assert_eq!(before.limit_bytes, 1000 * stratum_poc::cache::GB);
+    {
+        let _lease = store.server_lock().unwrap();
+        let cache = stratum_poc::cache::Cache::open(&store.cache_directory(), &before).unwrap();
+        let key = "a".repeat(64);
+        let ticket = cache.lookup(&key).unwrap().ticket;
+        assert!(cache
+            .insert(&key, b"retained test packet", &ticket)
+            .unwrap());
+    }
+    for args in [vec!["clear-cache"], vec!["configure-cache", "--disable"]] {
+        assert!(!command(&dir, &args, None).0);
+        assert_eq!(store.config().unwrap().storage, before);
+        assert!(store
+            .cache_directory()
+            .join(format!("{}.segment", "a".repeat(64)))
+            .exists());
+    }
+    assert!(command(&dir, &["clear-cache", "--confirm"], None).0);
+    assert!(!store
+        .cache_directory()
+        .join(format!("{}.segment", "a".repeat(64)))
+        .exists());
+    assert!(store.config().unwrap().storage.enabled);
+    let (mut server, addr, _) = start(&dir, &temp.path().join("cache.log"));
+    let tls = roots(&dir);
+    let cookie = cookie(&request(
+        addr,
+        tls.clone(),
+        "POST",
+        "/admin/api/login",
+        None,
+        json!({"password":PASSWORD}),
+    ));
+    let saved = command(&dir, &["configure-cache", "--disable", "--confirm"], None);
+    assert!(saved.0);
+    assert!(saved.1.contains("running service"));
+    let response = request(
+        addr,
+        tls,
+        "GET",
+        "/admin/api/storage",
+        Some(&cookie),
+        json!({}),
+    );
+    assert_eq!(response.status, 200);
+    let state: Value = serde_json::from_str(&response.body).unwrap();
+    assert_eq!(state["settings"]["enabled"], false);
+    assert_eq!(state["cache"]["settings"], state["settings"]);
+    assert_eq!(state["cache"]["retained_bytes"], 0);
+    stop(&mut server);
+}

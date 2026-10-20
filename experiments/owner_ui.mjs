@@ -22,6 +22,9 @@ let delayNext = false;
 let saves = 0;
 let discovery = { revision: 'initial', status: 'not-published', hasAnnouncement: false };
 let publicationRequests = 0;
+let storage = { settings: { revision: 'initial', enabled: true, limit_bytes: 5e9, clear_epoch: 'initial' },
+  cache: { retained_bytes: 123e6, entries: 32, problem: false }, working_bytes: 64e6 };
+let storageRequests = 0;
 const stage = () => !saved.settings.navidrome_url ? 'navidrome' : saved.settings.listeners.length ? 'connections-saved' : 'listeners';
 const server = createServer(async (request, response) => {
   const send = (status, value) => { response.writeHead(status, { 'Content-Type': 'application/json' }); response.end(JSON.stringify(value)); };
@@ -40,10 +43,19 @@ const server = createServer(async (request, response) => {
     if (path === 'login') { signedIn = true; return send(200, {}); }
     if (path === 'logout') { signedIn = false; return send(200, {}); }
     if (!signedIn) return send(401, { error: 'Sign in again.' });
-    if (path === 'setup') return send(200, { stage: stage(), setup: saved, discovery });
+    if (path === 'setup') return send(200, { stage: stage(), setup: saved, discovery, storage });
     if (path === 'discovery') publicationRequests++;
     if (errorNext) { const error = errorNext; errorNext = null; return send(error.status, { error: error.message }); }
     if (delayNext) { delayNext = false; await new Promise((resolve) => { held = resolve; }); }
+    if (path === 'storage') {
+      if (request.method === 'GET') return send(200, storage);
+      storageRequests++;
+      if (body.revision !== storage.settings.revision) return send(409, { error: 'Reload saved settings.' });
+      if ((body.clear || (!body.enabled && storage.settings.enabled)) && !body.confirmed) return send(400, { error: 'Confirm clearing retained audio.' });
+      if (body.clear || !body.enabled) { storage.cache.retained_bytes = 0; storage.cache.entries = 0; }
+      storage.settings = { ...storage.settings, ...body, revision: String(storageRequests) };
+      return send(200, storage);
+    }
     if (path === 'discovery') {
       if (body.setup_revision !== saved.revision || body.discovery_revision !== discovery.revision) return send(409, { error: 'Reload saved settings.' });
       discovery = { revision: String(publicationRequests), status: body.action === 'publish' ? 'published' : 'manual',
@@ -178,6 +190,53 @@ try {
   assert.equal(discovery.hasAnnouncement, false);
   console.log('PASS explicit publish/remove refreshes status and discards form credentials');
   await shot('connections-saved');
+  await click('cache-clear');
+  assert.equal(await evaluate('document.getElementById("cache-confirmation").hidden'), false);
+  await click('cache-cancel');
+  assert.equal(storageRequests, 0);
+  assert.equal(storage.cache.retained_bytes, 123e6);
+  await fill('#cache-enabled', 'false'); await submit('storage-form');
+  assert.match(await evaluate('document.getElementById("cache-confirm-title").textContent'), /Turn off caching and clear/);
+  await shot('cache-disable-confirmation');
+  await click('cache-cancel');
+  assert.equal(await evaluate('document.getElementById("cache-enabled").value'), 'true');
+  assert.equal(storageRequests, 0);
+  console.log('PASS clear/disable cancellation preserves the cache and saved settings');
+  await fill('#cache-enabled', 'false'); await submit('storage-form');
+  await click('cache-confirm'); await idle();
+  assert.equal(storageRequests, 1);
+  assert.equal(storage.settings.enabled, false);
+  assert.equal(storage.cache.retained_bytes, 0);
+  assert.equal(storage.working_bytes, 64e6);
+  console.log('PASS disabling clears retention with one confirmation and keeps working use separate');
+  await fill('#cache-enabled', 'true'); await fill('#cache-limit', '1000'); await submit('storage-form'); await idle();
+  assert.equal(storage.settings.limit_bytes, 1000e9);
+  assert.equal(storage.settings.enabled, true);
+  errorNext = { status: 503, message: 'Could not save cache settings.' };
+  await fill('#cache-limit', '1'); await submit('storage-form'); await idle();
+  assert.equal(await evaluate('document.getElementById("cache-limit").value'), '1000');
+  assert.equal(storage.settings.limit_bytes, 1000e9);
+  console.log('PASS custom cache size has no arbitrary tier cap and a failed save restores saved values');
+  storage.cache.retained_bytes = 456e6;
+  await click('storage-refresh'); await idle();
+  const beforeClear = storageRequests;
+  await click('cache-clear');
+  assert.equal(storageRequests, beforeClear);
+  await click('cache-confirm'); await idle();
+  assert.equal(storageRequests, beforeClear + 1);
+  assert.equal(storage.cache.retained_bytes, 0);
+  assert.match(await evaluate('document.getElementById("message").textContent'), /cleared/);
+  console.log('PASS explicit clear updates usage only after confirmation');
+  await click('cache-clear');
+  await evaluate('document.getElementById("cache-limit").dispatchEvent(new Event("input", { bubbles: true }))');
+  assert.equal(await evaluate('document.getElementById("cache-confirmation").hidden'), true);
+  storage.settings.revision = 'changed-by-cli';
+  await fill('#cache-limit', '10'); await submit('storage-form'); await idle();
+  assert.equal(await evaluate('document.getElementById("reload").hidden'), false);
+  await click('reload'); await idle();
+  assert.equal(await evaluate('document.getElementById("cache-limit").value'), '1000');
+  console.log('PASS edited drafts cancel stale confirmations and concurrent changes require reload');
+  await shot('cache-controls');
   await click('edit-listeners');
   await fill('#addresses input', 'https://stale.lan:7843');
   saved.revision = 'other-tab';

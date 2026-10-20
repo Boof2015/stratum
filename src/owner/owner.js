@@ -5,6 +5,8 @@ let busy = false;
 let saved = null;
 let discoveryState = { revision: 'initial', status: 'not-published', hasAnnouncement: false };
 let discoveryAction = null;
+let storageState = null;
+let pendingStorage = null;
 
 async function request(path, body) {
   const response = await fetch(`/admin/api/${path}`, body === undefined ? {} : {
@@ -60,7 +62,9 @@ function showStep(step) {
     for (const endpoint of listeners.length ? listeners : [{ url: '', trust: 'sidecar_key' }]) addAddress(endpoint);
   }
   clearDiscoveryForm();
+  cancelStorage();
   if (step === 'summary') {
+    renderStorage();
     renderDiscovery();
     element('saved-navidrome').textContent = saved.settings.navidrome_url;
     element('saved-addresses').replaceChildren();
@@ -74,6 +78,7 @@ function showStep(step) {
 }
 function resume(value) {
   saved = value.setup;
+  if (value.storage) storageState = value.storage;
   if (value.discovery) discoveryState = value.discovery;
   else if (discoveryState.hasAnnouncement) discoveryState = { ...discoveryState, status: 'update-needed' };
   showStep(value.stage === 'connections-saved' ? 'summary' : value.stage);
@@ -121,6 +126,8 @@ async function refresh() {
       catch (error) { if (error.status !== 401) throw error; }
     }
     saved = null;
+    storageState = null;
+    cancelStorage();
     element('title').textContent = needsOwner ? 'Make Sidecar yours' : 'Welcome back';
     element('description').textContent = needsOwner
       ? 'Enter the setup code from your server’s terminal or container logs, then choose a password of at least 12 characters.'
@@ -236,4 +243,68 @@ element('discovery-form').addEventListener('submit', (event) => {
     } finally { body.password = ''; body.username = ''; }
   });
 });
+function storageBytes(value) {
+  return `${(value / 1e9).toLocaleString(undefined, { maximumFractionDigits: 3 })} GB`;
+}
+function cancelStorage() {
+  pendingStorage = null;
+  element('cache-confirmation').hidden = true;
+}
+function renderStorage() {
+  element('storage-form').hidden = !storageState;
+  if (!storageState) return;
+  const { settings, cache, working_bytes: working } = storageState;
+  element('storage-usage').textContent = `Cached audio: ${storageBytes(cache.retained_bytes)} / ${storageBytes(settings.limit_bytes)}`;
+  element('storage-working').textContent = `Temporary storage for active streams: ${storageBytes(working)}`;
+  element('storage-problem').textContent = cache.problem
+    ? 'Cache changes are waiting for storage access. Sidecar will retry; playback can continue without retention.' : '';
+  element('cache-enabled').value = String(settings.enabled);
+  element('cache-limit').value = String(settings.limit_bytes / 1e9);
+}
+function confirmStorage(body) {
+  pendingStorage = body;
+  const disabling = !body.enabled && storageState.settings.enabled;
+  element('cache-confirm-title').textContent = disabling ? 'Turn off caching and clear saved audio?' : 'Clear cached audio?';
+  element('cache-confirm-message').textContent = disabling
+    ? 'This removes the retained cache and stops saving new audio. Active playback keeps the temporary files it needs until it finishes.'
+    : body.enabled ? 'This removes retained audio. Active playback keeps its temporary files, and future listening can fill the cache again.'
+    : 'This removes retained audio. Caching stays off. Active playback keeps its temporary files.';
+  element('cache-confirm').textContent = disabling ? 'Turn off and clear' : 'Clear cached audio';
+  element('cache-confirmation').hidden = false;
+  element('cache-cancel').focus();
+}
+async function saveStorage(body) {
+  try {
+    storageState = await request('storage', body);
+    cancelStorage();
+    element('message').textContent = storageState.cache.problem
+      ? 'Settings saved. Cache changes will be retried when storage is accessible.'
+      : body.clear ? 'Retained audio cleared. Active playback can continue.'
+      : !body.enabled ? 'Caching is off and retained audio is cleared.' : 'Cache settings saved.';
+  } finally { renderStorage(); }
+}
+for (const event of ['input', 'change']) element('storage-form').addEventListener(event, cancelStorage);
+element('storage-form').addEventListener('submit', (event) => {
+  event.preventDefault();
+  if (busy || !storageState) return;
+  const limit = Number(element('cache-limit').value) * 1e9;
+  if (!Number.isSafeInteger(limit) || limit < 1e9) {
+    element('message').textContent = 'Use a cache limit of at least 1 GB, within the supported numeric range.';
+    return;
+  }
+  const body = { revision: storageState.settings.revision, enabled: element('cache-enabled').value === 'true', limit_bytes: limit };
+  if (storageState.settings.enabled && !body.enabled) confirmStorage(body);
+  else operate(() => saveStorage(body));
+});
+element('cache-clear').addEventListener('click', () => {
+  if (!busy && storageState) confirmStorage({ revision: storageState.settings.revision,
+    enabled: storageState.settings.enabled, limit_bytes: storageState.settings.limit_bytes, clear: true });
+});
+element('cache-cancel').addEventListener('click', () => { cancelStorage(); renderStorage(); element('cache-clear').focus(); });
+element('cache-confirm').addEventListener('click', () => {
+  if (pendingStorage) operate(() => saveStorage({ ...pendingStorage, confirmed: true }));
+});
+element('storage-refresh').addEventListener('click', () => operate(async () => {
+  storageState = await request('storage'); cancelStorage(); renderStorage();
+}));
 operate(refresh);

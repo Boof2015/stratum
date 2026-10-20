@@ -27,6 +27,7 @@ use super::setup::{Settings, SetupState};
 pub enum SetupWriteError {
     Conflict,
     OwnerChanged,
+    Confirmation,
 }
 impl std::fmt::Display for SetupWriteError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -35,6 +36,7 @@ impl std::fmt::Display for SetupWriteError {
                 "Setup changed elsewhere. Reload the saved settings before trying again."
             }
             Self::OwnerChanged => "Owner sign-in changed. Sign in again before saving setup.",
+            Self::Confirmation => "Confirm clearing retained audio before continuing.",
         })
     }
 }
@@ -49,6 +51,8 @@ pub struct Config {
     pub admin_origins: Vec<String>,
     #[serde(default)]
     pub setup: SetupState,
+    #[serde(default)]
+    pub storage: crate::cache::Settings,
 }
 impl Default for Config {
     fn default() -> Self {
@@ -60,6 +64,7 @@ impl Default for Config {
                 "https://127.0.0.1:7843".into(),
             ],
             setup: SetupState::default(),
+            storage: crate::cache::Settings::default(),
         }
     }
 }
@@ -87,6 +92,7 @@ impl Config {
             );
         }
         self.setup.validate()?;
+        self.storage.validate()?;
         Ok(())
     }
     pub(crate) fn accepts_host(&self, host: &str) -> bool {
@@ -214,16 +220,63 @@ impl Store {
 
     /// A coherent listener snapshot, read on a blocking thread. A saved connection
     /// revision binds sessions even if the owner changes A -> B -> A between reads.
-    pub(super) fn listener_configuration(&self) -> Result<Option<(String, String)>> {
+    pub(super) fn listener_configuration(
+        &self,
+    ) -> Result<(Option<(String, String)>, crate::cache::Settings)> {
         let _lock = self.lock("state.lock")?;
         let configured = self.read_state()?.owner.is_some();
-        let setup = self.config()?.setup;
+        let config = self.config()?;
+        let setup = config.setup;
         let settings = setup.settings.normalized()?;
-        Ok(if configured && !settings.listeners.is_empty() {
-            settings.navidrome_url.map(|url| (setup.revision, url))
-        } else {
-            None
-        })
+        Ok((
+            if configured && !settings.listeners.is_empty() {
+                settings.navidrome_url.map(|url| (setup.revision, url))
+            } else {
+                None
+            },
+            config.storage,
+        ))
+    }
+
+    pub fn cache_directory(&self) -> PathBuf {
+        self.directory.join("retained")
+    }
+
+    pub fn save_storage(
+        &self,
+        change: &crate::cache::Change,
+        generation: Option<&str>,
+    ) -> Result<crate::cache::Settings> {
+        let _lock = self.lock("state.lock")?;
+        let owner = self
+            .read_state()?
+            .owner
+            .ok_or(SetupWriteError::OwnerChanged)?;
+        if generation.is_some_and(|value| value != owner.generation) {
+            return Err(SetupWriteError::OwnerChanged.into());
+        }
+        let mut config = self.config()?;
+        if config.storage.revision != change.revision {
+            return Err(SetupWriteError::Conflict.into());
+        }
+        let destructive = change.clear || (config.storage.enabled && !change.enabled);
+        if destructive && !change.confirmed {
+            return Err(SetupWriteError::Confirmation.into());
+        }
+        let storage = crate::cache::Settings {
+            revision: random_hex(32)?,
+            enabled: change.enabled,
+            limit_bytes: change.limit_bytes,
+            clear_epoch: if destructive {
+                random_hex(32)?
+            } else {
+                config.storage.clear_epoch.clone()
+            },
+        };
+        storage.validate()?;
+        config.storage = storage.clone();
+        self.write("config.json", &config)?;
+        Ok(storage)
     }
 
     /// All setup writers use the same lock/validation. The revision also stops

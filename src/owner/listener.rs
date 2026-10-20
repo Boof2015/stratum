@@ -23,6 +23,7 @@ struct Inner {
     // Reconfiguration shares these limits with work still being cancelled.
     audio: Arc<access::audio::Store>,
     requests: Semaphore,
+    storage_jobs: Arc<Semaphore>,
     stopped: CancellationToken,
 }
 #[derive(Default)]
@@ -47,10 +48,14 @@ impl Listener {
     pub(super) fn new(store: Store) -> anyhow::Result<Self> {
         Ok(Self(Arc::new(Inner {
             identity: store.identity()?,
-            store,
+            store: store.clone(),
             state: Arc::new(Mutex::new(Current::default())),
-            audio: Arc::new(access::audio::Store::new()?),
+            audio: Arc::new(access::audio::Store::persistent(
+                &store.cache_directory(),
+                &store.config()?.storage,
+            )?),
             requests: Semaphore::new(8),
+            storage_jobs: Arc::new(Semaphore::new(2)),
             stopped: CancellationToken::new(),
         })))
     }
@@ -68,14 +73,20 @@ impl Listener {
         let store = self.0.store.clone();
         // The blocking read owns the gate, even if its HTTP caller times out.
         // That prevents cancelled requests piling up background filesystem work.
+        let audio = self.0.audio.clone();
         let (mut current, snapshot) = tokio::task::spawn_blocking(move || {
-            let snapshot = store.listener_configuration();
+            let snapshot = store.listener_configuration().map(|(key, storage)| {
+                // Cache problems must not cancel otherwise healthy audio. It
+                // bypasses retention until the persisted settings can be applied.
+                let _ = audio.retained().unwrap().apply(&storage);
+                key
+            });
             (current, snapshot)
         })
         .await
         .map_err(|_| ())?;
         let key = match snapshot {
-            Ok(key) if !self.0.stopped.is_cancelled() => key,
+            Ok(value) if !self.0.stopped.is_cancelled() => value,
             _ => {
                 current.clear();
                 return Err(());
@@ -95,6 +106,19 @@ impl Listener {
             engine.reap();
         }
         Ok(current.engine.clone())
+    }
+
+    pub(super) async fn storage(&self) -> anyhow::Result<serde_json::Value> {
+        let permit = self.0.storage_jobs.clone().try_acquire_owned()?;
+        self.refresh()
+            .await
+            .map_err(|_| anyhow::anyhow!("Could not apply cache settings."))?;
+        let audio = self.0.audio.clone();
+        let store = self.0.store.clone();
+        tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let _permit = permit;
+            Ok(json!({"settings":store.config()?.storage, "cache": audio.retained().unwrap().stats(), "working_bytes":audio.working_bytes()?}))
+        }).await?
     }
 
     pub(super) async fn maintain(&self, stop: CancellationToken) {

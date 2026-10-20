@@ -26,6 +26,9 @@ After owner sign-in:
    change either part or recheck Navidrome. Reloading or restarting resumes from
    the saved step; unsaved text is not retained across a page reload.
 
+The summary also has [Storage controls](owner-cache.md): retained cache usage,
+its limit, clear/disable confirmations, and separate temporary working usage.
+
 Direct addresses record `sidecar_key`, for verification against Sidecar's
 persistent SPKI identity. Proxy addresses record `https_proxy`, for normal
 HTTPS certificate/hostname verification and explicit trust in the owner's
@@ -135,6 +138,6 @@ node experiments/owner_ui.mjs /path/to/chrome /tmp/sidecar-ui-shots
 It launches one headless browser with a separate temporary profile and 45-second
 cutoff. It renders the real UI with fake API responses, checks failed/pending
 requests, reload, trust selections, concurrent-save conflicts, sign-in/out and
-narrow-width overflow, and captures screenshots. Backend behavior is covered by
+narrow-width overflow, cache controls/confirmation/cancellation, and captures screenshots. Backend behavior is covered by
 the Rust/real-Navidrome checks. No Electron, existing browser profile or audio is
 used. The UI is a functional setup preview; final dashboard styling is later.

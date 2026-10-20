@@ -430,6 +430,305 @@ impl Harness {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     }
+    async fn close_playback(&self, token: &str, handle: &str) {
+        assert!(self
+            .http
+            .delete(format!("{}/audio/v1/playback/{handle}", self.base))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .is_success());
+    }
+    async fn restart_installed(&mut self) {
+        unsafe {
+            libc::kill(self.process.id() as i32, libc::SIGTERM);
+        }
+        let deadline = Instant::now() + Duration::from_secs(6);
+        while self.process.try_wait().unwrap().is_none() {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let log_path = self.dir.path().join("restart.log");
+        let log = fs::File::create(&log_path).unwrap();
+        self.process = Command::new(env!("CARGO_BIN_EXE_sidecar"))
+            .args(["serve", "--data-dir"])
+            .arg(self.dir.path().join("owner"))
+            .env("TMPDIR", self.dir.path())
+            .stdin(Stdio::null())
+            .stdout(log.try_clone().unwrap())
+            .stderr(log)
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let log = fs::read_to_string(&log_path).unwrap();
+            if log.contains("fingerprint is") {
+                if let Some(addr) = log
+                    .lines()
+                    .find_map(|line| line.strip_prefix("Sidecar HTTPS listener: "))
+                {
+                    self.base = format!("https://{addr}/stratum");
+                    if self
+                        .http
+                        .get(format!("{}/access/v1/capabilities", self.base))
+                        .send()
+                        .await
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            }
+            assert!(self.process.try_wait().unwrap().is_none());
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    fn retained_entries(&self) -> usize {
+        fs::read_dir(self.owner.as_ref().unwrap().cache_directory())
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "segment"))
+            .count()
+    }
+    async fn cache_change(&self, enabled: bool, clear: bool) {
+        let store = self.owner.as_ref().unwrap();
+        let saved = store.config().unwrap().storage;
+        store
+            .save_storage(
+                &stratum_poc::cache::Change {
+                    revision: saved.revision,
+                    enabled,
+                    limit_bytes: saved.limit_bytes,
+                    clear,
+                    confirmed: true,
+                },
+                None,
+            )
+            .unwrap();
+        // Every listener request applies changes, without a timing-dependent sleep.
+        assert_eq!(
+            self.http
+                .get(format!("{}/access/v1/capabilities", self.base))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            200
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_retention_survives_restart_and_rechecks_each_listeners_access() {
+    let mut test = Harness::installed(48000).await;
+    let alice = test.login("alice").await;
+    let opened = test.handle(&alice).await;
+    let handle = opened["playback"].as_str().unwrap();
+    let (cold, expected) = test.decoded(&alice, handle, 37, 48001, "opus-64").await;
+    assert_ne!(cold["retained_cache_hit"], true);
+    assert_eq!(test.retained_entries(), 1);
+    test.close_playback(&alice, handle).await;
+    test.wait_clean().await;
+    let bob = test.login("bob").await;
+    assert_eq!(test.open(&bob, "a").await.status(), 404);
+    let allowed = test.open(&bob, "b").await.json::<Value>().await.unwrap();
+    let handle = allowed["playback"].as_str().unwrap();
+    // A hit on another authorized playback must not invoke FFmpeg at all.
+    fs::write(test.dir.path().join("hold-worker"), b"hold").unwrap();
+    let (warm, actual) = test.decoded(&bob, handle, 37, 48001, "opus-64").await;
+    assert_eq!(warm["retained_cache_hit"], true);
+    assert_eq!(actual, expected);
+    assert!(!test.dir.path().join("worker-pid").exists());
+    fs::remove_file(test.dir.path().join("hold-worker")).unwrap();
+    assert_eq!(
+        test.state.full_reads.load(Ordering::SeqCst),
+        2,
+        "fresh playbacks still verify their complete source"
+    );
+    // Permission can disappear between the initial check and delivery of a hit.
+    test.state.hold_song.store(
+        test.state.songs.load(Ordering::SeqCst) + 2,
+        Ordering::SeqCst,
+    );
+    {
+        let pending = test.segment(&bob, handle, 37, 48001, "opus-64");
+        tokio::pin!(pending);
+        tokio::select! {
+            _=&mut pending=>panic!("cached delivery completed before reauthorization"),
+            result=tokio::time::timeout(Duration::from_secs(3),test.state.reached.notified())=>result.unwrap(),
+        }
+        test.state.denied.store(true, Ordering::SeqCst);
+        test.state.release.notify_one();
+        assert_eq!(pending.await.status(), 404);
+    }
+    test.state.denied.store(false, Ordering::SeqCst);
+    test.wait_clean().await;
+    test.restart_installed().await;
+    assert_eq!(test.open(&alice, "a").await.status(), 401);
+    let alice = test.login("alice").await;
+    let opened = test.handle(&alice).await;
+    let (warm, actual) = test
+        .decoded(
+            &alice,
+            opened["playback"].as_str().unwrap(),
+            37,
+            48001,
+            "opus-64",
+        )
+        .await;
+    assert_eq!(warm["retained_cache_hit"], true);
+    assert_eq!(actual, expected);
+    assert_eq!(test.state.full_reads.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_clear_during_preparation_and_disable_keep_active_audio_working() {
+    let test = Harness::installed(48000).await;
+    let token = test.login("alice").await;
+    let opened = test.handle(&token).await;
+    let handle = opened["playback"].as_str().unwrap();
+    test.decoded(&token, handle, 0, 48000, "lossless").await;
+    assert_eq!(test.retained_entries(), 1);
+    // Hold the newly encoded interval at its final permission check, before insert.
+    test.state.hold_song.store(
+        test.state.songs.load(Ordering::SeqCst) + 2,
+        Ordering::SeqCst,
+    );
+    let pending = test.segment(&token, handle, 48000, 48000, "opus-64");
+    tokio::pin!(pending);
+    tokio::select! {
+        _=&mut pending=>panic!("preparation completed before clear"),
+        result=tokio::time::timeout(Duration::from_secs(3),test.state.reached.notified())=>result.unwrap(),
+    }
+    test.cache_change(true, true).await;
+    assert_eq!(test.retained_entries(), 0);
+    test.state.release.notify_one();
+    assert_eq!(
+        pending.await.status(),
+        200,
+        "clear must not cancel active audio"
+    );
+    assert_eq!(
+        test.retained_entries(),
+        0,
+        "late preparation must not refill the cleared cache"
+    );
+    test.decoded(&token, handle, 96000, 48000, "opus-64").await;
+    assert_eq!(test.retained_entries(), 1);
+    test.cache_change(false, false).await;
+    assert_eq!(test.retained_entries(), 0);
+    test.decoded(&token, handle, 144000, 48000, "lossless")
+        .await;
+    assert_eq!(test.retained_entries(), 0);
+    test.cache_change(true, false).await;
+    test.decoded(&token, handle, 192000, 48000, "lossless")
+        .await;
+    assert_eq!(test.retained_entries(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_new_source_hash_cannot_reuse_old_retained_audio() {
+    let test = Harness::installed(48000).await;
+    let token = test.login("alice").await;
+    let opened = test.handle(&token).await;
+    let handle = opened["playback"].as_str().unwrap();
+    test.decoded(&token, handle, 0, 48000, "lossless").await;
+    test.close_playback(&token, handle).await;
+    // Alter an existing FLAC padding byte. The source is still decodable, same
+    // length and audio, but different content. Weak server metadata is unchanged.
+    {
+        let mut data = test.state.data.lock().unwrap();
+        assert_eq!(&data[..4], b"fLaC");
+        let mut offset = 4;
+        loop {
+            let kind = data[offset] & 127;
+            let length = (usize::from(data[offset + 1]) << 16)
+                | (usize::from(data[offset + 2]) << 8)
+                | usize::from(data[offset + 3]);
+            if kind == 1 && length > 0 {
+                data[offset + 4] ^= 1;
+                break;
+            }
+            assert_eq!(data[offset] & 128, 0, "fixture must contain padding");
+            offset += 4 + length;
+        }
+    }
+    let fresh = test.handle(&token).await;
+    assert_ne!(fresh["source"]["sha256"], opened["source"]["sha256"]);
+    let (metadata, _) = test
+        .decoded(
+            &token,
+            fresh["playback"].as_str().unwrap(),
+            0,
+            48000,
+            "lossless",
+        )
+        .await;
+    assert_ne!(metadata["retained_cache_hit"], true);
+    assert_eq!(metadata["source_sha256"], fresh["source"]["sha256"]);
+    assert_eq!(test.retained_entries(), 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_cache_hit_does_not_wait_for_busy_encoder_slots() {
+    let test = Harness::installed(48000).await;
+    let alice = test.login("alice").await;
+    let bob = test.login("bob").await;
+    let hot = test.handle(&alice).await;
+    let hot = hot["playback"].as_str().unwrap();
+    test.decoded(&alice, hot, 0, 48000, "opus-64").await;
+    let cold_a = test.handle(&alice).await;
+    let cold_a = cold_a["playback"].as_str().unwrap();
+    let cold_b = test.open(&bob, "b").await.json::<Value>().await.unwrap();
+    let cold_b = cold_b["playback"].as_str().unwrap();
+    // Both real encoder slots remain occupied until their playbacks close.
+    fs::write(
+        test.dir.path().join("bin/ffmpeg"),
+        "#!/bin/sh\necho $$ >> \"$STRATUM_TEST_PID\"\nexec /bin/sleep 30\n",
+    )
+    .unwrap();
+    let pending = async {
+        tokio::join!(
+            test.segment(&alice, cold_a, 48000, 48000, "opus-64"),
+            test.segment(&bob, cold_b, 48000, 48000, "opus-64")
+        )
+    };
+    tokio::pin!(pending);
+    let occupied = async {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            if fs::read_to_string(test.dir.path().join("worker-pid"))
+                .unwrap_or_default()
+                .lines()
+                .count()
+                == 2
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "both encoders did not start");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    };
+    tokio::select! {
+        _=&mut pending=>panic!("encoders did not stay occupied"),
+        _=occupied=>{},
+    }
+    let (metadata, _) = test.decoded(&alice, hot, 0, 48000, "opus-64").await;
+    assert_eq!(metadata["retained_cache_hit"], true);
+    assert_eq!(
+        fs::read_to_string(test.dir.path().join("worker-pid"))
+            .unwrap()
+            .lines()
+            .count(),
+        2
+    );
+    test.close_playback(&alice, cold_a).await;
+    test.close_playback(&bob, cold_b).await;
+    let (a, b) = pending.await;
+    assert!(!a.status().is_success() && !b.status().is_success());
 }
 
 async fn audio_contract(rate: u64, installed: bool) {

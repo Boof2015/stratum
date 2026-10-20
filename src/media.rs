@@ -220,12 +220,19 @@ impl Engine {
     pub fn new(source: Source, cache: &Path) -> Result<Self> {
         fs::create_dir_all(cache)?;
         // Include the executable build/configuration in the cache identity.
-        let version = run(Command::new("ffmpeg").arg("-version"), TIMEOUT, 1_048_576)?;
         Ok(Self {
             source,
             cache: cache.canonicalize()?,
-            encoder: hash_bytes(&version),
+            encoder: Self::encoder_identity()?,
         })
+    }
+
+    pub(crate) fn encoder_identity() -> Result<String> {
+        Ok(hash_bytes(&run(
+            Command::new("ffmpeg").arg("-version"),
+            TIMEOUT,
+            1_048_576,
+        )?))
     }
 
     pub fn segment(&self, start: u64, frames: u64, quality: Quality) -> Result<Segment> {

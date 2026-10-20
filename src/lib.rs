@@ -1,4 +1,5 @@
 pub mod access;
+pub mod cache;
 pub mod media;
 pub mod owner;
 pub mod process;

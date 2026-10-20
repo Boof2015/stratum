@@ -2,9 +2,10 @@
 
 Checkpoint 4a connects the existing authenticated audio engine to the persistent
 `sidecar` binary. Owner enrollment, saved connections and discovery publication
-now lead to an actual HTTPS audio endpoint. This is a development server:
-retained caching, configurable resource limits, deployment packaging and the
-production Astra discovery/enable flow are still subsequent work.
+now lead to an actual HTTPS audio endpoint. Checkpoint 4b adds
+[retained encoded segments and owner cache controls](owner-cache.md).
+This is a development server: configurable resource limits, deployment packaging
+and the production Astra discovery/enable flow are still subsequent work.
 
 Build `sidecar` with the repository's Rust toolchain. Audio requires `ffmpeg` and
 `ffprobe` on PATH, with FFmpeg's `libopus` encoder. The service/worker implementation
@@ -101,13 +102,11 @@ These are carried forward from the proofs to bound this integration. They are
 - At most 64 accepted HTTPS connections; ten-second TLS handshake/header bounds
   and a 60-second total socket lifetime, including slow response readers.
 - Private temporary working directories, with only the most recent encoded
-  interval retained per playback. No reusable retained cache or cache controls yet.
-  Graceful cleanup is tested; crash recovery and low-disk policy remain future work.
-
-The retained-cache design remains 5 GB by default, configurable from 1 GB upward
-without an arbitrary maximum. Clear/disable confirmations, protection for active
-work, separate working-storage accounting and configurable encoder concurrency
-belong to the next slice.
+  interval retained per playback. A separate retained cache reuses encoded
+  intervals between plays; see its [controls and recovery rules](owner-cache.md).
+  New playback acquisition still fetches and validates the complete original.
+  Graceful working-file cleanup is tested; hard-crash working-file recovery and
+  the final working-storage/low-disk policy remain future work.
 
 ## Verification
 

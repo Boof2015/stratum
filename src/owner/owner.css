@@ -23,3 +23,6 @@ fieldset { min-width: 0; margin-block: 20px; border: 1px solid GrayText; border-
 legend { padding-inline: 6px; font-size: .9rem; }
 .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-block: 20px; }
 footer { margin-top: 36px; padding-top: 20px; border-top: 1px solid GrayText; }
+
+#cache-confirmation { border: 1px solid GrayText; border-radius: 10px; padding: 16px; margin-block: 20px; }
+#cache-confirmation h3 { margin-top: 0; font-size: 1rem; }

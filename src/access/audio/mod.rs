@@ -22,6 +22,8 @@ pub(crate) struct Store {
     sources: Arc<Semaphore>,
     workers: Arc<Semaphore>,
     executable: PathBuf,
+    retained: Option<Arc<crate::cache::Cache>>,
+    cache_jobs: Arc<Semaphore>,
 }
 impl Store {
     pub(crate) async fn drain(&self) {
@@ -37,7 +39,66 @@ impl Store {
             sources: Arc::new(Semaphore::new(4)),
             workers: Arc::new(Semaphore::new(2)),
             executable: std::env::current_exe()?,
+            retained: None,
+            cache_jobs: Arc::new(Semaphore::new(2)),
         })
+    }
+    pub(crate) fn persistent(
+        directory: &std::path::Path,
+        settings: &crate::cache::Settings,
+    ) -> anyhow::Result<Self> {
+        let mut store = Self::new()?;
+        store.retained = Some(Arc::new(crate::cache::Cache::open(directory, settings)?));
+        Ok(store)
+    }
+    pub(crate) fn retained(&self) -> Option<Arc<crate::cache::Cache>> {
+        self.retained.clone()
+    }
+    pub(crate) fn working_bytes(&self) -> anyhow::Result<u64> {
+        fn count(path: &std::path::Path, depth: usize) -> anyhow::Result<u64> {
+            anyhow::ensure!(depth < 8, "Unexpected working directory depth.");
+            let mut bytes = 0;
+            for entry in std::fs::read_dir(path)? {
+                let entry = entry?;
+                let metadata = match std::fs::symlink_metadata(entry.path()) {
+                    Ok(value) => value,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => return Err(error.into()),
+                };
+                if metadata.file_type().is_symlink() {
+                    continue;
+                }
+                if metadata.is_dir() {
+                    // A worker may remove its completed staging directory during the snapshot.
+                    match count(&entry.path(), depth + 1) {
+                        Ok(size) => bytes += size,
+                        Err(error)
+                            if error
+                                .downcast_ref::<std::io::Error>()
+                                .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound) => {}
+                        Err(error) => return Err(error),
+                    }
+                } else if metadata.is_file() {
+                    bytes += metadata.len();
+                }
+            }
+            Ok(bytes)
+        }
+        count(self.root.path(), 0)
+    }
+    async fn cache_job<T: Send + 'static>(
+        &self,
+        work: impl FnOnce(Arc<crate::cache::Cache>) -> anyhow::Result<T> + Send + 'static,
+    ) -> Option<T> {
+        let cache = self.retained.clone()?;
+        let permit = self.cache_jobs.clone().try_acquire_owned().ok()?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            work(cache)
+        })
+        .await
+        .ok()?
+        .ok()
     }
 }
 
@@ -52,12 +113,18 @@ pub(super) struct Playback {
     pub(super) cancelled: CancellationToken,
     operation: tokio::sync::Mutex<()>,
     worker_busy: Arc<tokio::sync::Mutex<()>>,
-    source: Mutex<Option<SourceInfo>>,
+    source: Mutex<Option<Prepared>>,
 }
 impl Drop for Playback {
     fn drop(&mut self) {
         self.cancelled.cancel();
     }
+}
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct Prepared {
+    source: SourceInfo,
+    encoder: String,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -257,7 +324,8 @@ async fn open(
         original(&service, &session, &playback).await?;
         let acquisition_ms = started.elapsed().as_secs_f64() * 1000.0;
         let bytes = worker(&service, playback.clone(), Job { segment: None }).await?;
-        let info: SourceInfo = serde_json::from_slice(&bytes).map_err(|_| Failure::Encoding)?;
+        let prepared: Prepared = serde_json::from_slice(&bytes).map_err(|_| Failure::Encoding)?;
+        let info = &prepared.source;
         if info.bytes != size {
             return Err(Failure::Encoding);
         }
@@ -270,7 +338,7 @@ async fn open(
             "sourcePolicy": "complete-private-copy", "acquiredBytes": size,
             "acquisitionMs": acquisition_ms, "readyMs": started.elapsed().as_secs_f64()*1000.0,
             "maxSegmentSeconds": MAX_SEGMENT_SECONDS});
-        *playback.source.lock().unwrap() = Some(info);
+        *playback.source.lock().unwrap() = Some(prepared);
         {
             let mut playbacks = session.playbacks.lock().unwrap();
             active(&session, &playback)?;
@@ -339,12 +407,13 @@ async fn segment(
     let work = async {
         active(&session, &playback)?;
         let _operation = playback.operation.try_lock().map_err(|_| Failure::Busy)?;
-        let info = playback
+        let prepared = playback
             .source
             .lock()
             .unwrap()
             .clone()
             .ok_or(Failure::Internal)?;
+        let info = &prepared.source;
         if interval.frames > info.sample_rate * MAX_SEGMENT_SECONDS
             || Interval::at_rate(
                 interval.start,
@@ -359,37 +428,79 @@ async fn segment(
         // Weak live metadata is an access check, not the staged copy's identity.
         // A changed upstream file does not change this playback's immutable input.
         service.authorize(&session, &playback.track).await?;
-        let metadata_bytes = worker(
-            &service,
-            playback.clone(),
-            Job {
-                segment: Some(interval),
-            },
-        )
-        .await?;
-        let metadata: SegmentMetadata =
-            serde_json::from_slice(&metadata_bytes).map_err(|_| Failure::Encoding)?;
-        if metadata.source_sha256 != info.sha256
-            || metadata.payload_bytes > MAX_PAYLOAD_BYTES as u64
-        {
-            return Err(Failure::Encoding);
-        }
-        let payload = tokio::fs::read(playback.directory.path().join("payload"))
-            .await
-            .map_err(|_| Failure::Encoding)?;
-        if payload.len() as u64 != metadata.payload_bytes
-            || crate::media::hash_bytes(&payload) != metadata.payload_sha256
-        {
-            return Err(Failure::Encoding);
+        let id = crate::media::hash_bytes(
+            &serde_json::to_vec(&(
+                "stratum-retained-segment-1",
+                crate::media::EXPERIMENT,
+                info,
+                &prepared.encoder,
+                interval,
+            ))
+            .map_err(|_| Failure::Internal)?,
+        );
+        let cache_id = id.clone();
+        let lookup = service
+            .0
+            .audio
+            .cache_job(move |cache| cache.lookup(&cache_id))
+            .await;
+        let ticket = lookup.as_ref().map(|value| value.ticket.clone());
+        let invalid_cached_packet = lookup
+            .as_ref()
+            .and_then(|value| value.bytes.as_ref())
+            .is_some_and(|bytes| !valid_packet(bytes, &prepared, interval, true));
+        let mut output = lookup.and_then(|value| value.bytes).and_then(|bytes| {
+            if valid_packet(&bytes, &prepared, interval, true) {
+                mark_hit(&bytes).ok()
+            } else {
+                None
+            }
+        });
+        let hit = output.is_some();
+        if !hit {
+            // Corrupt entries are discarded before attempting regeneration.
+            if invalid_cached_packet {
+                let cache_id = id.clone();
+                service
+                    .0
+                    .audio
+                    .cache_job(move |cache| cache.invalidate(&cache_id))
+                    .await;
+            }
+            let metadata_bytes = worker(
+                &service,
+                playback.clone(),
+                Job {
+                    segment: Some(interval),
+                },
+            )
+            .await?;
+            let payload = tokio::fs::read(playback.directory.path().join("payload"))
+                .await
+                .map_err(|_| Failure::Encoding)?;
+            let mut bytes = Vec::with_capacity(4 + metadata_bytes.len() + payload.len());
+            bytes.extend_from_slice(&(metadata_bytes.len() as u32).to_be_bytes());
+            bytes.extend_from_slice(&metadata_bytes);
+            bytes.extend_from_slice(&payload);
+            if !valid_packet(&bytes, &prepared, interval, false) {
+                return Err(Failure::Encoding);
+            }
+            output = Some(bytes);
         }
         service.authorize(&session, &playback.track).await?;
         active(&session, &playback)?;
-        // One response binds metadata and bytes atomically: BE u32 JSON length,
-        // UTF-8 SegmentMetadata JSON, then encoded payload. No credentials/paths.
-        let mut output = Vec::with_capacity(4 + metadata_bytes.len() + payload.len());
-        output.extend_from_slice(&(metadata_bytes.len() as u32).to_be_bytes());
-        output.extend_from_slice(&metadata_bytes);
-        output.extend_from_slice(&payload);
+        let output = output.ok_or(Failure::Encoding)?;
+        if !hit && valid_packet(&output, &prepared, interval, true) {
+            if let Some(ticket) = ticket {
+                let cached = output.clone();
+                service
+                    .0
+                    .audio
+                    .cache_job(move |cache| cache.insert(&id, &cached, &ticket))
+                    .await;
+            }
+        }
+        active(&session, &playback)?;
         let mut response = Response::new(final_body(
             session.clone(),
             playback.cancelled.clone(),
@@ -414,6 +525,63 @@ async fn segment(
         _ => {} // A temporary outage permits an authorized retry of this frozen copy.
     }
     result
+}
+
+// A retained packet is the same atomic metadata+audio envelope sent to clients.
+fn valid_packet(
+    bytes: &[u8],
+    prepared: &Prepared,
+    interval: SegmentRequest,
+    encoder: bool,
+) -> bool {
+    if bytes.len() < 4 || bytes.len() > crate::cache::MAX_PACKET {
+        return false;
+    }
+    let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+    if length > JSON_LIMIT || 4 + length >= bytes.len() {
+        return false;
+    }
+    let Ok(metadata) = serde_json::from_slice::<SegmentMetadata>(&bytes[4..4 + length]) else {
+        return false;
+    };
+    let info = &prepared.source;
+    metadata.experiment == crate::media::EXPERIMENT
+        && metadata.source_sha256 == info.sha256
+        && (!encoder || metadata.encoder == prepared.encoder)
+        && metadata.quality == interval.quality
+        && metadata.sample_rate == info.sample_rate
+        && metadata.channels == info.channels
+        && metadata.presentation.start == interval.start
+        && metadata.presentation.frames == interval.frames
+        && metadata.encoded_interval.start <= interval.start
+        && metadata.encoded_interval.frames > 0
+        && metadata
+            .encoded_interval
+            .start
+            .checked_add(metadata.encoded_interval.frames)
+            .is_some_and(|end| end <= info.frames && end >= interval.start + interval.frames)
+        && metadata.discard_start_frames == interval.start - metadata.encoded_interval.start
+        && metadata
+            .decoded_frames
+            .checked_sub(metadata.discard_start_frames)
+            .and_then(|n| n.checked_sub(metadata.discard_end_frames))
+            == Some(interval.frames)
+        && metadata.payload_bytes <= MAX_PAYLOAD_BYTES as u64
+        && metadata.payload_bytes == (bytes.len() - 4 - length) as u64
+        && crate::media::hash_bytes(&bytes[4 + length..]) == metadata.payload_sha256
+}
+fn mark_hit(bytes: &[u8]) -> Result<Vec<u8>, Failure> {
+    let length = u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+    let mut metadata: Value =
+        serde_json::from_slice(&bytes[4..4 + length]).map_err(|_| Failure::Encoding)?;
+    metadata["cache_hit"] = json!(true);
+    metadata["retained_cache_hit"] = json!(true);
+    let metadata = serde_json::to_vec(&metadata).map_err(|_| Failure::Encoding)?;
+    let mut output = Vec::with_capacity(bytes.len() + 32);
+    output.extend_from_slice(&(metadata.len() as u32).to_be_bytes());
+    output.extend_from_slice(&metadata);
+    output.extend_from_slice(&bytes[4 + length..]);
+    Ok(output)
 }
 
 /// A detached supervisor owns cleanup. Dropping its caller signals cancellation;

@@ -83,7 +83,11 @@ fn work() -> Result<Vec<u8>, WorkerFailure> {
         Ok(serde_json::to_vec(&value).map_err(anyhow::Error::from)?)
     } else {
         validate_complete(&source)?;
-        Ok(serde_json::to_vec(&source.info).map_err(anyhow::Error::from)?)
+        Ok(serde_json::to_vec(&Prepared {
+            encoder: Engine::encoder_identity()?,
+            source: source.info,
+        })
+        .map_err(anyhow::Error::from)?)
     }
 }
 fn validate_complete(source: &Source) -> anyhow::Result<()> {

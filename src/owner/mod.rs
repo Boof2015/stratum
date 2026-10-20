@@ -57,6 +57,7 @@ enum Failure {
     Busy,
     Internal,
     Conflict,
+    Storage,
     Setup(&'static str),
     Probe(setup::ProbeFailure),
     Discovery(discovery::Error),
@@ -70,6 +71,7 @@ impl IntoResponse for Failure {
             Self::Origin => (StatusCode::FORBIDDEN, "Open Sidecar at a configured administration address."),
             Self::Busy => (StatusCode::TOO_MANY_REQUESTS, "Too many requests. Wait a minute and try again."),
             Self::Internal => (StatusCode::INTERNAL_SERVER_ERROR, "Sidecar couldn't read or save its owner settings. Check the service's data directory."),
+            Self::Storage => (StatusCode::SERVICE_UNAVAILABLE, "Sidecar could not read or apply its cache settings. Check storage access and try again."),
             Self::Conflict => (StatusCode::CONFLICT, "Setup changed elsewhere. Reload the saved settings before trying again."),
             Self::Setup(message) => (StatusCode::BAD_REQUEST, message),
             Self::Probe(error) => (StatusCode::BAD_GATEWAY, error.message()),
@@ -132,6 +134,10 @@ impl Service {
             .route("/admin/api/setup/listeners", post(save_listeners))
             .route("/admin/api/setup/check", post(check_navidrome))
             .route("/admin/api/discovery", post(change_discovery))
+            .route(
+                "/admin/api/storage",
+                get(storage_state).post(change_storage),
+            )
             .layer(DefaultBodyLimit::max(32768))
             .layer(middleware::from_fn_with_state(self.clone(), boundary))
             .with_state(self.clone())
@@ -161,6 +167,9 @@ impl Service {
             |error| match error.downcast_ref::<store::SetupWriteError>() {
                 Some(store::SetupWriteError::Conflict) => Failure::Conflict,
                 Some(store::SetupWriteError::OwnerChanged) => Failure::Authentication,
+                Some(store::SetupWriteError::Confirmation) => {
+                    Failure::Setup("Confirm clearing retained audio before continuing.")
+                }
                 None => error
                     .downcast_ref::<discovery::Error>()
                     .copied()
@@ -374,9 +383,51 @@ async fn setup_state(
     let (identity, setup, discovery) = service
         .disk(|store| Ok((store.identity()?, store.config()?.setup, store.discovery()?)))
         .await?;
+    let storage = service
+        .0
+        .listener
+        .storage()
+        .await
+        .map_err(|_| Failure::Storage)?;
     Ok(Json(
-        json!({"stage":setup.stage(), "identity":identity, "discovery":discovery.view(&setup,&identity), "setup":setup}),
+        json!({"stage":setup.stage(), "identity":identity, "discovery":discovery.view(&setup,&identity), "setup":setup, "storage":storage}),
     ))
+}
+
+async fn storage_state(
+    State(service): State<Service>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, Failure> {
+    service.authorize(&headers).await?;
+    Ok(Json(
+        service
+            .0
+            .listener
+            .storage()
+            .await
+            .map_err(|_| Failure::Storage)?,
+    ))
+}
+async fn change_storage(
+    State(service): State<Service>,
+    headers: HeaderMap,
+    body: Result<Json<crate::cache::Change>, JsonRejection>,
+) -> Result<Json<serde_json::Value>, Failure> {
+    let generation = service.authorize(&headers).await?;
+    let Json(body) = body.map_err(|_| Failure::Input)?;
+    crate::cache::Settings {
+        enabled: body.enabled,
+        limit_bytes: body.limit_bytes,
+        ..Default::default()
+    }
+    .validate()
+    .map_err(|_| {
+        Failure::Setup("Use a cache limit of at least 1 GB, within the supported numeric range.")
+    })?;
+    service
+        .disk(move |store| store.save_storage(&body, Some(&generation)))
+        .await?;
+    storage_state(State(service), headers).await
 }
 
 #[derive(Deserialize)]

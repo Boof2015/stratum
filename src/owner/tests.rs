@@ -63,6 +63,184 @@ async fn enrolled(store: &Store, service: &Service) -> String {
 }
 
 #[tokio::test]
+async fn storage_changes_require_owner_confirmation_and_current_revision() {
+    let (_dir, store, service) = fixture();
+    for method in ["GET", "POST"] {
+        assert_eq!(
+            call(&service, method, "/admin/api/storage", None, json!({}))
+                .await
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+    }
+    let cookie = enrolled(&store, &service).await;
+    let setup_revision = store.config().unwrap().setup.revision;
+    let state = json(
+        call(
+            &service,
+            "GET",
+            "/admin/api/storage",
+            Some(&cookie),
+            json!({}),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(state["settings"]["limit_bytes"], 5_000_000_000u64);
+    assert_eq!(state["cache"]["entries"], 0);
+    let mut change =
+        json!({"revision":"initial","enabled":true,"limit_bytes":1_000_000_000_000u64});
+    let saved = json(
+        call(
+            &service,
+            "POST",
+            "/admin/api/storage",
+            Some(&cookie),
+            change.clone(),
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(saved["settings"]["limit_bytes"], 1_000_000_000_000u64);
+    assert_eq!(saved["cache"]["settings"], saved["settings"]);
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/storage",
+            Some(&cookie),
+            change.clone()
+        )
+        .await
+        .status(),
+        StatusCode::CONFLICT
+    );
+    change["revision"] = saved["settings"]["revision"].clone();
+    let before = store.config().unwrap().storage;
+    for limit in [0, crate::cache::GB - 1, 9_007_199_254_740_992u64] {
+        let mut invalid = change.clone();
+        invalid["limit_bytes"] = json!(limit);
+        assert_eq!(
+            call(
+                &service,
+                "POST",
+                "/admin/api/storage",
+                Some(&cookie),
+                invalid
+            )
+            .await
+            .status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(store.config().unwrap().storage, before);
+    }
+    change["enabled"] = json!(false);
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/storage",
+            Some(&cookie),
+            change.clone()
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(store.config().unwrap().storage, before);
+    change["confirmed"] = json!(true);
+    let disabled = json(
+        call(
+            &service,
+            "POST",
+            "/admin/api/storage",
+            Some(&cookie),
+            change,
+        )
+        .await,
+    )
+    .await;
+    assert_eq!(disabled["settings"]["enabled"], false);
+    assert_ne!(disabled["settings"]["clear_epoch"], before.clear_epoch);
+    assert_eq!(disabled["cache"]["settings"], disabled["settings"]);
+    assert_eq!(disabled["cache"]["retained_bytes"], 0);
+    let mut clear = json!({"revision":disabled["settings"]["revision"],"enabled":true,"limit_bytes":crate::cache::GB,"clear":true});
+    assert_eq!(
+        call(
+            &service,
+            "POST",
+            "/admin/api/storage",
+            Some(&cookie),
+            clear.clone()
+        )
+        .await
+        .status(),
+        StatusCode::BAD_REQUEST
+    );
+    clear["confirmed"] = json!(true);
+    assert_eq!(
+        call(&service, "POST", "/admin/api/storage", Some(&cookie), clear)
+            .await
+            .status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        store.config().unwrap().setup.revision,
+        setup_revision,
+        "cache controls must not revoke listener sessions"
+    );
+    store
+        .set_password("replacement owner password", true)
+        .unwrap();
+    assert_eq!(
+        call(
+            &service,
+            "GET",
+            "/admin/api/storage",
+            Some(&cookie),
+            json!({})
+        )
+        .await
+        .status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[test]
+fn pre_cache_config_gets_defaults_and_stale_owner_cannot_change_storage() {
+    let (directory, store, _service) = fixture();
+    let path = directory.path().join("config.json");
+    let mut config: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    config.as_object_mut().unwrap().remove("storage");
+    std::fs::write(path, serde_json::to_vec(&config).unwrap()).unwrap();
+    assert_eq!(
+        store.config().unwrap().storage,
+        crate::cache::Settings::default()
+    );
+    store.set_password(PASSWORD, false).unwrap();
+    let generation = store.owner_generation().unwrap().unwrap();
+    store
+        .set_password("replacement owner password", true)
+        .unwrap();
+    let change = crate::cache::Change {
+        revision: "initial".into(),
+        enabled: true,
+        limit_bytes: crate::cache::GB,
+        clear: false,
+        confirmed: false,
+    };
+    let error = store.save_storage(&change, Some(&generation)).unwrap_err();
+    assert!(matches!(
+        error.downcast_ref::<store::SetupWriteError>(),
+        Some(store::SetupWriteError::OwnerChanged)
+    ));
+    assert_eq!(
+        store.config().unwrap().storage,
+        crate::cache::Settings::default()
+    );
+}
+
+#[tokio::test]
 async fn enrollment_needs_the_local_code_and_sets_a_protected_cookie() {
     let (_directory, store, service) = fixture();
     let code = store.setup_code().unwrap();

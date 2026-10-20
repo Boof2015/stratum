@@ -85,7 +85,35 @@
             </div>
           </form>
         </section>
-        <p class="preview">Development preview: authenticated audio is available with these connections. Retained caching, resource controls and the live dashboard are still being built.</p>
+        <section aria-labelledby="storage-heading">
+          <h2 id="storage-heading">Storage</h2>
+          <p id="storage-usage">Load storage use to view the cache.</p>
+          <p id="storage-working"></p>
+          <p id="storage-problem" role="status"></p>
+          <form id="storage-form" hidden>
+            <label>Retain prepared audio
+              <select id="cache-enabled"><option value="true">On</option><option value="false">Off</option></select>
+            </label>
+            <p class="hint">Reuse prepared audio between plays to avoid repeated conversion. Active streams still need temporary working storage when this is off.</p>
+            <label>Cache limit (GB)
+              <input id="cache-limit" type="number" min="1" step="1" required>
+            </label>
+            <div class="actions">
+              <button type="submit">Save cache settings</button>
+              <button id="cache-clear" type="button">Clear cached audio…</button>
+            </div>
+          </form>
+          <div id="cache-confirmation" role="alertdialog" aria-labelledby="cache-confirm-title" aria-describedby="cache-confirm-message" hidden>
+            <h3 id="cache-confirm-title"></h3>
+            <p id="cache-confirm-message"></p>
+            <div class="actions">
+              <button id="cache-cancel" type="button">Cancel</button>
+              <button id="cache-confirm" type="button">Clear cached audio</button>
+            </div>
+          </div>
+          <button id="storage-refresh" type="button">Refresh storage use</button>
+        </section>
+        <p class="preview">Development preview: authenticated audio is available with these connections. Retained segments are available. Resource controls and the live dashboard are still being built.</p>
       </section>
       <footer><button id="logout" type="button">Sign out</button></footer>
     </section>

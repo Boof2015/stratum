@@ -17,6 +17,8 @@ sidecar setup-code --data-dir DIR
 sidecar renew-certificate --data-dir DIR
 sidecar status --data-dir DIR
 sidecar configure --data-dir DIR --settings FILE
+sidecar configure-cache --data-dir DIR [--limit-gb N] [--enable | --disable --confirm]
+sidecar clear-cache --data-dir DIR --confirm
 sidecar check-navidrome --data-dir DIR [--url URL]
 sidecar manual-discovery --data-dir DIR
 sidecar publish-discovery --data-dir DIR --username NAME [--password-stdin] [--recreate]
@@ -30,7 +32,8 @@ from automation; passwords are never accepted in command-line arguments.
 configure imports connection settings after owner setup; check-navidrome detects
 the API without signing in. Publishing/removing discovery asks for temporary
 Navidrome administrator authorization. Configured servers serve experimental
-authenticated audio over HTTPS. Retained caching and the full dashboard follow.";
+authenticated audio over HTTPS, with configurable retained segments. Temporary
+working storage is still needed when caching is disabled. The full dashboard follows.";
 
 #[tokio::main(worker_threads = 2)]
 async fn main() {
@@ -65,6 +68,8 @@ async fn run() -> Result<()> {
             "renew-certificate",
             "status",
             "configure",
+            "configure-cache",
+            "clear-cache",
             "check-navidrome",
             "manual-discovery",
             "publish-discovery",
@@ -81,6 +86,9 @@ async fn run() -> Result<()> {
     let mut probe_url = None;
     let mut username = None;
     let mut recreate = false;
+    let mut cache_limit = None;
+    let mut cache_enabled = None;
+    let mut confirmed = false;
     while let Some(flag) = args.next() {
         match flag.to_str() {
             Some("--data-dir") if directory.is_none() => {
@@ -132,6 +140,26 @@ async fn run() -> Result<()> {
                         .and_then(|v| v.into_string().ok())
                         .context("--username needs a Navidrome administrator name.")?,
                 );
+            }
+            Some("--limit-gb") if command == "configure-cache" && cache_limit.is_none() => {
+                let gb: u64 = args
+                    .next()
+                    .and_then(|v| v.into_string().ok())
+                    .context("--limit-gb needs a whole number of GB.")?
+                    .parse()
+                    .context("Use a whole number of GB.")?;
+                cache_limit = Some(
+                    gb.checked_mul(stratum_poc::cache::GB)
+                        .context("Cache limit is too large.")?,
+                );
+            }
+            Some("--enable" | "--disable")
+                if command == "configure-cache" && cache_enabled.is_none() =>
+            {
+                cache_enabled = Some(flag == "--enable");
+            }
+            Some("--confirm") if matches!(command, "configure-cache" | "clear-cache") => {
+                confirmed = true;
             }
             Some("--recreate") if command == "publish-discovery" => {
                 recreate = true;
@@ -207,6 +235,42 @@ async fn run() -> Result<()> {
             let current = store.config()?.setup;
             let saved = store.save_setup(&settings, &current.revision, None)?;
             println!("Connection settings saved ({}). Addresses have not been checked. Run check-navidrome to detect the server; this does not sign in.", saved.stage());
+        }
+        "configure-cache" | "clear-cache" => {
+            ensure!(
+                command == "clear-cache" || cache_enabled.is_some() || cache_limit.is_some(),
+                "Choose a cache limit, --enable or --disable."
+            );
+            let current = store.config()?.storage;
+            let saved = store.save_storage(
+                &stratum_poc::cache::Change {
+                    revision: current.revision,
+                    enabled: cache_enabled.unwrap_or(current.enabled),
+                    limit_bytes: cache_limit.unwrap_or(current.limit_bytes),
+                    clear: command == "clear-cache",
+                    confirmed,
+                },
+                None,
+            )?;
+            match store.server_lock() {
+                Ok(_lease) => {
+                    let cache = stratum_poc::cache::Cache::open(&store.cache_directory(), &saved)
+                        .context("Settings saved, but retained audio could not be updated. Check storage access and retry.")?;
+                    println!("{}", serde_json::to_string_pretty(&cache.stats())?);
+                }
+                Err(error)
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock) =>
+                {
+                    println!("Cache settings saved. The running service will apply them shortly; active playback keeps its temporary files.");
+                }
+                Err(error) => {
+                    return Err(error.context(
+                        "Settings saved, but cache maintenance could not acquire the service lock.",
+                    ))
+                }
+            }
         }
         "check-navidrome" => {
             ensure!(

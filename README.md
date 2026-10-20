@@ -213,6 +213,11 @@ logout, expiry, password changes and upstream outages. It is not connected to
 Astra yet. See [the initial access proof](docs/access-proof.md) and the audio
 checkpoint's source-staging trade-offs before treating this as a deployment design.
 
+The installed `sidecar` binary now provides owner setup, discovery publication
+and [authenticated HTTPS streaming](docs/owner-streaming.md), with a
+[retained encoded-segment cache and owner controls](docs/owner-cache.md).
+Production Astra discovery/enable UI and deployment packaging remain in progress.
+
 ## Checks
 
 ```sh
@@ -244,5 +249,7 @@ client. Discovery and Navidrome credentials do not belong in the audio engine.
    harder network conditions, queue edits and source-cache reuse across seeks. Discovery, pairing, per-user authorization
    and production cache eviction must be designed before deployment.
 
-The current cache is an unbounded experiment directory, not a server cache. No
-existing accounts, servers, music libraries, or Astra settings are modified by the tests.
+The command-line proof's `--cache` directory is an unbounded experiment directory.
+The installed HTTPS service uses the separately bounded
+[retained server cache](docs/owner-cache.md). No existing accounts, servers, music
+libraries, or Astra settings are modified by the tests.
