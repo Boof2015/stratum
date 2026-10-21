@@ -3,11 +3,11 @@
 This is the first owner-setup checkpoint, separate from `sidecar-access` and the
 audio engine. It supplies persistent configuration and HTTPS identity, terminal
 or browser password enrollment, owner sessions, and local password recovery.
-It is **not a complete streaming deployment**. [Connection setup](owner-setup.md)
-is available as checkpoint 2 and [discovery publication](owner-discovery.md) as
-checkpoint 3. [Authenticated HTTPS streaming](owner-streaming.md) is connected
-in checkpoint 4a. The full dashboard, retained cache and Docker/systemd packaging
-come in subsequent checkpoints. Astra's current streaming integration is unchanged.
+Later checkpoints add [connection setup](owner-setup.md),
+[discovery publication](owner-discovery.md), [authenticated HTTPS streaming](owner-streaming.md),
+[retained cache](owner-cache.md) and the [live dashboard](owner-dashboard.md).
+For Docker or standalone Linux/systemd, start with [installation](install.md).
+This is still a development service; Astra's production enable flow is unfinished.
 
 ## Start an isolated installation
 
@@ -75,7 +75,7 @@ Recovery works while Sidecar runs. It changes the owner-session generation, so
 existing cookies fail on their next protected request without a service restart.
 Configuration, installation ID and TLS key/certificate remain unchanged. This
 command must run as the Sidecar service account with access to its private data
-directory; for Docker it would run inside the container with the same mounted
+directory; for Docker it runs inside the container with the same mounted
 volume. It does not change Navidrome credentials or listener accounts.
 
 ## Persistence and identity
@@ -145,5 +145,5 @@ resets the password from a separate process, then restarts and signs in again.
 Children have deadlines and are killed/reaped on failure. These checks launch no
 browser/Electron window, touch no existing server, and play no audio.
 
-The web page now includes the [connection setup flow](owner-setup.md). Full
-dashboard visual design remains subsequent work.
+The web page includes the [connection setup flow](owner-setup.md) and
+[live dashboard](owner-dashboard.md).

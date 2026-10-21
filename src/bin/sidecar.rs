@@ -34,7 +34,8 @@ configure imports connection settings after owner setup; check-navidrome detects
 the API without signing in. Publishing/removing discovery asks for temporary
 Navidrome administrator authorization. Configured servers serve experimental
 authenticated audio over HTTPS, with configurable retained segments. Temporary
-working storage is still needed when caching is disabled. The full dashboard follows.";
+working storage is still needed when caching is disabled. The owner dashboard
+shows live activity and storage use. See docs/install.md for Docker/systemd setup.";
 
 #[tokio::main(worker_threads = 2)]
 async fn main() {

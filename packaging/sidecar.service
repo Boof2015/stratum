@@ -1,0 +1,27 @@
+[Unit]
+Description=Astra Sidecar
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=sidecar
+Group=sidecar
+StateDirectory=sidecar
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/sidecar
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+ExecStart=/usr/local/bin/sidecar serve --data-dir /var/lib/sidecar
+Restart=on-failure
+RestartSec=5
+TimeoutStopSec=20
+KillMode=mixed
+UMask=0077
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+RestrictSUIDSGID=yes
+
+[Install]
+WantedBy=multi-user.target

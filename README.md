@@ -14,9 +14,11 @@ for the development limits and [resource controls](docs/owner-resources.md) for
 conversion scheduling, working storage and crash recovery.
 The [live owner dashboard](docs/owner-dashboard.md) shows sessions, prepared
 streams, last sent quality, transfer rate and resource use.
+For Docker Compose or a standalone Linux/systemd installation, see
+[Install Sidecar](docs/install.md). Both use the same persistent setup and identity.
 The loopback `sidecar-access` proof remains available.
 
-This repository contains **audio and delivery proofs of concept**, plus a development Sidecar server, not a finished deployment package. They generate independently decodable FLAC/Opus
+This repository contains **audio and delivery proofs of concept**, plus a development Sidecar server and buildable Linux packages. The protocol and production Astra enable flow are still under development. The proofs generate independently decodable FLAC/Opus
 segments, trim them onto one sample timeline, acquire source intervals from a
 disposable Navidrome, and test delivery against a real-time consumption clock.
 
@@ -24,7 +26,8 @@ disposable Navidrome, and test delivery against a real-time consumption clock.
 
 Requires Rust 1.88 or newer and `ffmpeg` / `ffprobe` on PATH. FFmpeg must include
 the `libopus` encoder. The initial run was checked on macOS with Rust 1.98.1 and
-FFmpeg 9.0.1; other platforms/builds have not yet been exercised.
+FFmpeg 9.0.1. The packaging checks also exercise Linux with Rust 1.88 and Debian's
+FFmpeg; see [installation and verification](docs/install.md).
 
 ```sh
 cargo run --release -- demo --out artifacts/demo

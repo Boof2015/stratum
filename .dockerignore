@@ -1,0 +1,13 @@
+**
+!Cargo.toml
+!Cargo.lock
+!src/
+!src/**
+!packaging/
+!packaging/**
+!docs/
+!docs/install.md
+!tests/
+!tests/**
+!examples/
+!examples/**
