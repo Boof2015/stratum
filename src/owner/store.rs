@@ -454,6 +454,13 @@ impl Store {
         Ok(Arc::new(tls_config(&self.read_state()?)?))
     }
 
+    /// Public certificate for local administration tools to verify this service.
+    pub fn certificate(&self) -> Result<CertificateDer<'static>> {
+        Ok(CertificateDer::from_pem_slice(
+            self.read_state()?.certificate_pem.as_bytes(),
+        )?)
+    }
+
     /// Renewal uses the same key; changing the certificate does not rotate the
     /// advertised SPKI identity. A running server uses the new cert after restart.
     pub fn renew_certificate(&self) -> Result<()> {

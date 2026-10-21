@@ -216,10 +216,13 @@ async fn dispatch(State(listener): State<Listener>, request: Request) -> Respons
     } else {
         error(StatusCode::TOO_MANY_REQUESTS, "limit_reached")
     };
+    let close = !response.status().is_success();
     let headers = response.headers_mut();
     headers.insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
     headers.insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
-    headers.insert(header::CONNECTION, "close".parse().unwrap());
+    if close {
+        headers.insert(header::CONNECTION, "close".parse().unwrap());
+    }
     response
 }
 

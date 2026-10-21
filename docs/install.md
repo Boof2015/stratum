@@ -2,8 +2,8 @@
 
 These are development packages for Linux, alongside an existing Navidrome.
 Docker and a standalone binary use the same setup, dashboard and data format.
-Astra's normal discovery/enable flow is still being connected; packaging does
-not remove the current audio limits (FLAC/WAV, mono/stereo, 44.1/48/96 kHz).
+Astra can discover Sidecar through Navidrome and enable Stratum per server.
+The current audio limits still apply (FLAC/WAV, mono/stereo, 44.1/48/96 kHz).
 
 ## Docker
 
@@ -14,13 +14,14 @@ cp .env.example .env
 # Edit .env: use the HTTPS address you will open, such as
 # SIDECAR_ADMIN_ORIGIN=https://192.168.1.20:7843
 docker compose up -d --build
-docker compose logs sidecar
+docker compose exec sidecar sidecar setup-info --data-dir /var/lib/sidecar
 ```
 
 Open that address. Sidecar creates its own HTTPS certificate, so your browser
-will show a trust warning. The logs show its certificate fingerprint and a
-30-minute setup code. Enter the code and choose your owner password, then follow
-the Navidrome, listener-address and discovery steps. No Astra installation is
+may show a trust warning. The last command checks local HTTPS and prints the
+address and a 30-minute setup code on its own line. Enter the code and choose
+your owner password, then follow the Navidrome, listener-address and discovery
+steps. No Astra installation is
 needed to set up the server.
 
 The image includes FFmpeg and runs as UID/GID **10001**, without root privileges.
@@ -63,7 +64,7 @@ Use a local filesystem that supports Unix permissions, atomic rename and locks.
 
 ## Standalone Linux / systemd
 
-The archive contains `sidecar`, `sidecar.service` and this guide. Build it on the
+The archive contains `sidecar`, `install.sh`, `sidecar.service` and this guide. Build it on the
 target Linux architecture with Rust 1.88+:
 
 ```sh
@@ -89,32 +90,49 @@ Debian 12/Ubuntu 24.04 or newer for the Docker-built binary. An archive built on
 another distribution inherits that system's libc requirements. FFmpeg is a
 separate runtime dependency and must provide `ffmpeg`, `ffprobe` and `libopus`.
 
-On a Debian/Ubuntu server or LXC, install FFmpeg and a dedicated service user.
-Run these from the extracted archive directory (skip `useradd` if the account
-already exists):
+On a Debian/Ubuntu server or LXC, run this from the extracted archive:
 
 ```sh
-sudo apt-get update
-sudo apt-get install --no-install-recommends ffmpeg ca-certificates
-sudo useradd --system --user-group --home-dir /var/lib/sidecar \
-  --no-create-home --shell /usr/sbin/nologin sidecar
-sudo install -m 0755 sidecar /usr/local/bin/sidecar
-sudo install -d -m 0700 -o sidecar -g sidecar /var/lib/sidecar
-sudo -u sidecar /usr/local/bin/sidecar init --data-dir /var/lib/sidecar \
-  --listen 0.0.0.0:7843 --admin-origin https://192.168.1.20:7843
-sudo install -m 0644 sidecar.service /etc/systemd/system/sidecar.service
-sudo systemctl daemon-reload
-sudo systemctl enable --now sidecar
-sudo journalctl -u sidecar -n 30 --no-pager
+sudo ./install.sh
 ```
 
-Replace the example address with your server's. Use the setup code from the
-journal to choose the owner password in your browser. Alternatively, run
-`sidecar set-password --data-dir /var/lib/sidecar` as the service user before
-starting it. The service starts without interactive prompts and starts on boot.
-It runs without root/capabilities; no sound device or music-directory mount is
-needed. Its unit avoids mount-namespace sandbox settings so it also fits typical
-unprivileged LXC installations.
+If you are already root (for example in the Proxmox console), use `./install.sh`.
+It asks for the Sidecar port and browser address, offering detected defaults,
+then confirms before installing. It installs missing FFmpeg/CA certificates,
+creates a dedicated service account, and starts Sidecar on boot. Navidrome is
+left alone. Other systemd distributions can use the installer with FFmpeg,
+ffprobe, libopus, CA certificates and util-linux already installed.
+
+After checking Sidecar's local HTTPS service, it prints:
+
+```text
+Sidecar is running.
+
+Open: https://192.168.1.20:7843
+
+Setup code (valid for 30 minutes):
+
+<your one-time code>
+
+Enter this code in your browser and choose your Sidecar password.
+```
+
+Dependency output goes to a private log whose path is printed at the end; the
+setup code is not stored there. If setup was already completed, it asks you to
+sign in with your existing password instead. A local check cannot verify your
+firewall, DNS or reverse proxy from another computer.
+
+For unattended installation, supply the address explicitly:
+
+```sh
+sudo ./install.sh --yes --admin-origin https://192.168.1.20:7843
+```
+
+Use `--port 7844` to change the listen port on a **new** installation. The browser
+address may use a different port when a reverse proxy forwards it. The service
+runs without root/capabilities; no audio device or music-directory mount is
+needed. Its unit avoids mount-namespace settings for unprivileged LXC support.
+The installer never reinitializes incomplete or unreadable existing state.
 
 ## Recovery and updates
 
@@ -122,11 +140,11 @@ Recover an expired first-setup code, or replace an established owner password:
 
 ```sh
 # Docker: these exec commands run as the image's non-root service user.
-docker compose exec sidecar sidecar setup-code --data-dir /var/lib/sidecar
+docker compose exec sidecar sidecar setup-info --data-dir /var/lib/sidecar
 docker compose exec -it sidecar sidecar reset-password --data-dir /var/lib/sidecar
 
 # Standalone:
-sudo -u sidecar sidecar setup-code --data-dir /var/lib/sidecar
+sudo -u sidecar sidecar setup-info --data-dir /var/lib/sidecar
 sudo -u sidecar sidecar reset-password --data-dir /var/lib/sidecar
 ```
 
@@ -135,16 +153,23 @@ preserving connections, cache and identity. It does not change Navidrome account
 For automation, use `--password-stdin` with protected input, never a password in
 command arguments or Compose environment variables.
 
-Before updating, stop Sidecar and back up its data directory, keeping ownership
-and private permissions. `private.json` includes the identity key and owner
+Before a manual or Docker update, stop Sidecar and back up its data directory,
+keeping ownership and private permissions. The guided installer does this for
+you, excluding cached audio. `private.json` includes the identity key and owner
 password hash; store backups privately. `config.json`, `private.json` and the
 discovery state belong together. Retained audio can be omitted from a backup;
 working files are disposable. Never start two installations from the same backup
 at once. Restoring without the identity changes what clients must trust.
 
 For Docker, rebuild from the chosen checkout and run `docker compose up -d`
-with the same volume. For standalone, stop the service, replace the binary,
-then start it again. A graceful stop cancels streaming and cleans up workers;
+with the same volume. For standalone, extract the new verified archive and run
+`sudo ./install.sh` again. It keeps the saved address, password, identity and
+cache, makes a private configuration backup in `/var/backups/sidecar`, and replaces
+the program and service unit. If startup fails, it restores the previous binary
+and unit and restarts a previously running service. It preserves systemd drop-ins;
+a unit with a custom command needs a manual update. `--yes` skips the interactive
+confirmation. Do not pass new address/port options on an update.
+A graceful stop cancels streaming and cleans up workers;
 restarting preserves settings/identity but listeners and dashboard sessions sign
 in again. A crash releases process locks; stale working files are recovered at
 startup. The service's 20-second stop allowance exceeds its normal cleanup time.
@@ -179,5 +204,15 @@ volumes and loopback-only ports with hard timeouts and cleanup. It does not
 modify an installed service, access an existing Navidrome or play audio.
 It requires Python with TLS 1.3 support. Add `--archive dist/<archive>.tar.gz`
 to also check a standalone archive built from the same checkout and architecture.
-Unit validation is not a systemd boot test; that still needs a Linux host/LXC
-running systemd.
+The guided installer has a separate isolated Linux check:
+
+```sh
+docker build --target installer-test -t astra-sidecar:installer-test .
+docker run --rm --init --network none astra-sidecar:installer-test
+```
+
+It uses real files, accounts and Sidecar HTTPS, with a simulated `systemctl`;
+no privileged container or existing installation is used. It covers new installs,
+interactive cancellation, preservation on update, backup, failure rollback and
+damaged state. Unit validation and this simulation are not a systemd boot test;
+that still needs a Linux host/LXC running systemd.

@@ -212,6 +212,7 @@ test "$#" -eq 1
 binary=$1
 cmp "$binary" /usr/local/bin/sidecar
 test -f "$(dirname "$binary")/sidecar.service"
+test -x "$(dirname "$binary")/install.sh"
 test -s "$(dirname "$binary")/INSTALL.md"
 "$binary" init --data-dir /tmp/state >/dev/null
 "$binary" set-password --data-dir /tmp/state --password-stdin >/dev/null

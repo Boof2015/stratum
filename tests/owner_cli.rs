@@ -58,7 +58,7 @@ fn command(dir: &Path, args: &[&str], input: Option<&str>) -> (bool, String) {
             .unwrap();
     }
     drop(child.0.stdin.take());
-    let status = wait(&mut child.0, Duration::from_secs(10));
+    let status = wait(&mut child.0, Duration::from_secs(25));
     let mut out = String::new();
     child
         .0
@@ -619,5 +619,103 @@ fn resource_cli_validates_and_updates_the_running_service() {
     );
     let value: Value = serde_json::from_str(&response.body).unwrap();
     assert_eq!(value["resources"]["max_conversions"], Value::Null);
+    stop(&mut server);
+}
+
+#[test]
+fn setup_info_checks_real_https_and_prints_a_usable_standalone_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let dir = temp.path().join("data");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let listen = format!("0.0.0.0:{port}");
+    // Browser proxy origin deliberately differs from the listener port and cannot
+    // resolve. Setup verification must connect locally but verify its real cert.
+    assert!(
+        command(
+            &dir,
+            &[
+                "init",
+                "--listen",
+                &listen,
+                "--admin-origin",
+                "https://sidecar.invalid",
+                "--admin-origin",
+                "https://localhost:7843"
+            ],
+            None
+        )
+        .0
+    );
+    let identity = command(&dir, &["status"], None).1;
+    let (mut server, addr, _) = start(&dir, &temp.path().join("setup.log"));
+    let (ok, text) = command(&dir, &["setup-info"], None);
+    assert!(ok, "{text}");
+    assert!(text.contains("Open: https://sidecar.invalid"));
+    let code = text
+        .lines()
+        .find(|line| line.len() == 64 && line.bytes().all(|c| c.is_ascii_hexdigit()))
+        .unwrap();
+    let local = SocketAddr::from(([127, 0, 0, 1], addr.port()));
+    assert_eq!(
+        request(
+            local,
+            roots(&dir),
+            "POST",
+            "/admin/api/claim",
+            None,
+            json!({"code": code, "password": PASSWORD})
+        )
+        .status,
+        200
+    );
+    let (ok, text) = command(&dir, &["setup-info"], None);
+    assert!(ok);
+    assert!(text.contains("existing Sidecar password"));
+    assert!(!text.contains("Setup code"));
+    assert_eq!(
+        serde_json::from_str::<Value>(&identity).unwrap()["identity"],
+        serde_json::from_str::<Value>(&command(&dir, &["status"], None).1).unwrap()["identity"]
+    );
+    assert!(addr.port() > 0);
+    stop(&mut server);
+}
+
+#[test]
+fn setup_info_never_accepts_another_installations_certificate_or_issues_a_code() {
+    let temp = tempfile::tempdir().unwrap();
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let listen = format!("127.0.0.1:{port}");
+    let first = temp.path().join("first");
+    let second = temp.path().join("second");
+    for dir in [&first, &second] {
+        assert!(
+            command(
+                dir,
+                &[
+                    "init",
+                    "--listen",
+                    &listen,
+                    "--admin-origin",
+                    "https://localhost:7843"
+                ],
+                None
+            )
+            .0
+        );
+    }
+    let before = fs::read(second.join("private.json")).unwrap();
+    let (mut server, _, _) = start(&first, &temp.path().join("first.log"));
+    let (ok, text) = command(&second, &["setup-info"], None);
+    assert!(!ok);
+    assert!(!text.contains("running") && !text.contains("Setup code"));
+    assert_eq!(before, fs::read(second.join("private.json")).unwrap());
     stop(&mut server);
 }

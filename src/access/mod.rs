@@ -603,9 +603,13 @@ async fn guard(State(service): State<Service>, request: Request, next: Next) -> 
     response
         .headers_mut()
         .insert(header::X_CONTENT_TYPE_OPTIONS, "nosniff".parse().unwrap());
-    response
-        .headers_mut()
-        .insert(header::CONNECTION, "close".parse().unwrap());
+    // Successful listener requests can share a verified HTTPS connection.
+    // Rejects may leave a request body unread, so close those connections.
+    if !response.status().is_success() {
+        response
+            .headers_mut()
+            .insert(header::CONNECTION, "close".parse().unwrap());
+    }
     response
 }
 

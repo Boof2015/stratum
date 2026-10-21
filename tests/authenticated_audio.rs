@@ -1609,3 +1609,108 @@ async fn prepared_segment_rejects_modified_private_source_even_with_restored_mti
     test.close_playback(&token, opened["playback"].as_str().unwrap())
         .await;
 }
+
+// One actual TLS stream, rather than a pooling client that could silently
+// reconnect. Covers both installed middleware layers and checks authorization
+// again after access changes on that same connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_listener_reuses_https_without_reusing_authorization() {
+    let h = Harness::installed(48000).await;
+    let private: Value =
+        serde_json::from_slice(&fs::read(h.dir.path().join("owner/private.json")).unwrap())
+            .unwrap();
+    let certificate = private["certificate_pem"].as_str().unwrap().to_owned();
+    let address = reqwest::Url::parse(&h.base).unwrap();
+    let state = h.state.clone();
+    tokio::task::spawn_blocking(move || {
+        use rustls::pki_types::{pem::PemObject, CertificateDer, ServerName};
+        use std::io::{Read, Write};
+        let mut roots = rustls::RootCertStore::empty();
+        roots
+            .add(CertificateDer::from_pem_slice(certificate.as_bytes()).unwrap())
+            .unwrap();
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connection = rustls::ClientConnection::new(
+            Arc::new(config),
+            ServerName::try_from("localhost").unwrap(),
+        )
+        .unwrap();
+        let socket = std::net::TcpStream::connect_timeout(
+            &format!("127.0.0.1:{}", address.port().unwrap()).parse().unwrap(),
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        socket.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        socket.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut stream = rustls::StreamOwned::new(connection, socket);
+        let mut call = |method: &str, path: &str, token: Option<&str>, body: Option<Value>| {
+            let body = body.map(|value| value.to_string()).unwrap_or_default();
+            let auth = token.map(|v| format!("Authorization: Bearer {v}\r\n")).unwrap_or_default();
+            write!(stream, "{method} /stratum{path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth}\r\n{body}", body.len()).unwrap();
+            stream.flush().unwrap();
+            let mut header = Vec::new();
+            while !header.ends_with(b"\r\n\r\n") {
+                assert!(header.len() < 16 * 1024);
+                let mut byte = [0];
+                stream.read_exact(&mut byte).unwrap();
+                header.push(byte[0]);
+            }
+            let header = String::from_utf8(header).unwrap().to_lowercase();
+            let status: u16 = header.split_whitespace().nth(1).unwrap().parse().unwrap();
+            let mut bytes = Vec::new();
+            if header.contains("transfer-encoding: chunked") {
+                loop {
+                    let mut line = Vec::new();
+                    while !line.ends_with(b"\r\n") {
+                        assert!(line.len() < 128);
+                        let mut byte = [0];
+                        stream.read_exact(&mut byte).unwrap();
+                        line.push(byte[0]);
+                    }
+                    let length = usize::from_str_radix(std::str::from_utf8(&line).unwrap().trim(), 16).unwrap();
+                    assert!(bytes.len() + length < 2 * 1024 * 1024);
+                    let start = bytes.len();
+                    bytes.resize(start + length, 0);
+                    stream.read_exact(&mut bytes[start..]).unwrap();
+                    let mut end = [0; 2];
+                    stream.read_exact(&mut end).unwrap();
+                    assert_eq!(&end, b"\r\n");
+                    if length == 0 { break; }
+                }
+            } else {
+                let length: usize = header.lines().find_map(|line| line.strip_prefix("content-length: "))
+                    .unwrap_or("0").parse().unwrap();
+                assert!(length < 2 * 1024 * 1024);
+                bytes.resize(length, 0);
+                stream.read_exact(&mut bytes).unwrap();
+            }
+            if status < 300 { assert!(!header.contains("connection: close")); }
+            (status, bytes)
+        };
+        assert_eq!(call("GET", "/access/v1/capabilities", None, None).0, 200);
+        let (status, bytes) = call("POST", "/access/v1/sessions", None,
+            Some(json!({"username":"alice","token":"a".repeat(32),"salt":"reuse"})));
+        assert_eq!(status, 201);
+        let session: Value = serde_json::from_slice(&bytes).unwrap();
+        let token = session["session"].as_str().unwrap();
+        let (status, bytes) = call("POST", "/audio/v1/playbacks/a", Some(token), None);
+        assert_eq!(status, 201);
+        let playback: Value = serde_json::from_slice(&bytes).unwrap();
+        let segment = format!("/audio/v1/playback/{}/segment", playback["playback"].as_str().unwrap());
+        for quality in ["opus-64", "lossless"] {
+            assert_eq!(call("POST", &segment, Some(token),
+                Some(json!({"start":0,"frames":48000,"quality":quality}))).0, 200);
+        }
+        state.denied.store(true, Ordering::SeqCst);
+        assert_eq!(call("POST", &segment, Some(token),
+            Some(json!({"start":48000,"frames":48000,"quality":"opus-64"}))).0, 404);
+    })
+    .await
+    .unwrap();
+}

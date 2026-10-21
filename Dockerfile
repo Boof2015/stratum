@@ -41,6 +41,14 @@ RUN install -m 0755 /out/sidecar /usr/local/bin/sidecar \
 USER sidecar
 RUN cargo test --locked -- --test-threads=1
 
+# Isolated installer checks: root only inside this disposable container.
+FROM test AS installer-test
+USER root
+COPY --from=build /out/sidecar /installer/sidecar
+COPY packaging/install.sh packaging/sidecar.service packaging/test-installer.sh /installer/
+ENV SIDECAR_INSTALLER_TEST=disposable
+CMD ["sh", "/installer/test-installer.sh", "/installer"]
+
 FROM build AS package
 COPY packaging ./packaging
 COPY docs/install.md ./docs/install.md

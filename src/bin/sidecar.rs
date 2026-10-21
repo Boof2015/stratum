@@ -7,10 +7,14 @@ use std::{
 use stratum_poc::owner::{self, Config, Store};
 use tokio_util::sync::CancellationToken;
 
+#[path = "sidecar/setup_info.rs"]
+mod setup_info;
+
 const WELCOME: &str = "Astra Sidecar — development server
 
-To install, follow INSTALL.md included with the Linux package.
-Setup continues in your browser after the service starts.
+Linux package: run sudo ./install.sh to install or update Sidecar.
+Already installed? Run sidecar setup-info --data-dir /var/lib/sidecar
+as the service user to show the dashboard address and setup instructions.
 
 Run sidecar --help for the command reference.";
 
@@ -23,6 +27,7 @@ sidecar reset-password --data-dir DIR [--password-stdin]
 sidecar setup-code --data-dir DIR
 sidecar renew-certificate --data-dir DIR
 sidecar status --data-dir DIR
+sidecar setup-info --data-dir DIR
 sidecar configure --data-dir DIR --settings FILE
 sidecar configure-cache --data-dir DIR [--limit-gb N] [--enable | --disable --confirm]
 sidecar clear-cache --data-dir DIR --confirm
@@ -76,6 +81,7 @@ async fn run() -> Result<()> {
             "setup-code",
             "renew-certificate",
             "status",
+            "setup-info",
             "configure",
             "configure-cache",
             "configure-resources",
@@ -225,6 +231,7 @@ async fn run() -> Result<()> {
         "Could not open Sidecar. Check the data directory; run init for a new installation.",
     )?;
     match command {
+        "setup-info" => setup_info::show(store).await?,
         "manual-discovery" | "publish-discovery" | "remove-discovery" => {
             let config = store.config()?;
             let discovery = store.discovery()?;

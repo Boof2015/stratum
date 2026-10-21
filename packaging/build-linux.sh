@@ -27,6 +27,7 @@ trap 'rm -rf "$stage"' EXIT HUP INT TERM
 mkdir "$stage/$name"
 install -m 0755 "$build/$target/release/sidecar" "$stage/$name/sidecar"
 install -m 0644 "$root/packaging/sidecar.service" "$stage/$name/sidecar.service"
+install -m 0755 "$root/packaging/install.sh" "$stage/$name/install.sh"
 install -m 0644 "$root/docs/install.md" "$stage/$name/INSTALL.md"
 tar -C "$stage" -czf "$output/$name.tar.gz" "$name"
 (cd "$output" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
