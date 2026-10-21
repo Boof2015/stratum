@@ -421,3 +421,194 @@ async fn successful_write_reply_without_retained_change_does_not_claim_publicati
         .pending
         .is_none());
 }
+
+fn changed_listeners(store: &Store) -> Vec<Endpoint> {
+    let mut listeners = store.config().unwrap().setup.settings.listeners;
+    listeners[0].url = "https://corrected.lan:7843".into();
+    listeners
+}
+
+#[tokio::test]
+async fn address_update_requires_admin_and_commits_only_after_readback() {
+    use axum::{
+        body::{to_bytes, Body},
+        http::Request,
+    };
+    use tower::ServiceExt;
+    let server = fake_server().await;
+    let (_dir, store) = fixture(&server.base);
+    let published = run(&store, Action::Publish, false).await.unwrap();
+    let before = store.config().unwrap().setup;
+    let listeners = changed_listeners(&store);
+    let service = super::super::Service::new(store.clone()).unwrap();
+    let request = |path: &str, cookie: Option<&str>, body: Value| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri(path)
+            .header("Host", "localhost:7843")
+            .header("Origin", "https://localhost:7843")
+            .header("Content-Type", "application/json");
+        if let Some(cookie) = cookie {
+            builder = builder.header("Cookie", cookie);
+        }
+        builder.body(Body::from(body.to_string())).unwrap()
+    };
+    let login = service
+        .router()
+        .oneshot(request(
+            "/admin/api/login",
+            None,
+            json!({"password":"disposable owner password"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(login.status(), 200);
+    let cookie = login.headers()["set-cookie"]
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_owned();
+    let no_admin = service
+        .router()
+        .oneshot(request(
+            "/admin/api/setup/listeners",
+            Some(&cookie),
+            json!({"revision":before.revision,"listeners":listeners}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(no_admin.status(), 400);
+    assert_eq!(store.config().unwrap().setup.revision, before.revision);
+    assert_eq!(server.fake.0.lock().unwrap().mutations, 1);
+    let update = service
+        .router()
+        .oneshot(request(
+            "/admin/api/discovery",
+            Some(&cookie),
+            json!({"action":"publish", "setup_revision":before.revision,
+            "discovery_revision":published.revision, "listeners":listeners,
+            "username":"owner", "password":"nav-secret"}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(update.status(), 200);
+    let value: Value =
+        serde_json::from_slice(&to_bytes(update.into_body(), 16384).await.unwrap()).unwrap();
+    assert_eq!(value["discovery"]["status"], "published");
+    assert!(store.config().unwrap().setup.settings.listeners == listeners);
+    let record = store.discovery().unwrap().record.unwrap();
+    assert!(record.manifest.endpoints == listeners);
+    assert_eq!(record.station_id, published.record.unwrap().station_id);
+    assert_eq!(server.fake.0.lock().unwrap().radios.len(), 1);
+    assert_eq!(server.fake.0.lock().unwrap().mutations, 2);
+}
+
+#[tokio::test]
+async fn failed_address_update_keeps_local_settings_and_retry_reconciles_remote_write() {
+    for mode in ["wrong", "ordinary", "unretained", "lost"] {
+        let server = fake_server().await;
+        let (dir, store) = fixture(&server.base);
+        run(&store, Action::Publish, false).await.unwrap();
+        let before = store.config().unwrap().setup;
+        let listeners = changed_listeners(&store);
+        {
+            let mut state = server.fake.0.lock().unwrap();
+            state.login_mode = mode.into();
+            state.no_retention = mode == "unretained";
+            state.lose_reply = mode == "lost";
+        }
+        let result = operation(&store)
+            .with_listeners(listeners.clone())
+            .unwrap()
+            .run(
+                Action::Publish,
+                credentials(),
+                false,
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(
+            result.err(),
+            Some(match mode {
+                "wrong" => Error::Authentication,
+                "ordinary" => Error::NotAdmin,
+                _ => Error::Unverified,
+            })
+        );
+        assert_eq!(store.config().unwrap().setup.revision, before.revision);
+        assert!(store.config().unwrap().setup.settings.listeners == before.settings.listeners);
+        {
+            let mut state = server.fake.0.lock().unwrap();
+            state.login_mode.clear();
+            state.no_retention = false;
+        }
+        let reopened = Store::open(&dir.path().join("sidecar")).unwrap();
+        operation(&reopened)
+            .with_listeners(listeners.clone())
+            .unwrap()
+            .run(
+                Action::Publish,
+                credentials(),
+                false,
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(reopened.config().unwrap().setup.settings.listeners == listeners);
+        assert!(
+            reopened
+                .discovery()
+                .unwrap()
+                .record
+                .unwrap()
+                .manifest
+                .endpoints
+                == listeners
+        );
+        assert!(reopened.discovery().unwrap().pending.is_none());
+        let expected_mutations = if mode == "unretained" { 3 } else { 2 };
+        assert_eq!(
+            server.fake.0.lock().unwrap().mutations,
+            expected_mutations,
+            "{mode}"
+        );
+        assert_eq!(server.fake.0.lock().unwrap().radios.len(), 1);
+        for file in ["config.json", "private.json", "discovery.json"] {
+            let content = std::fs::read_to_string(dir.path().join("sidecar").join(file)).unwrap();
+            for secret in ["nav-secret", "transient-token", "transient-salt"] {
+                assert!(!content.contains(secret));
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn address_update_holds_edit_lock_and_cancellation_leaves_saved_addresses() {
+    let server = fake_server().await;
+    let (_dir, store) = fixture(&server.base);
+    run(&store, Action::Publish, false).await.unwrap();
+    let before = store.config().unwrap().setup;
+    server.fake.0.lock().unwrap().login_mode = "delay".into();
+    let cancel = CancellationToken::new();
+    let operation = operation(&store)
+        .with_listeners(changed_listeners(&store))
+        .unwrap();
+    let task = tokio::spawn(operation.run(Action::Publish, credentials(), false, cancel.clone()));
+    server.fake.1.notified().await;
+    assert_eq!(store.config().unwrap().setup.revision, before.revision);
+    assert_eq!(
+        store
+            .save_setup(&before.settings, &before.revision, None)
+            .err()
+            .unwrap()
+            .downcast_ref::<Error>(),
+        Some(&Error::Busy)
+    );
+    cancel.cancel();
+    assert_eq!(task.await.unwrap().err(), Some(Error::Interrupted));
+    server.fake.2.notify_one();
+    assert!(store.config().unwrap().setup.settings.listeners == before.settings.listeners);
+    assert_eq!(server.fake.0.lock().unwrap().mutations, 1);
+}

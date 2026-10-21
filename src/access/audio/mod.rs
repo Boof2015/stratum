@@ -7,7 +7,7 @@ use crate::resources::{
     working::{Reservation, Working},
 };
 use crate::{
-    media::{Quality, SegmentMetadata, SourceInfo},
+    media::{FileStamp, PreparedEncoder, Quality, SegmentMetadata, SourceInfo},
     timeline::Interval,
 };
 use serde::Serialize;
@@ -191,12 +191,16 @@ impl Playback {
 struct Prepared {
     source: SourceInfo,
     encoder: String,
+    source_stamp: FileStamp,
+    prepared_encoder: PreparedEncoder,
 }
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Job {
     // None means inspect and validate the complete staged input.
     segment: Option<SegmentRequest>,
+    // Trusted preparation copied from this playback, never supplied by a client.
+    prepared: Option<Prepared>,
 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -407,7 +411,16 @@ async fn open(
         let started = Instant::now();
         original(&service, &session, &playback).await?;
         let acquisition_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let bytes = worker(&service, playback.clone(), Job { segment: None }, priority).await?;
+        let bytes = worker(
+            &service,
+            playback.clone(),
+            Job {
+                segment: None,
+                prepared: None,
+            },
+            priority,
+        )
+        .await?;
         let prepared: Prepared = serde_json::from_slice(&bytes).map_err(|_| Failure::Encoding)?;
         let info = &prepared.source;
         if info.bytes != size {
@@ -557,6 +570,7 @@ async fn segment(
                 playback.clone(),
                 Job {
                     segment: Some(interval),
+                    prepared: Some(prepared.clone()),
                 },
                 interval.priority,
             )
@@ -893,7 +907,10 @@ mod tests {
             worker(
                 &run_service,
                 run_playback,
-                Job { segment: None },
+                Job {
+                    segment: None,
+                    prepared: None,
+                },
                 Priority::Playback,
             )
             .await

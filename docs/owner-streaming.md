@@ -89,6 +89,30 @@ settings does not create another independent encoder/source allowance.
 
 ## Current limits
 
+### Reusing track preparation
+
+Opening a playback still acquires, probes, hashes and fully validates its private
+read-only source. It also identifies FFmpeg once. Subsequent segment workers reuse
+that preparation rather than probing and hashing the whole source and running
+`ffmpeg -version` again for every four-second interval.
+
+The preparation belongs to that playback and is passed only through its private
+worker job. It is never accepted from a listener or reused across newly acquired
+sources. On Unix, file checks include device/inode, size, modification and change
+times, and permissions. Changing content while restoring the modification time,
+replacing the file, or making the source writable invalidates preparation. The
+encoder is bound to the resolved executable and checked before and after use;
+replacing it requires a new playback. Segment encoding and frame validation use
+that same executable. Full content checks are retained on platforms without the
+Unix change clock; Unix remains the supported service platform.
+
+Segment hashes, decode/frame validation, cache repair, per-listener access checks,
+worker deadlines, admission and cancellation remain unchanged. Preparation reuse
+does not introduce parallel requests or additional conversion workers. A retained
+segment can still be served without taking an encoder slot.
+
+### Resource bounds
+
 These development bounds carry forward the proofs, with configurable resources
 added in checkpoint 4c. They are not a production capacity guarantee:
 

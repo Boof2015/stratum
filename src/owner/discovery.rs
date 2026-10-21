@@ -426,8 +426,20 @@ pub struct Operation {
     pub(crate) state: Discovery,
     pub(crate) identity: Identity,
     pub(crate) generation: String,
+    pub(crate) save_listener_settings: bool,
 }
 impl Operation {
+    /// Keep the proposed addresses in memory until Navidrome confirms them.
+    /// The existing pending journal records any uncertain upstream write.
+    pub fn with_listeners(mut self, listeners: Vec<Endpoint>) -> Result<Self> {
+        ensure!(!listeners.is_empty(), Error::Setup);
+        self.setup.settings.listeners = listeners;
+        self.setup.settings = self.setup.settings.normalized().map_err(|_| Error::Setup)?;
+        Manifest::new(&self.setup.settings, &self.identity).map_err(|_| Error::Setup)?;
+        self.save_listener_settings = true;
+        Ok(self)
+    }
+
     pub fn manual(mut self) -> Result<Discovery> {
         ensure!(
             self.state.record.is_none() && self.state.pending.is_none(),
@@ -466,6 +478,9 @@ impl Operation {
         cancel: CancellationToken,
     ) -> std::result::Result<Discovery, Error> {
         self.authorize(&cancel)?;
+        if self.save_listener_settings && action != Action::Publish {
+            return Err(Error::Setup);
+        }
         let desired = || -> std::result::Result<Record, Error> {
             Ok(Record {
                 navidrome_url: self
@@ -502,6 +517,22 @@ impl Operation {
             _=cancel.cancelled()=>Err(Error::Interrupted),
             result=tokio::time::timeout(Duration::from_secs(25),self.execute(action,credentials,recreate,&target,&cancel))=>result.unwrap_or(Err(Error::Unverified)),
         };
+        let result = result.and_then(|record| {
+            if self.save_listener_settings {
+                self.authorize(&cancel)?;
+                // The announcement was read back successfully. Only now commit
+                // local addresses, still under the same operation lock. If this
+                // fails, keep the pending journal for an explicitly authorized retry.
+                self.store
+                    .save_setup_locked(
+                        &self.setup.settings,
+                        &self.setup.revision,
+                        Some(&self.generation),
+                    )
+                    .map_err(|_| Error::Storage)?;
+            }
+            Ok(record)
+        });
         match result {
             Ok(record) => {
                 self.state.record = record;

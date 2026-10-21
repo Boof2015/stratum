@@ -176,6 +176,9 @@ impl Service {
                 Some(store::SetupWriteError::Confirmation) => {
                     Failure::Setup("Confirm clearing retained audio before continuing.")
                 }
+                Some(store::SetupWriteError::DiscoveryAuthorization) => Failure::Setup(
+                    "Sign in to Navidrome to update discovery and save these addresses.",
+                ),
                 None => error
                     .downcast_ref::<discovery::Error>()
                     .copied()
@@ -487,6 +490,8 @@ struct DiscoveryChange {
     password: String,
     #[serde(default)]
     recreate: bool,
+    #[serde(default)]
+    listeners: Option<Vec<setup::Endpoint>>,
 }
 async fn change_discovery(
     State(service): State<Service>,
@@ -495,7 +500,9 @@ async fn change_discovery(
 ) -> Result<Json<serde_json::Value>, Failure> {
     let generation = service.authorize(&headers).await?;
     let Json(body) = body.map_err(|_| Failure::Input)?;
-    if !matches!(body.action.as_str(), "manual" | "publish" | "remove") {
+    if !matches!(body.action.as_str(), "manual" | "publish" | "remove")
+        || (body.listeners.is_some() && body.action != "publish")
+    {
         return Err(Failure::Input);
     }
     if body.action != "manual" {
@@ -523,7 +530,12 @@ async fn change_discovery(
     let discovery_revision = body.discovery_revision.clone();
     let operation = service
         .disk(move |store| {
-            store.begin_discovery(&setup_revision, &discovery_revision, Some(&generation))
+            let operation =
+                store.begin_discovery(&setup_revision, &discovery_revision, Some(&generation))?;
+            match body.listeners {
+                Some(listeners) => operation.with_listeners(listeners),
+                None => Ok(operation),
+            }
         })
         .await?;
     if body.action == "manual" {
@@ -606,10 +618,12 @@ async fn save_listeners(
     current.settings.listeners = body.listeners;
     current.settings = current.settings.normalized().map_err(|_| Failure::Setup(
         "Use up to 16 different HTTPS listener addresses, without credentials, query parameters or fragments."))?;
-    let saved = service
-        .disk(move |store| store.save_setup(&current.settings, &body.revision, Some(&generation)))
+    service
+        .disk(move |store| {
+            store.save_listener_setup(&current.settings, &body.revision, Some(&generation))
+        })
         .await?;
-    Ok(Json(json!({"stage":saved.stage(), "setup":saved})))
+    setup_state(State(service), headers).await
 }
 
 async fn check_navidrome(

@@ -5,6 +5,7 @@ let busy = false;
 let saved = null;
 let discoveryState = { revision: 'initial', status: 'not-published', hasAnnouncement: false };
 let discoveryAction = null;
+let pendingListeners = null;
 let storageState = null;
 let pendingStorage = null;
 let dashboardWanted = false;
@@ -248,10 +249,18 @@ element('navidrome-form').addEventListener('submit', (event) => {
 });
 element('listeners-form').addEventListener('submit', (event) => {
   event.preventDefault();
+  if (busy) return;
+  const listeners = [...element('addresses').children].map((row) => ({
+    url: row.querySelector('input').value, trust: row.querySelector('select').value,
+  }));
+  const normalized = listeners.map((endpoint) => ({ ...endpoint, url: endpoint.url.trim().replace(/\/+$/, '') }));
+  if (discoveryState.hasAnnouncement && (discoveryState.status !== 'published'
+    || JSON.stringify(normalized) !== JSON.stringify(saved.settings.listeners))) {
+    element('message').textContent = '';
+    showDiscoveryForm('publish', listeners);
+    return;
+  }
   operate(async () => {
-    const listeners = [...element('addresses').children].map((row) => ({
-      url: row.querySelector('input').value, trust: row.querySelector('select').value,
-    }));
     resume(await request('setup/listeners', { revision: saved.revision, listeners }));
   });
 });
@@ -285,6 +294,12 @@ element('logout').addEventListener('click', () => operate(async () => {
 }));
 for (const id of ['retry', 'reload']) element(id).addEventListener('click', () => operate(refresh));
 function clearDiscoveryForm() {
+  if (pendingListeners) {
+    element('discovery-back-row').before(element('discovery-form'));
+    element('discovery-form').classList.remove('panel');
+    element('listeners-form').hidden = false;
+  }
+  pendingListeners = null;
   discoveryAction = null;
   element('discovery-form').reset();
   element('discovery-form').hidden = true;
@@ -310,14 +325,23 @@ function renderDiscovery() {
   element('remove-discovery').hidden = !discoveryState.hasAnnouncement;
   element('remove-discovery').textContent = discoveryState.pendingAction === 'remove' ? 'Retry removal' : 'Remove announcement';
 }
-function showDiscoveryForm(action) {
+function showDiscoveryForm(action, listeners = null) {
   clearDiscoveryForm(); discoveryAction = action;
+  pendingListeners = listeners;
+  if (listeners) {
+    element('listeners-section').append(element('discovery-form'));
+    element('discovery-form').classList.add('panel');
+    element('listeners-form').hidden = true;
+  }
   const target = action === 'remove' ? discoveryState.target : saved.settings.navidrome_url;
   element('discovery-target').textContent = `Sign in to Navidrome at ${target}`;
-  element('discovery-effect').textContent = action === 'remove'
-    ? 'Removes Sidecar’s entry from Navidrome’s internet radio list.'
+  element('discovery-effect').textContent = listeners
+    ? 'Clients need the new addresses to find Sidecar. Sign in to Navidrome to update discovery and save your changes.'
+    : action === 'remove' ? 'Removes Sidecar’s entry from Navidrome’s internet radio list.'
     : 'Adds or updates a Stratum entry in Navidrome’s internet radio list. Other apps may show it as a radio station.';
-  element('discovery-submit').textContent = action === 'remove' ? 'Remove announcement' : discoveryState.canRecreate ? 'Recreate announcement' : 'Enable discovery';
+  element('discovery-submit').textContent = listeners ? 'Update and save'
+    : action === 'remove' ? 'Remove announcement' : discoveryState.canRecreate ? 'Recreate announcement'
+    : discoveryState.hasAnnouncement ? 'Update discovery' : 'Enable discovery';
   element('discovery-actions').hidden = true;
   element('discovery-form').hidden = false;
   element('navidrome-admin').focus();
@@ -325,7 +349,11 @@ function showDiscoveryForm(action) {
 for (const [id, action] of [['publish-discovery', 'publish'], ['remove-discovery', 'remove']]) {
   element(id).addEventListener('click', () => showDiscoveryForm(action));
 }
-element('discovery-cancel').addEventListener('click', clearDiscoveryForm);
+element('discovery-cancel').addEventListener('click', () => {
+  const editing = !!pendingListeners;
+  clearDiscoveryForm();
+  element(editing ? 'listeners-save' : 'publish-discovery').focus();
+});
 element('manual-discovery').addEventListener('click', () => operate(async () => {
   resume(await request('discovery', { action: 'manual', setup_revision: saved.revision, discovery_revision: discoveryState.revision }));
 }));
@@ -334,7 +362,8 @@ element('discovery-form').addEventListener('submit', (event) => {
   operate(async () => {
     const body = { action: discoveryAction, setup_revision: saved.revision, discovery_revision: discoveryState.revision,
       username: element('navidrome-admin').value, password: element('navidrome-password').value,
-      recreate: discoveryAction === 'publish' && !!discoveryState.canRecreate };
+      recreate: discoveryAction === 'publish' && !!discoveryState.canRecreate,
+      ...(pendingListeners ? { listeners: pendingListeners } : {}) };
     // Clear DOM values as soon as the request begins, including failed requests.
     element('discovery-form').reset();
     try { resume(await request('discovery', body)); }
@@ -342,7 +371,17 @@ element('discovery-form').addEventListener('submit', (event) => {
       // The server may have saved an interrupted/failed operation. Reload its
       // public state so Retry can reconcile it with fresh credentials.
       if (error.status !== 401) {
-        try { resume(await request('setup')); } catch { /* Keep the original error. */ }
+        try {
+          const value = await request('setup');
+          if (body.listeners) {
+            // Keep the draft and sign-in form after a failure. Refresh only the
+            // discovery revision; never silently rebase over another settings edit.
+            discoveryState = value.discovery;
+            renderDiscovery();
+            if (value.setup.revision !== saved.revision) element('reload').hidden = false;
+            if (discoveryState.canRecreate) element('discovery-submit').textContent = 'Recreate and save';
+          } else resume(value);
+        } catch { /* Keep the original error. */ }
       }
       throw error;
     } finally { body.password = ''; body.username = ''; }

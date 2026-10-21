@@ -33,6 +33,15 @@ The owner page explains that consequence before publication.
 
 - **Update discovery** checks the saved station and updates its
   advertised values when needed. An already matching entry causes no write.
+- Editing **Listener addresses** with discovery enabled asks for Navidrome admin
+  sign-in as part of Save. **Update and save** publishes and reads back the new
+  addresses before committing them locally. Cancel or rejected sign-in keeps the
+  old saved addresses; the browser keeps the draft for retry. Unchanged addresses
+  need no sign-in when discovery already matches. Manual setups save directly.
+- A dropped reply can leave the new announcement on Navidrome while local settings
+  are still unchanged. The pending record preserves that outcome for an authorized
+  retry, which reads back the announcement before writing again. This is not an
+  atomic transaction across the two servers.
 - **Remove announcement** verifies ownership, removes that entry, reads the list
   again, and switches to manual setup. Unrelated radio stations are preserved.
 - If the saved entry was removed outside Sidecar, publishing stops and offers

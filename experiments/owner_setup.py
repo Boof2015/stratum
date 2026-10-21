@@ -120,11 +120,12 @@ def main(args):
                     def radios():
                         return reader.request("getInternetRadioStations").get("internetRadioStations", {}).get("internetRadioStation", [])
 
-                    def publication(action, username="owner", secret=None, expected=200, recreate=False):
+                    def publication(action, username="owner", secret=None, expected=200, recreate=False, update_listeners=None):
                         current, _ = api("setup")
                         return api("discovery", {"action":action, "setup_revision":current["setup"]["revision"],
                             "discovery_revision":current["discovery"]["revision"], "username":username,
-                            "password":admin_password if secret is None else secret, "recreate":recreate}, expected)[0]
+                            "password":admin_password if secret is None else secret, "recreate":recreate,
+                            **({"listeners":update_listeners} if update_listeners is not None else {})}, expected)[0]
 
                     publication("publish", "listener", listener_password, expected=400)
                     require(len(radios()) == 1, "ordinary account changed radio list")
@@ -145,8 +146,13 @@ def main(args):
                     require(len(radios()) == 2, "repeated publish created a duplicate")
                     listeners[0]["url"] = "https://changed.home.lan:7843"
                     current, _ = api("setup")
-                    api("setup/listeners", {"revision":current["setup"]["revision"], "listeners":listeners})
-                    publication("publish")
+                    api("setup/listeners", {"revision":current["setup"]["revision"], "listeners":listeners}, expected=400)
+                    publication("publish", secret="wrong-password", expected=400, update_listeners=listeners)
+                    unchanged, _ = api("setup")
+                    require(unchanged["setup"] == current["setup"], "failed address update saved new settings")
+                    result = publication("publish", update_listeners=listeners)
+                    require(result["setup"]["settings"]["listeners"] == listeners, "successful update did not save addresses")
+                    require(result["discovery"]["status"] == "published", "address update left discovery stale")
                     updated = next(row for row in radios() if row["id"] == station["id"])
                     require(updated["streamUrl"].startswith(listeners[0]["url"]), "did not update same station")
                     print("PASS repeated publication is idempotent and changes update the saved station")

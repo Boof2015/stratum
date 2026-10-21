@@ -28,6 +28,7 @@ pub enum SetupWriteError {
     Conflict,
     OwnerChanged,
     Confirmation,
+    DiscoveryAuthorization,
 }
 impl std::fmt::Display for SetupWriteError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -37,6 +38,9 @@ impl std::fmt::Display for SetupWriteError {
             }
             Self::OwnerChanged => "Owner sign-in changed. Sign in again before saving setup.",
             Self::Confirmation => "Confirm clearing retained audio before continuing.",
+            Self::DiscoveryAuthorization => {
+                "Sign in to Navidrome to update discovery and save these addresses."
+            }
         })
     }
 }
@@ -327,8 +331,38 @@ impl Store {
         expected_revision: &str,
         owner_generation: Option<&str>,
     ) -> Result<SetupState> {
-        let settings = settings.normalized()?;
         let _operation = self.discovery_lock()?;
+        self.save_setup_locked(settings, expected_revision, owner_generation)
+    }
+
+    /// Browser address edits must update an existing announcement in the same
+    /// authorized operation. CLI configure still allows explicit maintenance.
+    pub fn save_listener_setup(
+        &self,
+        settings: &Settings,
+        expected_revision: &str,
+        owner_generation: Option<&str>,
+    ) -> Result<SetupState> {
+        let _operation = self.discovery_lock()?;
+        let settings = settings.normalized()?;
+        let current = self.config()?.setup;
+        let discovery = self.discovery()?;
+        ensure!(
+            current.settings.listeners == settings.listeners
+                || (discovery.record.is_none() && discovery.pending.is_none()),
+            SetupWriteError::DiscoveryAuthorization
+        );
+        self.save_setup_locked(&settings, expected_revision, owner_generation)
+    }
+
+    /// Caller holds discovery.lock through publication and this local commit.
+    pub(super) fn save_setup_locked(
+        &self,
+        settings: &Settings,
+        expected_revision: &str,
+        owner_generation: Option<&str>,
+    ) -> Result<SetupState> {
+        let settings = settings.normalized()?;
         let _lock = self.lock("state.lock")?;
         let state = self.read_state()?;
         let owner = state.owner.ok_or(SetupWriteError::OwnerChanged)?;
@@ -395,6 +429,7 @@ impl Store {
             state,
             identity: self.identity()?,
             generation: owner,
+            save_listener_settings: false,
         })
     }
 

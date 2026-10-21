@@ -7,6 +7,13 @@ use std::{
 use stratum_poc::owner::{self, Config, Store};
 use tokio_util::sync::CancellationToken;
 
+const WELCOME: &str = "Astra Sidecar — development server
+
+To install, follow INSTALL.md included with the Linux package.
+Setup continues in your browser after the service starts.
+
+Run sidecar --help for the command reference.";
+
 const HELP: &str = "Astra Sidecar — development server
 
 sidecar init --data-dir DIR [--listen IP:PORT] [--admin-origin https://HOST:PORT ...]
@@ -52,7 +59,7 @@ async fn main() {
 async fn run() -> Result<()> {
     let mut args = std::env::args_os().skip(1);
     let Some(command) = args.next() else {
-        println!("{HELP}");
+        println!("{WELCOME}");
         return Ok(());
     };
     if command == "--help" || command == "help" {

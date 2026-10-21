@@ -10,8 +10,11 @@ use std::{
     io::Read,
     path::{Path, PathBuf},
     process::Command,
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant},
 };
+
+mod preparation;
+pub(crate) use preparation::{FileStamp, PreparedEncoder};
 
 pub const EXPERIMENT: &str = "stratum-audio-poc-2";
 const TIMEOUT: Duration = Duration::from_secs(30);
@@ -44,7 +47,7 @@ impl Quality {
     }
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceInfo {
     pub sha256: String,
     pub codec: String,
@@ -57,7 +60,7 @@ pub struct SourceInfo {
 
 pub struct Source {
     path: PathBuf,
-    modified: SystemTime,
+    stamp: FileStamp,
     pub info: SourceInfo,
 }
 
@@ -83,6 +86,7 @@ impl Source {
         let path = path.canonicalize().context("could not open source file")?;
         let metadata = fs::metadata(&path)?;
         ensure!(metadata.is_file(), "source must be a regular local file");
+        let stamp = FileStamp::read(&path)?;
         let bytes = run(
             Command::new("ffprobe")
                 .args([
@@ -141,13 +145,10 @@ impl Source {
             "this proof requires at least 16 source frames (the minimum FLAC block size)"
         );
         let sha256 = hash_file(&path)?;
-        ensure!(
-            fs::metadata(&path)?.modified()? == metadata.modified()?,
-            "source changed while opening it"
-        );
+        stamp.check(&path)?;
         Ok(Self {
             path,
-            modified: metadata.modified()?,
+            stamp,
             info: SourceInfo {
                 sha256,
                 codec: stream.codec_name.clone(),
@@ -161,12 +162,26 @@ impl Source {
     }
 
     fn check_unchanged(&self) -> Result<()> {
-        let metadata = fs::metadata(&self.path)?;
+        self.stamp.check(&self.path)
+    }
+
+    /// Only the service's immutable, private staging file can skip a fresh probe
+    /// and full hash in subsequent workers. Mutable/local proof inputs cannot.
+    pub(crate) fn preparation_stamp(&self) -> Result<FileStamp> {
+        self.check_unchanged()?;
+        ensure!(self.stamp.readonly(), "prepared source must be read-only");
+        Ok(self.stamp.clone())
+    }
+
+    pub(crate) fn resume(path: &Path, info: SourceInfo, stamp: FileStamp) -> Result<Self> {
+        let path = path.canonicalize()?;
+        ensure!(stamp.readonly(), "prepared source must be read-only");
+        stamp.check(&path)?;
         ensure!(
-            metadata.len() == self.info.bytes && metadata.modified()? == self.modified,
-            "source changed; reopen it before requesting another segment"
+            fs::metadata(&path)?.len() == info.bytes,
+            "prepared source size changed"
         );
-        Ok(())
+        Ok(Self { path, info, stamp })
     }
 
     pub fn path(&self) -> &Path {
@@ -213,31 +228,29 @@ pub struct Segment {
 pub struct Engine {
     pub source: Source,
     cache: PathBuf,
-    encoder: String,
+    encoder: PreparedEncoder,
 }
 
 impl Engine {
     pub fn new(source: Source, cache: &Path) -> Result<Self> {
+        Self::prepared(source, cache, PreparedEncoder::capture()?)
+    }
+
+    pub(crate) fn prepared(source: Source, cache: &Path, encoder: PreparedEncoder) -> Result<Self> {
+        source.check_unchanged()?;
+        encoder.check()?;
         fs::create_dir_all(cache)?;
-        // Include the executable build/configuration in the cache identity.
         Ok(Self {
             source,
             cache: cache.canonicalize()?,
-            encoder: Self::encoder_identity()?,
+            encoder,
         })
-    }
-
-    pub(crate) fn encoder_identity() -> Result<String> {
-        Ok(hash_bytes(&run(
-            Command::new("ffmpeg").arg("-version"),
-            TIMEOUT,
-            1_048_576,
-        )?))
     }
 
     pub fn segment(&self, start: u64, frames: u64, quality: Quality) -> Result<Segment> {
         let began = Instant::now();
         self.source.check_unchanged()?;
+        self.encoder.check()?;
         let rate = self.source.info.sample_rate;
         let presentation = Interval::at_rate(start, frames, self.source.info.frames, rate)?;
         // FLAC cannot encode a block shorter than 16 frames. A tiny requested
@@ -265,7 +278,7 @@ impl Engine {
         let key = hash_bytes(&serde_json::to_vec(&(
             EXPERIMENT,
             &self.source.info.sha256,
-            &self.encoder,
+            &self.encoder.identity,
             quality,
             presentation,
             encoded,
@@ -275,7 +288,7 @@ impl Engine {
         let mut metadata = SegmentMetadata {
             experiment: EXPERIMENT.into(),
             source_sha256: self.source.info.sha256.clone(),
-            encoder: self.encoder.clone(),
+            encoder: self.encoder.identity.clone(),
             quality,
             sample_rate: rate,
             codec_sample_rate: codec_rate,
@@ -342,7 +355,7 @@ impl Engine {
                 ",aresample={codec_rate}:resampler=swr:exact_rational=1:async=0:dither_method=none"
             ));
         }
-        let mut command = ffmpeg();
+        let mut command = self.encoder.command();
         command
             .args([
                 "-protocol_whitelist",
@@ -409,19 +422,20 @@ impl Engine {
         }
         run(command.arg(&output), TIMEOUT, 1_048_576)?;
         self.source.check_unchanged()?;
-        let decoded = decode(&output, self.source.info.channels, codec_frames)
+        let decoded = decode_between_using(&output, self.source.info.channels, codec_frames, codec_frames, None, self.encoder.command())
             .with_context(|| format!("codec frames: rate={rate}, start={start}, frames={frames}, encoded={encoded:?}, quality={quality:?}"))?;
         ensure!(
             decoded.len() as u64 == codec_frames * u64::from(self.source.info.channels),
             "encoder/decoder returned the wrong frame count"
         );
         if rate != codec_rate {
-            let native = decode_between(
+            let native = decode_between_using(
                 &output,
                 self.source.info.channels,
                 encoded.frames,
                 decoded_frames,
                 Some(rate),
+                self.encoder.command(),
             )
             .context("client rate conversion count")?;
             metadata.decoded_frames = native.len() as u64 / u64::from(self.source.info.channels);
@@ -429,6 +443,8 @@ impl Engine {
             metadata.discard_end_frames =
                 encoded.end() - presentation.end() + metadata.resample_tail_frames;
         }
+        self.source.check_unchanged()?;
+        self.encoder.check()?;
         let payload = fs::read(&output)?;
         metadata.codec_preskip_frames = if quality == Quality::Lossless {
             0
@@ -471,6 +487,24 @@ fn decode_between(
     maximum_frames: u64,
     rate: Option<u64>,
 ) -> Result<Vec<i32>> {
+    decode_between_using(
+        path,
+        channels,
+        minimum_frames,
+        maximum_frames,
+        rate,
+        ffmpeg(),
+    )
+}
+
+fn decode_between_using(
+    path: &Path,
+    channels: u32,
+    minimum_frames: u64,
+    maximum_frames: u64,
+    rate: Option<u64>,
+    mut command: Command,
+) -> Result<Vec<i32>> {
     let minimum_bytes = minimum_frames
         .checked_mul(u64::from(channels))
         .and_then(|n| n.checked_mul(4))
@@ -479,7 +513,6 @@ fn decode_between(
         .checked_mul(u64::from(channels))
         .and_then(|n| n.checked_mul(4))
         .context("PCM size overflow")?;
-    let mut command = ffmpeg();
     command
         .args(["-protocol_whitelist", "file,pipe", "-i"])
         .arg(path);

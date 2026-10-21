@@ -62,7 +62,11 @@ pub fn run(command: &mut Command, timeout: Duration, max_stdout: u64) -> Result<
 }
 
 pub fn ffmpeg() -> Command {
-    let mut command = Command::new("ffmpeg");
+    ffmpeg_at(std::path::Path::new("ffmpeg"))
+}
+
+pub(crate) fn ffmpeg_at(path: &std::path::Path) -> Command {
+    let mut command = Command::new(path);
     command.args([
         "-hide_banner",
         "-loglevel",

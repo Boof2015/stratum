@@ -260,8 +260,15 @@ impl Harness {
             .map(|p| p.join("ffmpeg"))
             .find(|p| p.is_file())
             .unwrap();
+        let real_ffprobe = std::env::split_paths(&std::env::var_os("PATH").unwrap())
+            .map(|p| p.join("ffprobe"))
+            .find(|p| p.is_file())
+            .unwrap();
+        let probe_shim = shim_dir.join("ffprobe");
+        fs::write(&probe_shim, "#!/bin/sh\nprintf 'probe\\n' >> \"$STRATUM_TEST_COMMANDS\"\nexec \"$STRATUM_TEST_FFPROBE\" \"$@\"\n").unwrap();
+        fs::set_permissions(&probe_shim, fs::Permissions::from_mode(0o755)).unwrap();
         let shim = shim_dir.join("ffmpeg");
-        fs::write(&shim, "#!/bin/sh\nif [ -f \"$STRATUM_TEST_HOLD\" ]; then\n  echo $$ > \"$STRATUM_TEST_PID\"\n  exec /bin/sleep 30\nfi\nexec \"$STRATUM_TEST_FFMPEG\" \"$@\"\n").unwrap();
+        fs::write(&shim, "#!/bin/sh\nif [ \"$1\" = \"-version\" ]; then printf 'version\\n' >> \"$STRATUM_TEST_COMMANDS\"; fi\nif [ -f \"$STRATUM_TEST_HOLD_MULTI\" ]; then\n  echo $$ >> \"$STRATUM_TEST_PID\"\n  exec /bin/sleep 30\nfi\nif [ -f \"$STRATUM_TEST_HOLD\" ]; then\n  echo $$ > \"$STRATUM_TEST_PID\"\n  exec /bin/sleep 30\nfi\nexec \"$STRATUM_TEST_FFMPEG\" \"$@\"\n").unwrap();
         fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
         let mut http = reqwest::Client::builder()
             .no_proxy()
@@ -321,7 +328,10 @@ impl Harness {
                     format!("{}:{}", shim_dir.display(), std::env::var("PATH").unwrap()),
                 )
                 .env("STRATUM_TEST_FFMPEG", real_ffmpeg)
+                .env("STRATUM_TEST_FFPROBE", real_ffprobe)
+                .env("STRATUM_TEST_COMMANDS", dir.path().join("commands"))
                 .env("STRATUM_TEST_HOLD", dir.path().join("hold-worker"))
+                .env("STRATUM_TEST_HOLD_MULTI", dir.path().join("hold-workers"))
                 .env("STRATUM_TEST_PID", dir.path().join("worker-pid"))
                 .stdin(Stdio::null())
                 .stdout(log.try_clone().unwrap())
@@ -959,11 +969,9 @@ async fn installed_cache_hit_does_not_wait_for_busy_encoder_slots() {
     let cold_b = test.open(&bob, "b").await.json::<Value>().await.unwrap();
     let cold_b = cold_b["playback"].as_str().unwrap();
     // Both real encoder slots remain occupied until their playbacks close.
-    fs::write(
-        test.dir.path().join("bin/ffmpeg"),
-        "#!/bin/sh\necho $$ >> \"$STRATUM_TEST_PID\"\nexec /bin/sleep 30\n",
-    )
-    .unwrap();
+    // Use the existing shim's pause switch: replacing FFmpeg after preparation
+    // is correctly rejected by the executable identity check.
+    fs::write(test.dir.path().join("hold-workers"), b"hold").unwrap();
     let pending = async {
         tokio::join!(
             test.segment(&alice, cold_a, 48000, 48000, "opus-64"),
@@ -1484,4 +1492,120 @@ async fn installed_reconfiguration_cancels_inflight_source_and_shutdown_reaps_en
         "encoder outlived shutdown"
     );
     test.wait_clean().await;
+}
+
+#[tokio::test]
+async fn prepared_segments_probe_and_identify_encoder_once_per_playback() {
+    let test = Harness::installed(48000).await;
+    let token = test.login("alice").await;
+    let opened = test.handle(&token).await;
+    let handle = opened["playback"].as_str().unwrap();
+    for (start, quality) in [(0, "lossless"), (48000, "opus-64"), (96000, "opus-128")] {
+        let (metadata, pcm) = test.decoded(&token, handle, start, 48000, quality).await;
+        assert_eq!(pcm.len(), 96000);
+        assert_ne!(metadata["retained_cache_hit"], true);
+    }
+    let counts = fs::read_to_string(test.dir.path().join("commands")).unwrap();
+    assert_eq!(
+        counts.lines().filter(|s| *s == "probe").count(),
+        1,
+        "segments must reuse the source probe"
+    );
+    assert_eq!(
+        counts.lines().filter(|s| *s == "version").count(),
+        1,
+        "segments must reuse encoder identification"
+    );
+    test.close_playback(&token, handle).await;
+    // Each fresh playback still establishes identity and fully validates input.
+    let second = test.handle(&token).await;
+    let counts = fs::read_to_string(test.dir.path().join("commands")).unwrap();
+    assert_eq!(counts.lines().filter(|s| *s == "probe").count(), 2);
+    assert_eq!(counts.lines().filter(|s| *s == "version").count(), 2);
+    assert_eq!(test.state.full_reads.load(Ordering::SeqCst), 2);
+    test.close_playback(&token, second["playback"].as_str().unwrap())
+        .await;
+}
+
+#[tokio::test]
+async fn prepared_segment_rejects_changed_encoder_instead_of_using_old_identity() {
+    let test = Harness::installed(48000).await;
+    let token = test.login("alice").await;
+    let opened = test.handle(&token).await;
+    let shim = test.dir.path().join("bin/ffmpeg");
+    let old_modified = fs::metadata(&shim).unwrap().modified().unwrap();
+    // Harmless same-length script edit, with the original mtime restored.
+    let bytes = fs::read(&shim).unwrap();
+    let mut changed = bytes.clone();
+    let offset = bytes.windows(8).position(|s| s == b"'version").unwrap();
+    changed[offset + 1] = b'V';
+    fs::write(&shim, changed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&shim)
+        .unwrap()
+        .set_modified(old_modified)
+        .unwrap();
+    assert_eq!(fs::metadata(&shim).unwrap().len(), bytes.len() as u64);
+    let response = test
+        .segment(
+            &token,
+            opened["playback"].as_str().unwrap(),
+            0,
+            48000,
+            "lossless",
+        )
+        .await;
+    assert_eq!(response.status(), 422);
+    test.close_playback(&token, opened["playback"].as_str().unwrap())
+        .await;
+}
+
+#[tokio::test]
+async fn prepared_segment_rejects_modified_private_source_even_with_restored_mtime() {
+    use std::os::unix::fs::PermissionsExt;
+    let test = Harness::installed(48000).await;
+    let token = test.login("alice").await;
+    let opened = test.handle(&token).await;
+    let root = fs::read_dir(test.owner.as_ref().unwrap().working_directory())
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.file_type().unwrap().is_dir())
+        .unwrap()
+        .path();
+    let playback = fs::read_dir(root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|e| e.path().join("source").is_file())
+        .unwrap()
+        .path();
+    let source = playback.join("source");
+    let modified = fs::metadata(&source).unwrap().modified().unwrap();
+    let original = fs::read(&source).unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o600)).unwrap();
+    let mut changed = original.clone();
+    let last = changed.len() - 1;
+    changed[last] ^= 1;
+    fs::write(&source, changed).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&source)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    fs::set_permissions(&source, fs::Permissions::from_mode(0o400)).unwrap();
+    assert_eq!(fs::metadata(&source).unwrap().len(), original.len() as u64);
+    assert_eq!(fs::metadata(&source).unwrap().modified().unwrap(), modified);
+    let response = test
+        .segment(
+            &token,
+            opened["playback"].as_str().unwrap(),
+            0,
+            48000,
+            "lossless",
+        )
+        .await;
+    assert_eq!(response.status(), 422);
+    test.close_playback(&token, opened["playback"].as_str().unwrap())
+        .await;
 }

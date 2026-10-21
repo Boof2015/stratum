@@ -65,12 +65,16 @@ fn work() -> Result<Vec<u8>, WorkerFailure> {
     let job: Job =
         serde_json::from_slice(&fs::read(directory.join("job.json")).map_err(anyhow::Error::from)?)
             .map_err(anyhow::Error::from)?;
-    let source = Source::open(&directory.join("source")).map_err(|_| WorkerFailure::Unsupported)?;
-    // Bound compressed inputs that declare many hours despite a small file size.
-    if source.info.frames > source.info.sample_rate * 30 * 60 {
-        return Err(WorkerFailure::Unsupported);
-    }
     if let Some(request) = job.segment {
+        let prepared = job.prepared.ok_or(WorkerFailure::Internal)?;
+        let source = Source::resume(
+            &directory.join("source"),
+            prepared.source,
+            prepared.source_stamp,
+        )?;
+        if prepared.encoder != prepared.prepared_encoder.identity {
+            return Err(WorkerFailure::Internal);
+        }
         let cache = directory.join("cache");
         // Retain at most the last requested segment. Preserve a true warm hit,
         // clear before preparing a different interval/quality; never an unbounded cache.
@@ -91,7 +95,7 @@ fn work() -> Result<Vec<u8>, WorkerFailure> {
                 }
             }
         }
-        let engine = Engine::new(source, &cache)?;
+        let engine = Engine::prepared(source, &cache, prepared.prepared_encoder)?;
         let segment = engine.segment(request.start, request.frames, request.quality)?;
         if segment.metadata.payload_bytes > MAX_PAYLOAD_BYTES as u64 {
             return Err(WorkerFailure::Internal);
@@ -102,19 +106,32 @@ fn work() -> Result<Vec<u8>, WorkerFailure> {
         value["cache_hit"] = json!(segment.cache_hit);
         Ok(serde_json::to_vec(&value).map_err(anyhow::Error::from)?)
     } else {
-        validate_complete(&source)?;
+        if job.prepared.is_some() {
+            return Err(WorkerFailure::Internal);
+        }
+        let source =
+            Source::open(&directory.join("source")).map_err(|_| WorkerFailure::Unsupported)?;
+        // Bound compressed inputs that declare many hours despite a small file size.
+        if source.info.frames > source.info.sample_rate * 30 * 60 {
+            return Err(WorkerFailure::Unsupported);
+        }
+        let prepared_encoder = PreparedEncoder::capture()?;
+        validate_complete(&source, &prepared_encoder)?;
+        prepared_encoder.check()?;
         Ok(serde_json::to_vec(&Prepared {
-            encoder: Engine::encoder_identity()?,
+            encoder: prepared_encoder.identity.clone(),
+            prepared_encoder,
+            source_stamp: source.preparation_stamp()?,
             source: source.info,
         })
         .map_err(anyhow::Error::from)?)
     }
 }
-fn validate_complete(source: &Source) -> anyhow::Result<()> {
+fn validate_complete(source: &Source, encoder: &PreparedEncoder) -> anyhow::Result<()> {
     // Decode the whole staged input without retaining PCM. framehash gives exact
     // decoded frame counts in a sample timebase and fails malformed/truncated input.
     let output = crate::process::run(
-        Command::new("ffmpeg")
+        Command::new(encoder.path())
             .args([
                 "-hide_banner",
                 "-loglevel",
