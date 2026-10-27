@@ -1,5 +1,5 @@
 //! Experimental authenticated segments from a complete, private source copy.
-//! This intentionally measures a staging baseline, not a progressive-source policy.
+//! Acquisition stays bounded; validation is local to each requested interval.
 use super::*;
 use crate::resources::{
     self,
@@ -11,6 +11,7 @@ use crate::{
     timeline::Interval,
 };
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::{path::PathBuf, process::Stdio};
 use tempfile::TempDir;
@@ -18,7 +19,10 @@ use tokio::{io::AsyncWriteExt, sync::OwnedSemaphorePermit};
 
 mod worker;
 pub use worker::worker_main;
-pub(super) const MAX_SOURCE_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_SOURCE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(super) const MAX_SOURCE_SECONDS: u64 = 8 * 60 * 60;
+pub(super) const SOURCE_TRANSFER_LIMIT: Duration = Duration::from_secs(15);
+pub(super) const PREPARATION_LIMIT: Duration = Duration::from_secs(25);
 pub(super) const MAX_SEGMENT_SECONDS: u64 = 4;
 const MAX_PAYLOAD_BYTES: usize = 4 * 1024 * 1024;
 const WORKER_LIMIT: Duration = Duration::from_secs(8);
@@ -197,10 +201,12 @@ struct Prepared {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Job {
-    // None means inspect and validate the complete staged input.
+    // None means inspect the staged input and validate its first interval.
     segment: Option<SegmentRequest>,
     // Trusted preparation copied from this playback, never supplied by a client.
     prepared: Option<Prepared>,
+    // Calculated by the owner while writing the immutable original. Never client input.
+    source_sha256: Option<String>,
 }
 #[derive(Clone, Copy, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -277,7 +283,7 @@ async fn original(
     service: &Service,
     session: &Session,
     playback: &Playback,
-) -> Result<(), Failure> {
+) -> Result<String, Failure> {
     let mut response = service
         .upstream(
             "stream",
@@ -319,8 +325,13 @@ async fn original(
         .await
         .map_err(|_| Failure::Internal)?;
     let mut received = 0_u64;
+    let mut digest = Sha256::new();
     let mut magic = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|_| Failure::Upstream)? {
+    while let Some(chunk) = tokio::time::timeout(Duration::from_secs(3), response.chunk())
+        .await
+        .map_err(|_| Failure::Unavailable)?
+        .map_err(|_| Failure::Upstream)?
+    {
         active(session, playback)?;
         received = received
             .checked_add(chunk.len() as u64)
@@ -337,6 +348,7 @@ async fn original(
         file.write_all(&chunk)
             .await
             .map_err(|_| Failure::Internal)?;
+        digest.update(&chunk);
     }
     if received != playback.size {
         return Err(Failure::Upstream);
@@ -352,7 +364,7 @@ async fn original(
         .permissions();
     permissions.set_readonly(true);
     std::fs::set_permissions(path, permissions).map_err(|_| Failure::Internal)?;
-    Ok(())
+    Ok(format!("{:x}", digest.finalize()))
 }
 fn supported_magic(bytes: &[u8]) -> bool {
     bytes.starts_with(b"fLaC") || (bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WAVE"))
@@ -409,7 +421,7 @@ async fn open(
         // see cancellation; their owned Arc keeps files/permits until they are reaped.
         let pending = playback.cancelled.clone().drop_guard();
         let started = Instant::now();
-        original(&service, &session, &playback).await?;
+        let source_sha256 = original(&service, &session, &playback).await?;
         let acquisition_ms = started.elapsed().as_secs_f64() * 1000.0;
         let bytes = worker(
             &service,
@@ -417,6 +429,7 @@ async fn open(
             Job {
                 segment: None,
                 prepared: None,
+                source_sha256: Some(source_sha256),
             },
             priority,
         )
@@ -571,6 +584,7 @@ async fn segment(
                 Job {
                     segment: Some(interval),
                     prepared: Some(prepared.clone()),
+                    source_sha256: None,
                 },
                 interval.priority,
             )
@@ -910,6 +924,7 @@ mod tests {
                 Job {
                     segment: None,
                     prepared: None,
+                    source_sha256: None,
                 },
                 Priority::Playback,
             )

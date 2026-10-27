@@ -17,7 +17,7 @@ const HELP: &str = "Stratum audio proof of concept
 
 Requires ffmpeg (with libopus) and ffprobe on PATH.
 This experiment supports 44.1/48/96 kHz mono/stereo, 16/24-bit FLAC or PCM WAV.
-Quality: lossless, opus-64, opus-128. All frame counts are per channel.
+Quality: lossless, opus-64, opus-128, opus-192, opus-256, opus-320. All frame counts are per channel.
 No server is started and nothing plays automatically.
 ";
 

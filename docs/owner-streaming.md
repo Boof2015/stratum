@@ -41,6 +41,11 @@ protocol version. Capabilities carry `development: true`. `ready`/`playback` mea
 the saved setup permits audio requests, not that Navidrome, FFmpeg or every
 advertised address has passed a current health check.
 
+Capabilities also advertise Original and Opus 64/128/192/256/320 through the
+[`qualities` field](authenticated-audio-proof.md#quality-negotiation). The higher
+bitrates require this Sidecar update; older installations retain their original
+three representations with newer Astra clients.
+
 Listener URLs are **bases**: the published capabilities URL appends
 `/stratum/access/v1/capabilities`. For a proxy base `https://example.test/audio`,
 forward `/audio/stratum/...` to Sidecar's `/stratum/...`, stripping `/audio`.
@@ -91,10 +96,14 @@ settings does not create another independent encoder/source allowance.
 
 ### Reusing track preparation
 
-Opening a playback still acquires, probes, hashes and fully validates its private
-read-only source. It also identifies FFmpeg once. Subsequent segment workers reuse
-that preparation rather than probing and hashing the whole source and running
-`ffmpeg -version` again for every four-second interval.
+Opening a playback acquires one complete private original and computes its SHA-256
+while writing it. It then probes the read-only file, validates its first four
+seconds (or the whole file when shorter), and identifies FFmpeg once. Subsequent
+segment workers reuse that preparation rather than reading the file again to hash
+it or running `ffmpeg -version` for every four-second interval. Each requested
+interval still has exact frame validation; damaged audio later in a recording
+fails when that interval is requested, rather than delaying startup to decode
+the entire track. No silence is substituted for a failed interval.
 
 The preparation belongs to that playback and is passed only through its private
 worker job. It is never accepted from a listener or reused across newly acquired
@@ -116,22 +125,26 @@ segment can still be served without taking an encoder slot.
 These development bounds carry forward the proofs, with configurable resources
 added in checkpoint 4c. They are not a production capacity guarantee:
 
-- One complete private original per playback, up to 64 MiB and 30 minutes.
+- One complete private original per playback, up to 2 GiB and eight hours.
   Supported sources: mono/stereo 16/24-bit FLAC/WAV, 44.1/48/96 kHz.
 - Four staged playbacks globally, two per listener session. Conversion concurrency
   is Automatic or a custom 1–4; the loopback proof retains two workers.
   Up to four source-seconds per segment, 4 MiB encoded payload, eight-second worker
-  deadline. Serving still starts after complete source acquisition/validation.
+  deadline. Serving starts after complete source acquisition and prefix validation.
 - Ten-minute sessions, at most 32; renewal uses freshly validated same-account
   credentials. Request admission is bounded to eight and login attempts to 30/minute.
-- Three-second upstream requests and ten-second listener handlers. These are
-  conservative proof deadlines and may reject larger/slower remote acquisitions.
+- Complete-original transfers have a 15-second total deadline and a three-second
+  body-idle limit. Opening playback has a 25-second handler deadline; other
+  upstream requests and listener handlers retain three- and ten-second limits.
+  A source below the byte/duration ceiling can still exceed these deadlines on
+  a slow Sidecar-to-Navidrome connection. Playback before full acquisition remains
+  separate work; listener bandwidth does not set this upstream transfer speed.
 - At most 64 accepted HTTPS connections; ten-second TLS handshake/header bounds
   and a 60-second total socket lifetime, including slow response readers.
 - Private temporary working directories, with only the most recent encoded
   interval retained per playback. A separate retained cache reuses encoded
   intervals between plays; see its [controls and recovery rules](owner-cache.md).
-  New playback acquisition still fetches and validates the complete original.
+  New playback acquisition still fetches and hashes the complete original.
   Working files live under the installation, with a separate budget, free-space
   guard and crash recovery; see [resource controls](owner-resources.md).
 

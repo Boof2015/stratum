@@ -31,8 +31,11 @@ Windows worker containment is not implemented or claimed.
 
 Opening playback downloads **one complete original HTTP response** into a private
 bounded file. It checks the response status, media type, declared/received length,
-and FLAC or WAV signature; then the worker verifies a supported source, hashes it,
-and decodes the whole file to validate its exact native frame count. Unsupported
+and FLAC or WAV signature. SHA-256 is computed as the original is written. The
+worker probes its declared frame count and supported format, then validates the
+first four seconds (or the complete file when shorter). Every requested interval
+is decoded and checked for its exact frame count; corruption after the prefix
+fails that interval instead of forcing a full-track decode at startup. Unsupported
 sources return `unsupported_source`, rather than passing through a lossy intermediate.
 
 Every representation of that playback uses this same read-only local copy. The
@@ -48,7 +51,7 @@ file. A hash names the received bytes, not a guaranteed historic server version.
 The test changes the source *after* acquisition and verifies frozen playback; it
 is not a concurrent-write atomicity test.
 
-Full acquisition and validation add startup delay and upstream traffic. This is a
+Full acquisition and prefix validation add startup delay and upstream traffic. This is a
 measured integration baseline, **not a decision that Astra must wait for a whole
 track in the product**. Strong progressive revisions or operator-controlled source
 access remain alternatives. It should not silently replace the earlier efficient
@@ -85,6 +88,34 @@ The public capabilities still say `playback: false` for the original access proo
 and separately advertise `audioExperiment: stratum-authenticated-audio-1`, source
 policy and bounds. There is no Astra-compatible playback capability yet.
 
+## Quality negotiation
+
+The current `/access/v1/capabilities` response also includes:
+
+```json
+{"qualities":["lossless","opus-64","opus-128","opus-192","opus-256","opus-320"]}
+```
+
+The installed HTTPS endpoint exposes the same field at
+`/stratum/access/v1/capabilities`. This is an additive capability; the existing
+protocol and audio-experiment markers, segment envelope and timing rules stay
+unchanged. Older clients can continue requesting their existing representations.
+Older Sidecars omit `qualities`; clients treat omission as exactly `lossless`,
+`opus-64` and `opus-128`, not permission to request newer encodes. Clients ignore
+unknown future representations and reject a malformed list or one with no known
+representation. The list is a set, not a preferred ordering.
+
+Automatic selects among the advertised encodes. Fixed requires the exact chosen
+encode: Astra rejects an unsupported choice before staging a new source and uses
+its conventional streaming fallback at that requested quality. Existing complete
+local cache entries can still play without opening a remote source. Bit-perfect
+continues to require `lossless` and never substitutes Opus.
+
+Every quality has separate encoded cache entries. Opus bitrate changes do not
+change source metadata, the source clock, context, pre-skip or presentation
+trimming. The ladder is still experimental; source size/duration limits are
+unchanged.
+
 ## Authorization, cancellation and recovery
 
 Opening playback and requesting a segment both check `getSong` and a real original
@@ -117,24 +148,27 @@ These are explicit experiment limits, not client cache settings or product defau
 
 | Resource | Bound |
 | --- | --- |
-| Original file | 64 MiB, one complete copy per playback |
+| Original file | 2 GiB, one complete copy per playback |
 | Live playback copies | 2 per session, 4 across the service; slots reserved before acquisition |
-| Supported input | FLAC or 16/24-bit PCM WAV; 44.1/48/96 kHz; mono/stereo; at most 30 minutes |
+| Supported input | FLAC or 16/24-bit PCM WAV; 44.1/48/96 kHz; mono/stereo; at most eight hours |
 | Requested interval | At most 4 seconds in the native clock; exact EOF enforced |
 | Encoders/validators | 2 jobs total; one job per playback, with no unbounded wait queue |
-| Worker lifetime | 8 seconds; request and socket deadlines from checkpoint A still apply |
+| Worker lifetime | 8 seconds; playback-open handler 25 seconds, other handlers 10 seconds |
 | Worker file writes | OS per-file ceiling of 4 MiB, inherited by FFmpeg; bounded stdio monitoring |
 | Retained encodes | Only the last interval/quality per playback, plus its delivery copy; payload at most 4 MiB |
-| Original HTTP request | Existing 3-second upstream deadline; unsuitable for slow/large upstream acquisition |
+| Original HTTP request | 15-second total deadline, 3-second body-idle limit; other upstream requests remain 3 seconds |
 | Session / service lifetime | Existing maximum 600 / 3600 seconds |
 
-Original files therefore occupy at most 256 MiB across active and retiring
-playbacks. Encoded files and bounded worker scratch space are additional. There
-is no cross-user sharing, persistent disk cache, or background pre-encoding of
-whole libraries. Admission returns 429 instead of queuing unlimited source/encoder
-work. Explicit close, logout, expiry and normal shutdown clean private storage.
-A forced service kill or machine crash may leave a private temporary directory;
-restart scavenging is not implemented. These are not crash-recovery guarantees.
+The loopback proof can therefore reserve up to 8 GiB of original files across
+active and retiring playbacks, plus bounded scratch. The installed service also
+enforces the owner's working-storage limit (512 MB by default), per-playback
+headroom and a free-space reserve; see [resource controls](owner-resources.md).
+These limits can refuse a large original before any bytes are acquired. The
+installed service also has [retained caching and recovery](owner-cache.md); the
+loopback proof has no persistent cache or restart scavenging. Neither pre-encodes
+whole libraries in the background. Explicit close, logout, expiry and normal
+shutdown clean private storage. Admission rejects excess work instead of queuing
+unlimited source copies or encoders.
 
 New failure codes include `unsupported_source` (415), `source_limit_exceeded` (413),
 `playback_unavailable` (404), and `audio_preparation_failed` (422). Access and

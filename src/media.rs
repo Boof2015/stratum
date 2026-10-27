@@ -27,15 +27,43 @@ pub enum Quality {
     Opus64,
     #[serde(rename = "opus-128")]
     Opus128,
+    #[serde(rename = "opus-192")]
+    Opus192,
+    #[serde(rename = "opus-256")]
+    Opus256,
+    #[serde(rename = "opus-320")]
+    Opus320,
 }
 
 impl Quality {
+    pub const ALL: [Self; 6] = [
+        Self::Lossless,
+        Self::Opus64,
+        Self::Opus128,
+        Self::Opus192,
+        Self::Opus256,
+        Self::Opus320,
+    ];
+
+    pub fn opus_bitrate(self) -> Option<&'static str> {
+        match self {
+            Self::Lossless => None,
+            Self::Opus64 => Some("64k"),
+            Self::Opus128 => Some("128k"),
+            Self::Opus192 => Some("192k"),
+            Self::Opus256 => Some("256k"),
+            Self::Opus320 => Some("320k"),
+        }
+    }
     pub fn parse(value: &str) -> Result<Self> {
         match value {
             "lossless" => Ok(Self::Lossless),
             "opus-64" => Ok(Self::Opus64),
             "opus-128" => Ok(Self::Opus128),
-            _ => bail!("quality must be lossless, opus-64, or opus-128"),
+            "opus-192" => Ok(Self::Opus192),
+            "opus-256" => Ok(Self::Opus256),
+            "opus-320" => Ok(Self::Opus320),
+            _ => bail!("quality must be lossless or opus-64/128/192/256/320"),
         }
     }
     pub fn extension(self) -> &'static str {
@@ -83,10 +111,31 @@ struct Stream {
 
 impl Source {
     pub fn open(path: &Path) -> Result<Self> {
+        Self::inspect(path, None)
+    }
+
+    /// Only for the service's private, read-only copy whose bytes were hashed
+    /// as they were written. Local CLI files still receive a complete hash here.
+    pub(crate) fn acquired(path: &Path, sha256: String) -> Result<Self> {
+        ensure!(
+            sha256.len() == 64
+                && sha256
+                    .bytes()
+                    .all(|c| c.is_ascii_digit() || (b'a'..=b'f').contains(&c)),
+            "invalid acquired source hash"
+        );
+        Self::inspect(path, Some(sha256))
+    }
+
+    fn inspect(path: &Path, acquired_hash: Option<String>) -> Result<Self> {
         let path = path.canonicalize().context("could not open source file")?;
         let metadata = fs::metadata(&path)?;
         ensure!(metadata.is_file(), "source must be a regular local file");
         let stamp = FileStamp::read(&path)?;
+        ensure!(
+            acquired_hash.is_none() || stamp.readonly(),
+            "acquired source must be read-only"
+        );
         let bytes = run(
             Command::new("ffprobe")
                 .args([
@@ -144,7 +193,10 @@ impl Source {
             frames >= 16,
             "this proof requires at least 16 source frames (the minimum FLAC block size)"
         );
-        let sha256 = hash_file(&path)?;
+        let sha256 = match acquired_hash {
+            Some(value) => value,
+            None => hash_file(&path)?,
+        };
         stamp.check(&path)?;
         Ok(Self {
             path,
@@ -358,6 +410,7 @@ impl Engine {
         let mut command = self.encoder.command();
         command
             .args([
+                "-xerror",
                 "-protocol_whitelist",
                 "file,pipe",
                 "-ss",
@@ -399,16 +452,16 @@ impl Engine {
                     "5",
                 ]);
             }
-            Quality::Opus64 | Quality::Opus128 => {
+            Quality::Opus64
+            | Quality::Opus128
+            | Quality::Opus192
+            | Quality::Opus256
+            | Quality::Opus320 => {
                 command.args([
                     "-c:a",
                     "libopus",
                     "-b:a",
-                    if quality == Quality::Opus64 {
-                        "64k"
-                    } else {
-                        "128k"
-                    },
+                    quality.opus_bitrate().expect("Opus quality"),
                     "-vbr",
                     "off",
                     "-application",

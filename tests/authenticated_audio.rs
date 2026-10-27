@@ -15,7 +15,7 @@ use std::{
     path::PathBuf,
     process::{Child, Command, Stdio},
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     time::{Duration, Instant},
@@ -33,6 +33,7 @@ struct Upstream {
     denied: AtomicBool,
     unavailable: AtomicBool,
     mode: AtomicUsize,
+    advertised_size: AtomicU64,
     full_reads: AtomicUsize,
     songs: AtomicUsize,
     hold_full: AtomicBool,
@@ -80,10 +81,17 @@ async fn upstream(State(state): State<Arc<Upstream>>, request: Request) -> Respo
         return denied(50);
     }
     let data = state.data.lock().unwrap().clone();
+    let advertised_size = match state.advertised_size.load(Ordering::SeqCst) {
+        0 => data.len() as u64,
+        size => size,
+    };
+    let advertised_size = if state.mode.load(Ordering::SeqCst) == 1 {
+        2_147_483_649
+    } else {
+        advertised_size
+    };
     if endpoint.ends_with("getSong.view") {
-        return subsonic(
-            json!({"status":"ok","song":{"id":params["id"],"size": if state.mode.load(Ordering::SeqCst) == 1 { 67108865 } else { data.len() } }}),
-        );
+        return subsonic(json!({"status":"ok","song":{"id":params["id"],"size":advertised_size}}));
     }
     assert!(endpoint.ends_with("stream.view"));
     assert_eq!(params["format"], "raw");
@@ -95,14 +103,7 @@ async fn upstream(State(state): State<Arc<Upstream>>, request: Request) -> Respo
             [
                 (
                     header::CONTENT_RANGE,
-                    format!(
-                        "bytes 0-0/{}",
-                        if state.mode.load(Ordering::SeqCst) == 1 {
-                            67108865
-                        } else {
-                            data.len()
-                        }
-                    ),
+                    format!("bytes 0-0/{}", advertised_size),
                 ),
                 (header::CONTENT_TYPE, "audio/flac".into()),
             ],
@@ -128,7 +129,7 @@ async fn upstream(State(state): State<Arc<Upstream>>, request: Request) -> Respo
             vec![b'x'; data.len()],
         )
             .into_response(),
-        6 => {
+        mode @ (6 | 7 | 8) => {
             let chunk_size = data.len().div_ceil(8);
             let body = Body::from_stream(futures_util::stream::unfold(
                 (data, 0),
@@ -136,7 +137,12 @@ async fn upstream(State(state): State<Arc<Upstream>>, request: Request) -> Respo
                     if offset == data.len() {
                         return None;
                     }
-                    tokio::time::sleep(Duration::from_millis(25)).await;
+                    tokio::time::sleep(Duration::from_millis(match mode {
+                        7 => 1400,
+                        8 => 4000,
+                        _ => 25,
+                    }))
+                    .await;
                     let end = (offset + chunk_size).min(data.len());
                     Some((
                         Ok::<_, std::io::Error>(data[offset..end].to_vec()),
@@ -610,6 +616,197 @@ impl Harness {
             200
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn installed_advertises_and_delivers_every_quality() {
+    let test = Harness::installed(48000).await;
+    let capabilities: Value = test
+        .http
+        .get(format!("{}/access/v1/capabilities", test.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        capabilities["qualities"],
+        json!(["lossless", "opus-64", "opus-128", "opus-192", "opus-256", "opus-320"])
+    );
+    let token = test.login("alice").await;
+    let opened = test.handle(&token).await;
+    let handle = opened["playback"].as_str().unwrap();
+    for quality in capabilities["qualities"].as_array().unwrap() {
+        let name = quality.as_str().unwrap();
+        let (metadata, pcm) = test.decoded(&token, handle, 37, 48001, name).await;
+        assert_eq!(metadata["quality"], name);
+        assert_eq!(pcm.len(), 48001 * 2);
+        let (warm, _) = test.decoded(&token, handle, 37, 48001, name).await;
+        assert_eq!(warm["retained_cache_hit"], true);
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_original_preserves_hash_samples_and_owner_working_budget() {
+    let h = Harness::installed(48000).await;
+    let token = h.login("alice").await;
+    // Fits the new source ceiling but not the owner's unchanged 512 MB budget.
+    h.state.advertised_size.store(500_000_000, Ordering::SeqCst);
+    assert_eq!(h.open(&token, "a").await.status(), 503);
+    assert_eq!(h.state.full_reads.load(Ordering::SeqCst), 0);
+    h.wait_clean().await;
+    h.state.advertised_size.store(0, Ordering::SeqCst);
+
+    let data_bytes = 70 * 1024 * 1024_u32;
+    let mut wav = Vec::with_capacity(data_bytes as usize + 44);
+    wav.extend(b"RIFF");
+    wav.extend((data_bytes + 36).to_le_bytes());
+    wav.extend(b"WAVEfmt ");
+    wav.extend(16_u32.to_le_bytes());
+    wav.extend(1_u16.to_le_bytes());
+    wav.extend(2_u16.to_le_bytes());
+    wav.extend(48000_u32.to_le_bytes());
+    wav.extend(192000_u32.to_le_bytes());
+    wav.extend(4_u16.to_le_bytes());
+    wav.extend(16_u16.to_le_bytes());
+    wav.extend(b"data");
+    wav.extend(data_bytes.to_le_bytes());
+    wav.resize(data_bytes as usize + 44, 0);
+    let last = wav.len() - 4;
+    wav[last..last + 2].copy_from_slice(&1234_i16.to_le_bytes());
+    wav[last + 2..].copy_from_slice(&(-5678_i16).to_le_bytes());
+    let hash = media::hash_bytes(&wav);
+    *h.state.data.lock().unwrap() = wav;
+    let opened = h.handle(&token).await;
+    assert_eq!(
+        opened["source"]["sha256"], hash,
+        "hash the actual downloaded bytes"
+    );
+    assert_eq!(opened["acquiredBytes"], data_bytes as u64 + 44);
+    let handle = opened["playback"].as_str().unwrap();
+    let (_, pcm) = h
+        .decoded(&token, handle, data_bytes as u64 / 4 - 1, 1, "lossless")
+        .await;
+    assert_eq!(pcm, vec![1234_i32 << 16, -5678_i32 << 16]);
+    let capabilities: Value = h
+        .http
+        .get(format!("{}/access/v1/capabilities", h.base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(capabilities["maxSourceBytes"], 2_147_483_648_u64);
+    assert_eq!(capabilities["maxSourceSeconds"], 28_800);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn long_recording_opens_without_full_decode_and_seeks_to_its_real_end() {
+    let h = Harness::installed(44100).await;
+    let path = h.dir.path().join("two-hours.flac");
+    stratum_poc::process::run(
+        stratum_poc::process::ffmpeg()
+            .args([
+                "-f",
+                "lavfi",
+                "-i",
+                "anullsrc=r=44100:cl=mono",
+                "-t",
+                "7200",
+                "-c:a",
+                "flac",
+                "-sample_fmt",
+                "s16",
+                "-compression_level",
+                "0",
+            ])
+            .arg(&path),
+        Duration::from_secs(30),
+        1024,
+    )
+    .unwrap();
+    *h.state.data.lock().unwrap() = fs::read(&path).unwrap();
+    let token = h.login("alice").await;
+    let opened = h.handle(&token).await;
+    assert_eq!(opened["source"]["frames"], 7200_u64 * 44100);
+    assert_eq!(opened["source"]["sha256"], media::hash_file(&path).unwrap());
+    println!(
+        "two-hour source: acquisition={}ms ready={}ms",
+        opened["acquisitionMs"], opened["readyMs"]
+    );
+    let handle = opened["playback"].as_str().unwrap();
+    for quality in ["lossless", "opus-64"] {
+        let (_, pcm) = h
+            .decoded(&token, handle, 7200 * 44100 - 44137, 44137, quality)
+            .await;
+        assert_eq!(pcm.len(), 44137);
+    }
+    assert_eq!(
+        h.segment(&token, handle, 7200 * 44100, 1, "lossless")
+            .await
+            .status(),
+        400
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn original_transfer_has_a_separate_budget_but_stalled_bodies_release_storage() {
+    let h = Harness::installed(48000).await;
+    let token = h.login("alice").await;
+    h.state.mode.store(7, Ordering::SeqCst);
+    let opened = h.handle(&token).await;
+    // Exceeds both the old three-second upstream and ten-second handler budgets.
+    assert!(opened["acquisitionMs"].as_f64().unwrap() >= 10_000.0);
+    h.http
+        .delete(format!(
+            "{}/audio/v1/playback/{}",
+            h.base,
+            opened["playback"].as_str().unwrap()
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    h.state.mode.store(8, Ordering::SeqCst);
+    assert_eq!(h.open(&token, "a").await.status(), 503);
+    h.wait_clean().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn corrupt_audio_after_the_valid_prefix_fails_its_interval_without_silence() {
+    let h = Harness::new(48000).await;
+    {
+        let mut bytes = h.state.data.lock().unwrap();
+        let end = bytes.len();
+        bytes[end - 1024..end - 64].fill(0);
+    }
+    let token = h.login("alice").await;
+    let opened = h.handle(&token).await;
+    let handle = opened["playback"].as_str().unwrap();
+    assert_eq!(
+        h.segment(&token, handle, 5 * 48000, 48000 + 317, "lossless")
+            .await
+            .status(),
+        422
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn duration_above_eight_hours_is_rejected_without_unbounded_decode() {
+    let h = Harness::new(48000).await;
+    {
+        let mut bytes = h.state.data.lock().unwrap();
+        // STREAMINFO packs the exact total sample count in its final 36 bits.
+        assert_eq!(&bytes[..4], b"fLaC");
+        let packed = u64::from_be_bytes(bytes[18..26].try_into().unwrap());
+        let packed = (packed & !((1_u64 << 36) - 1)) | (48000 * 8 * 3600 + 1);
+        bytes[18..26].copy_from_slice(&packed.to_be_bytes());
+    }
+    let token = h.login("alice").await;
+    assert_eq!(h.open(&token, "a").await.status(), 415);
+    h.wait_clean().await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

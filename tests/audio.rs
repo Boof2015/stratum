@@ -13,6 +13,58 @@ use stratum_poc::{
 };
 
 #[test]
+fn expanded_ladder_preserves_alignment_and_separates_cached_representations() -> Result<()> {
+    for rate in [44100, 48000, 96000] {
+        let dir = tempfile::tempdir()?;
+        let path = dir.path().join("source.flac");
+        fixture_at_rate(&path, 18 * rate + 317, 2, 24, rate)?;
+        let source = Source::open(&path)?;
+        let reference = decode(&path, 2, source.info.frames)?;
+        let engine = Engine::new(source, &dir.path().join("cache"))?;
+        // The established high-rate alignment fixture has measurable zero-lag
+        // windows here even at 64 kbps; codec distortion can bias a short
+        // correlation window elsewhere by a source frame at 96 kHz.
+        let start = 10 * rate + 5;
+        let frames = 2 * rate + 1;
+        let mut paths = std::collections::HashSet::new();
+        let mut previous_opus_bytes = 0;
+        for quality in Quality::ALL {
+            let name = serde_json::to_value(quality)?;
+            assert_eq!(Quality::parse(name.as_str().unwrap())?, quality);
+            let segment = engine.segment(start, frames, quality)?;
+            assert!(paths.insert(segment.path.clone()));
+            let pcm = presentation_pcm(&segment)?;
+            assert_eq!(pcm.len() as u64, frames * 2);
+            if quality == Quality::Lossless {
+                assert_eq!(
+                    pcm,
+                    reference[(start * 2) as usize..((start + frames) * 2) as usize]
+                );
+            } else {
+                let bytes = fs::metadata(&segment.path)?.len();
+                assert!(
+                    bytes > previous_opus_bytes,
+                    "bitrate did not increase: {quality:?}"
+                );
+                previous_opus_bytes = bytes;
+                for alignment in alignment_at_rate(&reference, &pcm, start, 2, rate) {
+                    assert_eq!(
+                        alignment.best_lag_frames, 0,
+                        "{rate} {quality:?}: {alignment:?}"
+                    );
+                    assert!(alignment.correlation > 0.8);
+                }
+            }
+            let warm = engine.segment(start, frames, quality)?;
+            assert!(warm.cache_hit);
+            assert_eq!(warm.metadata, segment.metadata);
+        }
+    }
+    assert!(Quality::parse("opus-512").is_err());
+    Ok(())
+}
+
+#[test]
 fn adaptive_assembly_preserves_duration_and_measured_alignment() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let report = demo(None, dir.path())?;
@@ -181,7 +233,7 @@ fn native_96000_alignment_still_detects_one_frame_shifts_in_lossy_audio() -> Res
     // This position exposed an unstable ~21 ms estimate on the right channel.
     // Keep the original ~43 ms window and verify both intentional error signs.
     let start = 10 * rate + 5;
-    for quality in [Quality::Lossless, Quality::Opus64, Quality::Opus128] {
+    for quality in Quality::ALL {
         let pcm = presentation_pcm(&engine.segment(start, 2 * rate + 1, quality)?)?;
         for claimed_offset in [-1_i64, 0, 1] {
             for a in alignment_at_rate(

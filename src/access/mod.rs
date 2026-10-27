@@ -7,7 +7,7 @@ pub(crate) mod transport;
 use axum::{
     body::{to_bytes, Body, Bytes},
     extract::{Path, Request, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{header, HeaderMap, Method, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{delete, get, post},
@@ -293,8 +293,10 @@ impl Service {
             "authentication": "subsonic-token", "probeBytes": PREFIX_BYTES,
             "sessionRenewal": "fresh-credentials-same-user",
             "audioExperiment": "stratum-authenticated-audio-1",
+            "qualities": crate::media::Quality::ALL,
             "audioSource": "complete-private-copy",
             "maxSourceBytes": audio::MAX_SOURCE_BYTES,
+            "maxSourceSeconds": audio::MAX_SOURCE_SECONDS,
             "maxSegmentSeconds": audio::MAX_SEGMENT_SECONDS
         })
     }
@@ -450,6 +452,10 @@ impl Service {
             .header(header::ACCEPT_ENCODING, "identity");
         if let Some(bytes) = range {
             request = request.header(header::RANGE, format!("bytes=0-{}", bytes - 1));
+        } else if endpoint == "stream" {
+            // Original acquisition has a separate finite budget. Small API and
+            // authorization probes keep their existing three-second deadline.
+            request = request.timeout(audio::SOURCE_TRANSFER_LIMIT);
         }
         let response = request.send().await.map_err(|e| {
             if e.is_timeout() || e.is_connect() {
@@ -578,6 +584,17 @@ fn envelope(bytes: Bytes) -> Result<Value, Failure> {
     }
 }
 
+// Both the proof router and installed listener must allow the same preparation
+// budget; otherwise the outer listener cancels a healthy source acquisition.
+pub(crate) fn request_time_limit(request: &Request) -> Duration {
+    if request.method() == Method::POST && request.uri().path().starts_with("/audio/v1/playbacks/")
+    {
+        audio::PREPARATION_LIMIT
+    } else {
+        REQUEST_LIMIT
+    }
+}
+
 async fn guard(State(service): State<Service>, request: Request, next: Next) -> Response {
     // No ambient/browser credentials or URL authentication. Tokens are headers only.
     let invalid = request.uri().query().is_some()
@@ -586,10 +603,11 @@ async fn guard(State(service): State<Service>, request: Request, next: Next) -> 
     let mut response = if invalid {
         Failure::Input.into_response()
     } else if let Ok(_permit) = service.0.requests.clone().try_acquire_owned() {
+        let limit = request_time_limit(&request);
         tokio::select! {
             biased;
             _ = service.0.stopped.cancelled() => Failure::Unavailable.into_response(),
-            result = tokio::time::timeout(REQUEST_LIMIT, next.run(request)) => match result {
+            result = tokio::time::timeout(limit, next.run(request)) => match result {
                 Ok(response) => response,
                 Err(_) => Failure::Unavailable.into_response(),
             }

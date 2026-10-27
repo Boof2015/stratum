@@ -27,9 +27,13 @@ not an authentication mechanism or the eventual remote revision strategy.
 | `lossless` | FLAC | Preserves the source PCM, bit depth and native sample rate |
 | `opus-64` | Ogg Opus, 64 kbps CBR | Lossy, 48 kHz, same channels |
 | `opus-128` | Ogg Opus, 128 kbps CBR | Lossy, 48 kHz, same channels |
+| `opus-192` | Ogg Opus, 192 kbps CBR | Lossy, 48 kHz, same channels |
+| `opus-256` | Ogg Opus, 256 kbps CBR | Lossy, 48 kHz, same channels |
+| `opus-320` | Ogg Opus, 320 kbps CBR | Lossy, 48 kHz, same channels |
 
 Every payload contains a self-contained codec/container header. These are
-experimental encoding choices, not a negotiated production capability set. Opus
+experimental encoding choices; the HTTP service advertises them through its
+[`qualities` capability](authenticated-audio-proof.md#quality-negotiation). Opus
 uses 20 ms packets, audio mode, and intensity-stereo phase inversion disabled.
 
 For Opus, the encoder receives up to 120 ms of real source audio before and after

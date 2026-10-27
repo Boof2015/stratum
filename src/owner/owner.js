@@ -537,7 +537,8 @@ function renderDashboard(value) {
   if (!clients.length) {
     const item = document.createElement('li'); item.className = 'empty-state'; item.textContent = 'No listener sessions.'; list.append(item);
   }
-  const qualities = { lossless: 'Original (lossless)', 'opus-64': 'Opus 64 kbps', 'opus-128': 'Opus 128 kbps' };
+  const qualities = { lossless: 'Original (lossless)', 'opus-64': 'Opus 64 kbps', 'opus-128': 'Opus 128 kbps',
+    'opus-192': 'Opus 192 kbps', 'opus-256': 'Opus 256 kbps', 'opus-320': 'Opus 320 kbps' };
   for (const client of clients) {
     const item = document.createElement('li');
     const name = document.createElement('strong'); name.textContent = `Session ${client.id}`; item.append(name);

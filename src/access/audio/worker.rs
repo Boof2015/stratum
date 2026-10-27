@@ -66,6 +66,9 @@ fn work() -> Result<Vec<u8>, WorkerFailure> {
         serde_json::from_slice(&fs::read(directory.join("job.json")).map_err(anyhow::Error::from)?)
             .map_err(anyhow::Error::from)?;
     if let Some(request) = job.segment {
+        if job.source_sha256.is_some() {
+            return Err(WorkerFailure::Internal);
+        }
         let prepared = job.prepared.ok_or(WorkerFailure::Internal)?;
         let source = Source::resume(
             &directory.join("source"),
@@ -109,14 +112,17 @@ fn work() -> Result<Vec<u8>, WorkerFailure> {
         if job.prepared.is_some() {
             return Err(WorkerFailure::Internal);
         }
-        let source =
-            Source::open(&directory.join("source")).map_err(|_| WorkerFailure::Unsupported)?;
+        let source = Source::acquired(
+            &directory.join("source"),
+            job.source_sha256.ok_or(WorkerFailure::Internal)?,
+        )
+        .map_err(|_| WorkerFailure::Unsupported)?;
         // Bound compressed inputs that declare many hours despite a small file size.
-        if source.info.frames > source.info.sample_rate * 30 * 60 {
+        if source.info.frames > source.info.sample_rate * MAX_SOURCE_SECONDS {
             return Err(WorkerFailure::Unsupported);
         }
         let prepared_encoder = PreparedEncoder::capture()?;
-        validate_complete(&source, &prepared_encoder)?;
+        validate_start(&source, &prepared_encoder)?;
         prepared_encoder.check()?;
         Ok(serde_json::to_vec(&Prepared {
             encoder: prepared_encoder.identity.clone(),
@@ -127,9 +133,14 @@ fn work() -> Result<Vec<u8>, WorkerFailure> {
         .map_err(anyhow::Error::from)?)
     }
 }
-fn validate_complete(source: &Source, encoder: &PreparedEncoder) -> anyhow::Result<()> {
-    // Decode the whole staged input without retaining PCM. framehash gives exact
-    // decoded frame counts in a sample timebase and fails malformed/truncated input.
+fn validate_start(source: &Source, encoder: &PreparedEncoder) -> anyhow::Result<()> {
+    // Startup work is independent of track duration. Every later encoding uses
+    // -xerror and verifies its exact decoded frame count; a damaged later interval
+    // fails then rather than silently skipping, padding, or reporting EOF.
+    let expected = source
+        .info
+        .frames
+        .min(source.info.sample_rate * MAX_SEGMENT_SECONDS);
     let output = crate::process::run(
         Command::new(encoder.path())
             .args([
@@ -151,6 +162,8 @@ fn validate_complete(source: &Source, encoder: &PreparedEncoder) -> anyhow::Resu
                 "-vn",
                 "-sn",
                 "-dn",
+                "-af",
+                &format!("atrim=end_sample={expected}"),
                 "-c:a",
                 "pcm_s32le",
                 "-f",
@@ -186,6 +199,6 @@ fn validate_complete(source: &Source, encoder: &PreparedEncoder) -> anyhow::Resu
             .checked_add(duration)
             .context("decode duration overflow")?;
     }
-    ensure!(total == source.info.frames, "incomplete source decode");
+    ensure!(total == expected, "incomplete source decode");
     Ok(())
 }

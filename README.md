@@ -73,7 +73,9 @@ cargo run --release -- segment --source /path/to/music.flac \
 The second command requests just over two seconds starting 37 frames after 2:30.
 The source must be long enough. JSON on stdout describes the encoded file, its
 presentation interval and the trimming required after decoding. Qualities are
-`lossless`, `opus-64` and `opus-128`. One frame is one sample per channel.
+`lossless`, `opus-64`, `opus-128`, `opus-192`, `opus-256` and `opus-320`.
+One frame is one sample per channel. HTTP clients use the advertised `qualities`
+list; see [quality negotiation](docs/authenticated-audio-proof.md#quality-negotiation).
 
 The audio CLI is an experimental adapter to the engine. It has no HTTP listener,
 discovery endpoint or finalized wire protocol. A separate, loopback-only access

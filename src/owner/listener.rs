@@ -176,6 +176,7 @@ async fn dispatch(State(listener): State<Listener>, request: Request) -> Respons
     let mut response = if invalid {
         error(StatusCode::BAD_REQUEST, "invalid_request")
     } else if let Ok(_permit) = listener.0.requests.try_acquire() {
+        let limit = access::request_time_limit(&request);
         let work = async {
             let engine = match listener.refresh().await {
                 Ok(engine) => engine,
@@ -210,7 +211,7 @@ async fn dispatch(State(listener): State<Listener>, request: Request) -> Respons
         tokio::select! {
             biased;
             _ = listener.0.stopped.cancelled() => error(StatusCode::SERVICE_UNAVAILABLE, "service_stopping"),
-            result = tokio::time::timeout(Duration::from_secs(10), work) =>
+            result = tokio::time::timeout(limit, work) =>
                 result.unwrap_or_else(|_| error(StatusCode::SERVICE_UNAVAILABLE, "request_timed_out")),
         }
     } else {

@@ -85,12 +85,18 @@ keeps its original two-worker, immediate-busy behavior.
 
 Each playback reserves its advertised original size plus **32 MiB** for bounded
 worker files before acquiring the source. Download length is checked against
-that size and the existing 64 MiB source ceiling. The reservation remains until
+that size and the 2 GiB source ceiling. The reservation remains until
 the playback and its last worker release their files, including cancellation.
 At most one worker uses a playback's files at a time.
 
-The 512 MB default covers four maximum-size originals plus this headroom:
-4 × (64 + 32) MiB, about 403 MB. A 128 MB limit fits one maximum-size playback.
+The 512 MB default is unchanged. For example, it covers four 64 MiB originals
+plus this headroom: 4 × (64 + 32) MiB, about 403 MB. Larger originals can require
+a higher working limit, even when below the source ceiling. A 2 GiB original
+needs about 2,182 MB by itself; preparing the next track needs its own reservation
+too. Use **Settings → Resources** or `configure-resources --working-mb N` to
+choose a limit for the available disk space. Increasing the source ceiling never
+increases an owner's configured budget automatically.
+
 This is conservative capacity accounting, not disk preallocation or a filesystem
 quota. Temporary usage reports named file lengths; unlinked subprocess outputs
 and filesystem metadata are not included in that snapshot. The reservation
