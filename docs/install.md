@@ -64,8 +64,8 @@ Use a local filesystem that supports Unix permissions, atomic rename and locks.
 
 ## Standalone Linux / systemd
 
-The archive contains `sidecar`, `install.sh`, `sidecar.service` and this guide. Build it on the
-target Linux architecture with Rust 1.88+:
+The archive contains `sidecar`, `install.sh`, `sidecar.service`, `LICENSE` and this
+guide. Build it on the target Linux architecture with Rust 1.88+:
 
 ```sh
 sh packaging/build-linux.sh

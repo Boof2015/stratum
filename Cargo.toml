@@ -6,6 +6,7 @@ edition = "2021"
 rust-version = "1.88"
 publish = false
 description = "An experimental sample-addressed adaptive audio engine"
+license = "AGPL-3.0-only"
 
 [dependencies]
 anyhow = "1.0"

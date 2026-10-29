@@ -161,5 +161,5 @@ Those reports document what each experiment tested. Some use the earlier
 ## License
 
 The Stratum engine and Astra Sidecar implementation are licensed under the
-[GNU Affero General Public License, version 3 only](https://www.gnu.org/licenses/agpl-3.0.html)
-(`AGPL-3.0-only`).
+[GNU Affero General Public License, version 3 only](LICENSE) (`AGPL-3.0-only`).
+Third-party dependencies retain their own licenses.

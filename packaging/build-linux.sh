@@ -29,6 +29,7 @@ install -m 0755 "$build/$target/release/sidecar" "$stage/$name/sidecar"
 install -m 0644 "$root/packaging/sidecar.service" "$stage/$name/sidecar.service"
 install -m 0755 "$root/packaging/install.sh" "$stage/$name/install.sh"
 install -m 0644 "$root/docs/install.md" "$stage/$name/INSTALL.md"
+install -m 0644 "$root/LICENSE" "$stage/$name/LICENSE"
 tar -C "$stage" -czf "$output/$name.tar.gz" "$name"
 (cd "$output" && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
 printf 'Built %s\n' "$output/$name.tar.gz"

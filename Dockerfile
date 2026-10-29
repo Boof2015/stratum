@@ -16,7 +16,7 @@ RUN case "$TARGETARCH" in \
 ENV CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=x86_64-linux-gnu-gcc \
     CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock LICENSE ./
 COPY src ./src
 RUN case "$TARGETARCH" in \
       amd64) target=x86_64-unknown-linux-gnu ;; \
@@ -58,6 +58,7 @@ FROM scratch AS archive
 COPY --from=package /build/dist/ /
 
 FROM debian:bookworm-slim AS runtime
+LABEL org.opencontainers.image.licenses="AGPL-3.0-only"
 RUN apt-get update \
     && apt-get install -y --no-install-recommends ca-certificates ffmpeg \
     && rm -rf /var/lib/apt/lists/* \
@@ -65,6 +66,7 @@ RUN apt-get update \
     && useradd --uid 10001 --gid sidecar --no-create-home --home-dir /var/lib/sidecar --shell /usr/sbin/nologin sidecar \
     && install -d -m 0700 -o sidecar -g sidecar /var/lib/sidecar
 COPY --from=build /out/sidecar /usr/local/bin/sidecar
+COPY --chmod=644 LICENSE /usr/local/share/licenses/sidecar/LICENSE
 COPY --chmod=755 packaging/docker-entrypoint.sh /usr/local/bin/sidecar-entrypoint
 USER 10001:10001
 EXPOSE 7843
