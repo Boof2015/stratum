@@ -134,12 +134,17 @@ python3 -B -m unittest discover -s experiments -p 'test_*.py'
 The Rust tests exercise actual FFmpeg encodes and decodes. These checks don't
 launch a player or produce audible playback.
 
-Existing technical notes cover [installed HTTPS delivery](docs/owner-streaming.md),
+The [protocol reference](docs/protocol.md) starts with a client walkthrough, then
+covers discovery and trust, session authentication, segment requests, exact frame
+accounting, caching, cancellation and errors. It describes the current wire format
+and separates it from Astra's buffering and quality-selection policy. The protocol
+is still experimental.
+
+Earlier technical notes cover [installed HTTPS delivery](docs/owner-streaming.md),
 [audio timing and decoding](docs/audio-proof.md), [session authentication](docs/access-proof.md),
-[segment responses and quality negotiation](docs/authenticated-audio-proof.md),
-and [discovery metadata](docs/owner-discovery.md#metadata).
-These documents include earlier development checkpoints and their limitations;
-they are not yet a consolidated, stable protocol specification.
+[segment responses](docs/authenticated-audio-proof.md),
+and [discovery publication](docs/owner-discovery.md).
+They record development checkpoints; their limits may predate the current reference.
 
 The repository also retains its proof programs and experiment reports:
 
