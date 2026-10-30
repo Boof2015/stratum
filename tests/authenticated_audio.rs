@@ -103,7 +103,7 @@ async fn upstream(State(state): State<Arc<Upstream>>, request: Request) -> Respo
             [
                 (
                     header::CONTENT_RANGE,
-                    format!("bytes 0-0/{}", advertised_size),
+                    format!("bytes 0-0/{advertised_size}"),
                 ),
                 (header::CONTENT_TYPE, "audio/flac".into()),
             ],
@@ -129,7 +129,7 @@ async fn upstream(State(state): State<Arc<Upstream>>, request: Request) -> Respo
             vec![b'x'; data.len()],
         )
             .into_response(),
-        mode @ (6 | 7 | 8) => {
+        mode @ 6..=8 => {
             let chunk_size = data.len().div_ceil(8);
             let body = Body::from_stream(futures_util::stream::unfold(
                 (data, 0),

@@ -87,7 +87,7 @@ async fn dashboard_requires_current_owner_and_does_not_authorize_listener_tokens
     assert_eq!(value["activity"]["clients"], json!([]));
     assert_eq!(value["navidrome"]["status"], "setup_required");
     assert_eq!(value["bytes_per_second"], 0);
-    assert!(value.to_string().find(PASSWORD).is_none());
+    assert!(!value.to_string().contains(PASSWORD));
     store
         .set_password("new disposable owner password", true)
         .unwrap();
