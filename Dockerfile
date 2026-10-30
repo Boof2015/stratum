@@ -74,8 +74,10 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 sidecar \
     && useradd --uid 10001 --gid sidecar --no-create-home --home-dir /var/lib/sidecar --shell /usr/sbin/nologin sidecar \
+    && install -d -m 0755 /usr/local/share/licenses/sidecar \
     && install -d -m 0700 -o sidecar -g sidecar /var/lib/sidecar
 COPY --from=build /out/sidecar /usr/local/bin/sidecar
+# Pre-create the license directories above; COPY's 644 mode cannot traverse directories.
 COPY --chmod=644 LICENSE /usr/local/share/licenses/sidecar/LICENSE
 COPY --chmod=755 packaging/docker-entrypoint.sh /usr/local/bin/sidecar-entrypoint
 USER 10001:10001
