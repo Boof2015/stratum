@@ -1,9 +1,12 @@
 # Sidecar releases
 
-GitHub Actions builds and tests Linux x86-64 and ARM64 packages. Ordinary pushes
-to `main`, pull requests and manual **Sidecar** workflow runs produce test
-artifacts. A pushed `v…` tag also publishes the tested packages to GitHub Releases
-and the tested images to `ghcr.io/boof2015/stratum`.
+The **Sidecar** GitHub Actions workflow runs only when started manually. Commits,
+pushes, pull requests and new tags do not start it.
+
+A manual run builds and tests Linux x86-64 and ARM64 packages. Publishing is off
+by default. To publish tested packages to GitHub Releases and tested images to
+`ghcr.io/boof2015/stratum`, explicitly select **Publish a release after both
+architectures pass** and enter an existing version tag.
 
 The workflow is [sidecar.yml](../.github/workflows/sidecar.yml). Publishing is a
 separate job, with write permissions only there, after both architectures pass.
@@ -35,9 +38,14 @@ It also checks that both archives and images came from the tagged build.
 
 ## First CI run
 
-Commit and push the workflow to `main`, then open the repository's **Actions →
-Sidecar** run. This runs the checks and leaves downloadable `packages-amd64` and
-`packages-arm64` artifacts. It does not publish a release or Docker image.
+After committing and pushing the workflow to `main`, open **Actions → Sidecar →
+Run workflow**. Choose the branch to test, leave publishing unchecked, and click
+**Run workflow**. Leave `release_tag` empty to test that branch, or enter an
+existing version tag to test its code.
+
+The run leaves downloadable `packages-amd64` and `packages-arm64` artifacts. A
+build/test run does not publish a release or Docker image, even when testing a
+tag. The selected commit is resolved once and used by both architecture jobs.
 
 Download a package artifact, extract its outer Actions ZIP, and verify the
 included `.sha256` file before using the Linux archive. Test it in the LXC using
@@ -48,7 +56,8 @@ the [normal installer](install.md#standalone-linux--systemd).
 1. Set the package version in `Cargo.toml` and update the root package entry in
    `Cargo.lock`, for example with `cargo check`. Commit both. Choose a prerelease
    version such as `0.1.0-rc.1` while testing; the tag must match it exactly.
-2. Push the commit and let its CI checks finish.
+2. Push the commit. Manually run the build/test workflow if you want to check it
+   before preparing a release.
 3. Create and push the matching tag. For that example:
 
    ```sh
@@ -56,8 +65,14 @@ the [normal installer](install.md#standalone-linux--systemd).
    git push origin v0.1.0-rc.1
    ```
 
-The tag run performs the package checks again. A version mismatch fails before
-the builds. Prerelease tags become GitHub prereleases; versions without a
+4. In **Actions → Sidecar → Run workflow**, use the updated `main` workflow,
+   select **Publish a release after both architectures pass**, and enter
+   `v0.1.0-rc.1` in `release_tag` for this example. Then start the run. Pushing the
+   tag alone does nothing.
+
+The manually requested publishing run performs all package checks before
+publishing. Its version tag must exist and match Cargo.toml and Cargo.lock; a
+missing or mismatched tag fails before the builds. Prerelease tags become GitHub prereleases; versions without a
 prerelease suffix become ordinary releases. SemVer build metadata (`+…`) is not
 accepted because it cannot be used unchanged in a Docker tag.
 

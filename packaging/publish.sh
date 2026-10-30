@@ -1,13 +1,13 @@
 #!/bin/bash
 # Called only after both native CI jobs pass. Never rebuilds their artifacts.
 set -euo pipefail
-: "${RELEASE_TAG:?Run from the version-tag release job}"
-: "${GITHUB_SHA:?Missing commit}"
+: "${RELEASE_TAG:?Run from the manually requested publish job}"
+: "${RELEASE_COMMIT:?Missing commit}"
 : "${GITHUB_REPOSITORY:?Missing repository}"
 version=$(python3 packaging/release.py version --tag "$RELEASE_TAG")
 image="ghcr.io/${GITHUB_REPOSITORY,,}"
 assets=release-assets
-python3 packaging/release.py verify --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" --directory artifacts --output "$assets"
+python3 packaging/release.py verify --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory artifacts --output "$assets"
 
 # Do not overwrite a published release. A partial draft can be completed on retry.
 if draft=$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft); then
@@ -21,7 +21,7 @@ digests=()
 for arch in amd64 arm64; do
     gzip -dc "artifacts/image-$arch/image.tar.gz" | docker load
     python3 packaging/release.py check-image --tag "$RELEASE_TAG" --arch "$arch" \
-        --commit "$GITHUB_SHA" --directory "artifacts/packages-$arch"
+        --commit "$RELEASE_COMMIT" --directory "artifacts/packages-$arch"
     target="$image:$version-$arch"
     docker tag sidecar:ci "$target"
     docker push "$target"
@@ -45,7 +45,7 @@ printf '%s\n' "$image:$version" "${digests[@]}" > "$assets/container-images.txt"
 
 # Exact project source for the tag, including its locked dependency manifest and
 # build scripts. This is the tracked repository, never a developer working tree.
-git archive --format=tar.gz --prefix="stratum-$version/" "$GITHUB_SHA" > "$assets/stratum-$version-source.tar.gz"
+git archive --format=tar.gz --prefix="stratum-$version/" "$RELEASE_COMMIT" > "$assets/stratum-$version-source.tar.gz"
 cp compose.release.yaml "$assets/compose.yaml"
 printf 'SIDECAR_IMAGE=%s\nSIDECAR_VERSION=%s\nSIDECAR_ADMIN_ORIGIN=https://192.168.1.20:7843\n' "$image" "$version" > "$assets/sidecar.env.example"
 (cd "$assets" && sha256sum ./*.tar.gz compose.yaml sidecar.env.example container-manifest.json container-images.txt > SHA256SUMS)

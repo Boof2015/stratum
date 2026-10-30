@@ -1,11 +1,16 @@
 name: Sidecar
 
 on:
-  push:
-    branches: [main]
-    tags: ['v*']
-  pull_request:
   workflow_dispatch:
+    inputs:
+      publish:
+        description: Publish a release after both architectures pass
+        type: boolean
+        default: false
+      release_tag:
+        description: Existing version tag to build (required for publishing; otherwise optional)
+        type: string
+        default: ''
 
 permissions:
   contents: read
@@ -15,12 +20,46 @@ defaults:
     shell: bash
 
 concurrency:
-  group: sidecar-${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+  group: sidecar-${{ github.workflow }}-${{ github.ref }}-${{ inputs.release_tag }}
+  cancel-in-progress: false
 
 jobs:
+  prepare:
+    name: Validate manual request
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      commit: ${{ steps.package.outputs.commit }}
+      version: ${{ steps.package.outputs.version }}
+    env:
+      PUBLISH: ${{ inputs.publish }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+    steps:
+      - name: Require an explicit version tag for publishing
+        run: |
+          if [[ "$PUBLISH" == true && -z "$RELEASE_TAG" ]]; then
+            echo 'Publishing requires an existing version tag in release_tag.' >&2
+            exit 1
+          fi
+          if [[ -n "$RELEASE_TAG" && ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?$ ]]; then
+            echo 'Use a version tag such as v0.1.0 or v0.1.0-rc.1.' >&2
+            exit 1
+          fi
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.release_tag != '' && format('refs/tags/{0}', inputs.release_tag) || github.sha }}
+          persist-credentials: false
+      - name: Validate version and freeze the selected commit
+        id: package
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then args+=(--tag "$RELEASE_TAG"); fi
+          python3 packaging/release.py version "${args[@]}" --github-output "$GITHUB_OUTPUT"
+          printf 'commit=%s\n' "$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
   packages:
     name: Test and package (${{ matrix.arch }})
+    needs: prepare
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 45
     strategy:
@@ -32,18 +71,13 @@ jobs:
           - arch: arm64
             runner: ubuntu-24.04-arm
     env:
-      RELEASE_TAG: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+      PUBLISH: ${{ inputs.publish }}
+      BUILD_COMMIT: ${{ needs.prepare.outputs.commit }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.commit }}
           persist-credentials: false
-      - name: Validate package version
-        id: package
-        shell: bash
-        run: |
-          args=()
-          if [[ -n "$RELEASE_TAG" ]]; then args+=(--tag "$RELEASE_TAG"); fi
-          python3 packaging/release.py version "${args[@]}" --github-output "$GITHUB_OUTPUT"
       - name: Validate release tooling
         run: python3 -B -m unittest discover -s packaging -p 'test_*.py'
       - uses: docker/setup-buildx-action@v4
@@ -77,8 +111,8 @@ jobs:
           load: true
           labels: |
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
-            org.opencontainers.image.revision=${{ github.sha }}
-            org.opencontainers.image.version=${{ steps.package.outputs.version }}
+            org.opencontainers.image.revision=${{ needs.prepare.outputs.commit }}
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
           cache-from: type=gha,scope=sidecar-${{ matrix.arch }}
       - name: Verify checksums and test image/archive setup, updates and recovery
         shell: bash
@@ -88,7 +122,7 @@ jobs:
           [[ ${#archives[@]} -eq 1 ]]
           python3 -B experiments/packaging.py --image sidecar:ci --archive "${archives[0]}"
       - name: Preserve the tested image for publishing
-        if: env.RELEASE_TAG != ''
+        if: inputs.publish
         run: |
           mkdir -p image
           docker save sidecar:ci | gzip -1 > image/image.tar.gz
@@ -98,8 +132,8 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           args=()
-          if [[ -n "$RELEASE_TAG" ]]; then args+=(--image-file image/image.tar.gz); fi
-          python3 packaging/release.py record --arch "$ARCH" --commit "$GITHUB_SHA" "${args[@]}"
+          if [[ "$PUBLISH" == true ]]; then args+=(--image-file image/image.tar.gz); fi
+          python3 packaging/release.py record --arch "$ARCH" --commit "$BUILD_COMMIT" "${args[@]}"
       - uses: actions/upload-artifact@v7
         with:
           name: packages-${{ matrix.arch }}
@@ -108,7 +142,7 @@ jobs:
           compression-level: 0
           retention-days: 14
       - uses: actions/upload-artifact@v7
-        if: env.RELEASE_TAG != ''
+        if: inputs.publish
         with:
           name: image-${{ matrix.arch }}
           path: image/image.tar.gz
@@ -121,8 +155,8 @@ jobs:
 
   publish:
     name: Publish tested release
-    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
-    needs: packages
+    if: github.event_name == 'workflow_dispatch' && inputs.publish
+    needs: [prepare, packages]
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     permissions:
@@ -130,10 +164,12 @@ jobs:
       packages: write
     env:
       GH_TOKEN: ${{ github.token }}
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_COMMIT: ${{ needs.prepare.outputs.commit }}
     steps:
       - uses: actions/checkout@v7
         with:
+          ref: ${{ needs.prepare.outputs.commit }}
           persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
@@ -144,7 +180,7 @@ jobs:
           path: artifacts
           pattern: image-*
       - name: Validate both architectures before publishing
-        run: python3 packaging/release.py verify --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" --directory artifacts
+        run: python3 packaging/release.py verify --tag "$RELEASE_TAG" --commit "$RELEASE_COMMIT" --directory artifacts
       - uses: docker/setup-buildx-action@v4
       - uses: docker/login-action@v4
         with:

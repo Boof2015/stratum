@@ -1,8 +1,8 @@
 # Install Sidecar
 
-Sidecar runs on Linux, alongside an existing Navidrome. Tagged builds publish
-packages to [GitHub Releases](https://github.com/Boof2015/stratum/releases) after
-both architectures pass CI. Until the first tagged release is available, use
+Sidecar runs on Linux, alongside an existing Navidrome. Manually requested
+release runs publish packages to [GitHub Releases](https://github.com/Boof2015/stratum/releases)
+after both architectures pass CI. Until the first release is available, use
 the source-build instructions below or a package from a passing Actions run.
 Docker and a standalone binary use the same setup, dashboard and data format.
 Astra can discover Sidecar through Navidrome and enable Stratum per server.
@@ -221,7 +221,7 @@ not configure DNS, firewall rules or a proxy.
 
 ## Packaging checks (from a checkout)
 
-The [Sidecar workflow](releases.md) runs these checks on both Linux architectures.
+The manual-only [Sidecar workflow](releases.md) runs these checks on both Linux architectures.
 To reproduce the container checks locally:
 
 ```sh

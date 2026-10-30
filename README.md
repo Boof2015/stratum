@@ -134,10 +134,11 @@ python3 -B -m unittest discover -s experiments -p 'test_*.py'
 The Rust tests exercise actual FFmpeg encodes and decodes. These checks don't
 launch a player or produce audible playback.
 
-[Release automation](docs/releases.md) runs the Linux checks on x86-64 and ARM64.
-Pushed version tags publish tested archives to GitHub Releases and images to
-`ghcr.io/boof2015/stratum`. Ordinary CI runs publish neither. Release downloads
-become available after the first passing tag run.
+The [Sidecar workflow](docs/releases.md) is **manual-only**. Start it from
+Actions to run the Linux checks on x86-64 and ARM64. Publishing is off by default;
+explicitly enable it and supply a version tag to publish tested archives to
+GitHub Releases and images to `ghcr.io/boof2015/stratum`. Commits, pull requests
+and tag pushes do not trigger runs.
 
 The [protocol reference](docs/protocol.md) starts with a client walkthrough, then
 covers discovery and trust, session authentication, segment requests, exact frame
