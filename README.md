@@ -34,8 +34,8 @@ doesn't need a music-directory mount.
 
 | Installation | Setup |
 | --- | --- |
-| [Docker Compose](docs/install.md#docker) | Build the image from this repository and start it with Compose. FFmpeg is included in the image. |
-| [Standalone Linux / systemd](docs/install.md#standalone-linux--systemd) | Build an x86-64 or ARM64 archive, then run the guided installer. It sets up a service that starts on boot. |
+| [Docker Compose](docs/install.md#docker) | Use a published image or build from source. FFmpeg is included in the image. |
+| [Standalone Linux / systemd](docs/install.md#standalone-linux--systemd) | Use an x86-64 or ARM64 archive, then run the guided installer. It sets up a service that starts on boot. |
 
 The [installation guide](docs/install.md) currently covers builds from a checkout,
 including exporting a Linux archive with Docker. The standalone installer can
@@ -133,6 +133,11 @@ python3 -B -m unittest discover -s experiments -p 'test_*.py'
 
 The Rust tests exercise actual FFmpeg encodes and decodes. These checks don't
 launch a player or produce audible playback.
+
+[Release automation](docs/releases.md) runs the Linux checks on x86-64 and ARM64.
+Pushed version tags publish tested archives to GitHub Releases and images to
+`ghcr.io/boof2015/stratum`. Ordinary CI runs publish neither. Release downloads
+become available after the first passing tag run.
 
 The [protocol reference](docs/protocol.md) starts with a client walkthrough, then
 covers discovery and trust, session authentication, segment requests, exact frame

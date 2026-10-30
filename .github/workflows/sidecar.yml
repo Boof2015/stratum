@@ -1,0 +1,155 @@
+name: Sidecar
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+defaults:
+  run:
+    shell: bash
+
+concurrency:
+  group: sidecar-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ !startsWith(github.ref, 'refs/tags/') }}
+
+jobs:
+  packages:
+    name: Test and package (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    env:
+      RELEASE_TAG: ${{ github.event_name == 'push' && startsWith(github.ref, 'refs/tags/') && github.ref_name || '' }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Validate package version
+        id: package
+        shell: bash
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then args+=(--tag "$RELEASE_TAG"); fi
+          python3 packaging/release.py version "${args[@]}" --github-output "$GITHUB_OUTPUT"
+      - name: Validate release tooling
+        run: python3 -B -m unittest discover -s packaging -p 'test_*.py'
+      - uses: docker/setup-buildx-action@v4
+      - name: Test Rust, Python and the systemd unit; assemble installer fixture
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: installer-test
+          platforms: linux/${{ matrix.arch }}
+          tags: sidecar:installer-test
+          load: true
+          cache-from: type=gha,scope=sidecar-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=sidecar-${{ matrix.arch }}
+      - name: Test the packaged installer and recovery
+        run: timeout 240s docker run --rm --init --name sidecar-installer-check --network none sidecar:installer-test
+      - name: Export the Linux archive
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: archive
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=local,dest=dist
+          cache-from: type=gha,scope=sidecar-${{ matrix.arch }}
+      - name: Build the runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          target: runtime
+          platforms: linux/${{ matrix.arch }}
+          tags: sidecar:ci
+          load: true
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.version=${{ steps.package.outputs.version }}
+          cache-from: type=gha,scope=sidecar-${{ matrix.arch }}
+      - name: Verify checksums and test image/archive setup, updates and recovery
+        shell: bash
+        run: |
+          (cd dist && sha256sum --check ./*.sha256)
+          archives=(dist/*.tar.gz)
+          [[ ${#archives[@]} -eq 1 ]]
+          python3 -B experiments/packaging.py --image sidecar:ci --archive "${archives[0]}"
+      - name: Preserve the tested image for publishing
+        if: env.RELEASE_TAG != ''
+        run: |
+          mkdir -p image
+          docker save sidecar:ci | gzip -1 > image/image.tar.gz
+      - name: Record tested artifact identities
+        shell: bash
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          args=()
+          if [[ -n "$RELEASE_TAG" ]]; then args+=(--image-file image/image.tar.gz); fi
+          python3 packaging/release.py record --arch "$ARCH" --commit "$GITHUB_SHA" "${args[@]}"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: packages-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - uses: actions/upload-artifact@v7
+        if: env.RELEASE_TAG != ''
+        with:
+          name: image-${{ matrix.arch }}
+          path: image/image.tar.gz
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 14
+      - name: Clean up a timed-out installer
+        if: always()
+        run: docker rm --force sidecar-installer-check >/dev/null 2>&1 || true
+
+  publish:
+    name: Publish tested release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')
+    needs: packages
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    permissions:
+      contents: write
+      packages: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: packages-*
+      - uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          pattern: image-*
+      - name: Validate both architectures before publishing
+        run: python3 packaging/release.py verify --tag "$RELEASE_TAG" --commit "$GITHUB_SHA" --directory artifacts
+      - uses: docker/setup-buildx-action@v4
+      - uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+      - name: Publish versioned images and GitHub release assets
+        run: bash packaging/publish.sh

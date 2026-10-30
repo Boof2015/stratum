@@ -6,6 +6,7 @@ set -eu
 }
 [ ! -e /var/lib/sidecar/config.json ] || { echo 'Test container must have no Sidecar state.' >&2; exit 1; }
 package=$1
+test -s "$package/LICENSE" && test -s "$package/INSTALL.md"
 # Emulate the user's Proxmox console flow: archive in root's private home. Also
 # exercise creation of the service account rather than borrowing the image's.
 cp -r "$package" /root/sidecar-installer-package

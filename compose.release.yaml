@@ -1,0 +1,22 @@
+services:
+  sidecar:
+    image: ${SIDECAR_IMAGE:-ghcr.io/boof2015/stratum}:${SIDECAR_VERSION:?Set SIDECAR_VERSION in .env to the release version without v}
+    environment:
+      SIDECAR_ADMIN_ORIGIN: "${SIDECAR_ADMIN_ORIGIN:?Set SIDECAR_ADMIN_ORIGIN in .env to your dashboard HTTPS origin}"
+    ports:
+      - "7843:7843"
+    volumes:
+      - sidecar-data:/var/lib/sidecar
+    read_only: true
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,size=128m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 256
+    stop_grace_period: 20s
+    restart: unless-stopped
+
+volumes:
+  sidecar-data:

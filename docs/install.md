@@ -1,11 +1,33 @@
 # Install Sidecar
 
-These are development packages for Linux, alongside an existing Navidrome.
+Sidecar runs on Linux, alongside an existing Navidrome. Tagged builds publish
+packages to [GitHub Releases](https://github.com/Boof2015/stratum/releases) after
+both architectures pass CI. Until the first tagged release is available, use
+the source-build instructions below or a package from a passing Actions run.
 Docker and a standalone binary use the same setup, dashboard and data format.
 Astra can discover Sidecar through Navidrome and enable Stratum per server.
 The current audio limits still apply (FLAC/WAV, mono/stereo, 44.1/48/96 kHz).
 
 ## Docker
+
+### Published image
+
+Download `compose.yaml` and `sidecar.env.example` from the chosen GitHub release
+into a new directory. Copy `sidecar.env.example` to `.env`, keep its image and
+release version, and change `SIDECAR_ADMIN_ORIGIN` to the HTTPS address you will open,
+including the port. Then run:
+
+```sh
+docker compose pull
+docker compose up -d
+docker compose exec sidecar sidecar setup-info --data-dir /var/lib/sidecar
+```
+
+The image supports x86-64 and ARM64. Docker selects the architecture; you do not
+need Rust or a source checkout. The following setup and storage instructions
+apply to both published and locally built images.
+
+### Build from source
 
 From a checkout of Stratum, with Docker Compose available:
 
@@ -65,7 +87,11 @@ Use a local filesystem that supports Unix permissions, atomic rename and locks.
 ## Standalone Linux / systemd
 
 The archive contains `sidecar`, `install.sh`, `sidecar.service`, `LICENSE` and this
-guide. Build it on the target Linux architecture with Rust 1.88+:
+guide. Download the archive for your architecture and its `.sha256` file from
+the chosen GitHub release: `x86_64` for Intel/AMD, or `aarch64` for ARM64. The
+release archives target Debian 12/Ubuntu 24.04 or newer glibc Linux.
+
+To build an archive yourself instead, use the target Linux architecture with Rust 1.88+:
 
 ```sh
 sh packaging/build-linux.sh
@@ -161,8 +187,12 @@ discovery state belong together. Retained audio can be omitted from a backup;
 working files are disposable. Never start two installations from the same backup
 at once. Restoring without the identity changes what clients must trust.
 
-For Docker, rebuild from the chosen checkout and run `docker compose up -d`
-with the same volume. For standalone, extract the new verified archive and run
+For a published Docker image, change `SIDECAR_VERSION` in `.env` to the new
+release version, run `docker compose pull`, then `docker compose up -d` with the
+same volume. For a locally built image, rebuild from the chosen checkout and
+run `docker compose up -d` with the same volume. Keep the Compose project name
+and volume name when changing between a source build and a published image.
+For standalone, extract the new verified archive and run
 `sudo ./install.sh` again. It keeps the saved address, password, identity and
 cache, makes a private configuration backup in `/var/backups/sidecar`, and replaces
 the program and service unit. If startup fails, it restores the previous binary
@@ -190,6 +220,9 @@ Listener proxy paths and administration origins are separate; see the repository
 not configure DNS, firewall rules or a proxy.
 
 ## Packaging checks (from a checkout)
+
+The [Sidecar workflow](releases.md) runs these checks on both Linux architectures.
+To reproduce the container checks locally:
 
 ```sh
 docker build --target test --progress=plain .

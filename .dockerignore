@@ -12,3 +12,7 @@
 !tests/**
 !examples/
 !examples/**
+!experiments/
+!experiments/**
+**/__pycache__
+**/*.pyc

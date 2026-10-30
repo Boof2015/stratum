@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Bounded Docker packaging checks using disposable volumes, no personal server."""
 import argparse
+import hashlib
 import http.client
 import json
 from pathlib import Path
@@ -130,6 +131,9 @@ def main():
               docker("exec", name, "stat", "-c", "%a", "/var/lib/sidecar",
                      "/var/lib/sidecar/config.json", "/var/lib/sidecar/private.json").stdout.split() == ["700", "600", "600"])
         inspect = json.loads(docker("inspect", name).stdout)[0]
+        check("runtime declares AGPL-3.0-only and includes the license",
+              inspect["Config"]["Labels"].get("org.opencontainers.image.licenses") == "AGPL-3.0-only"
+              and "GNU AFFERO GENERAL PUBLIC LICENSE" in docker("exec", name, "cat", "/usr/local/share/licenses/sidecar/LICENSE").stdout)
         check("published port stays on loopback for this test and root filesystem is read-only",
               inspect["HostConfig"]["ReadonlyRootfs"]
               and inspect["NetworkSettings"]["Ports"]["7843/tcp"][0]["HostIp"] == "127.0.0.1")
@@ -202,6 +206,12 @@ def main():
         check("fresh volume rejects plaintext administration origin", await_failure())
         if args.archive:
             archive = args.archive.resolve(strict=True)
+            with archive.open("rb") as source:
+                checksum = hashlib.sha256()
+                for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                    checksum.update(chunk)
+            check("archive matches its published SHA-256 file",
+                  Path(str(archive) + ".sha256").read_text().strip() == checksum.hexdigest() + "  " + archive.name)
             # The same binary is shipped in the image and archive. Confirm that
             # relationship, then exercise the unpacked CLI independently.
             script = """set -eu
@@ -214,6 +224,7 @@ cmp "$binary" /usr/local/bin/sidecar
 test -f "$(dirname "$binary")/sidecar.service"
 test -x "$(dirname "$binary")/install.sh"
 test -s "$(dirname "$binary")/INSTALL.md"
+cmp "$(dirname "$binary")/LICENSE" /usr/local/share/licenses/sidecar/LICENSE
 "$binary" init --data-dir /tmp/state >/dev/null
 "$binary" set-password --data-dir /tmp/state --password-stdin >/dev/null
 "$binary" status --data-dir /tmp/state | grep -q '"ownerConfigured": true'

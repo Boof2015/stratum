@@ -27,32 +27,42 @@ RUN case "$TARGETARCH" in \
 
 # Optional targets; neither test tools nor build tools enter the runtime image.
 FROM build AS test
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends ffmpeg systemd \
+RUN rustup component add rustfmt clippy \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends ffmpeg systemd python3 \
     && rm -rf /var/lib/apt/lists/* \
     && groupadd --gid 10001 sidecar \
     && useradd --uid 10001 --gid sidecar --create-home sidecar \
     && chown -R sidecar:sidecar /build /usr/local/cargo
 COPY tests ./tests
 COPY examples ./examples
+COPY experiments ./experiments
 COPY packaging/sidecar.service /etc/systemd/system/sidecar.service
 RUN install -m 0755 /out/sidecar /usr/local/bin/sidecar \
     && systemd-analyze verify --man=no /etc/systemd/system/sidecar.service
 USER sidecar
-RUN cargo test --locked -- --test-threads=1
-
-# Isolated installer checks: root only inside this disposable container.
-FROM test AS installer-test
-USER root
-COPY --from=build /out/sidecar /installer/sidecar
-COPY packaging/install.sh packaging/sidecar.service packaging/test-installer.sh /installer/
-ENV SIDECAR_INSTALLER_TEST=disposable
-CMD ["sh", "/installer/test-installer.sh", "/installer"]
+RUN cargo fmt --check \
+    && cargo clippy --locked --all-targets -- -D warnings \
+    && cargo test --locked -- --test-threads=1 \
+    && python3 -B -m unittest discover -s experiments -p 'test_*.py'
 
 FROM build AS package
 COPY packaging ./packaging
 COPY docs/install.md ./docs/install.md
 RUN SIDECAR_BUILD_TARGET_DIR=/build/target SIDECAR_TARGET_ARCH="$TARGETARCH" sh packaging/build-linux.sh
+
+# Test the actual generated archive, including the installer shipped to users.
+# Root is used only inside this disposable test container.
+FROM test AS installer-test
+USER root
+COPY --from=package /build/dist/ /packages/
+RUN cd /packages && sha256sum --check ./*.sha256 \
+    && mkdir /installer \
+    && set -- /packages/*.tar.gz && test "$#" -eq 1 \
+    && tar -xzf "$1" --strip-components=1 -C /installer
+COPY packaging/test-installer.sh /installer/test-installer.sh
+ENV SIDECAR_INSTALLER_TEST=disposable
+CMD ["sh", "/installer/test-installer.sh", "/installer"]
 
 FROM scratch AS archive
 COPY --from=package /build/dist/ /
